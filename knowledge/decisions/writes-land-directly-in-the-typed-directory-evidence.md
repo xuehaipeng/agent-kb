@@ -3,7 +3,7 @@ type: Decision
 title: Writes land directly in the typed directory; evidence decides verified vs unverified
 description: 'No inbox or consolidator: kb add writes the entry at once, verified when the author gives evidence, unverified otherwise; duplicates are caught at write time.'
 tags: [write-path, design]
-status: stable
+status: deprecated
 resources: [internal/kb/ops.go]
 supersedes: [decisions/the-unverified-trust-state-replaces-an-inbox-staging-area]
 generated: {by: claude-code, at: "2026-11-08T13:56:16Z", commit: a8425826899a}

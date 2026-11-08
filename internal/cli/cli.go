@@ -32,7 +32,8 @@ type App struct {
 const usage = `kb - shared, cross-checked knowledge for coding agents (agent-kb)
 
 Retrieve (in a hub: current repo's project + global by default):
-  kb search [query] [-f path]... [-p project] [--all] [--type t] [--trusted] [--deprecated] [-n N] [--json]
+  kb search [query] [-f path]... [-p project] [--all] [--type t] [--trusted] [--deprecated] [--no-docs] [-n N] [--json]
+                 (also lists matching sections of the repo's own docs: they are the source of truth)
   kb show <id>... [--raw]
   kb status [--brief] [-p project] [--all] [--json]
 
@@ -289,12 +290,15 @@ func (a *App) cmdInstall(args []string) error {
 
 type hitJSON struct {
 	ID          string   `json:"id"`
+	Kind        string   `json:"kind"` // entry | doc
 	Project     string   `json:"project,omitempty"`
-	Type        string   `json:"type"`
+	Path        string   `json:"path,omitempty"` // doc hits: repo-relative file
+	Line        int      `json:"line,omitempty"` // doc hits: heading line
+	Type        string   `json:"type,omitempty"`
 	Title       string   `json:"title"`
 	Description string   `json:"description"`
-	Trust       string   `json:"trust"`
-	Stale       bool     `json:"stale"`
+	Trust       string   `json:"trust,omitempty"`
+	Stale       bool     `json:"stale,omitempty"`
 	StaleReason string   `json:"stale_reason,omitempty"`
 	Anchored    string   `json:"anchored,omitempty"`
 	Resources   []string `json:"resources,omitempty"`
@@ -312,6 +316,7 @@ func (a *App) cmdSearch(args []string) error {
 	f.boolean(&q.AllProjects, "search every project (hub)", "all")
 	f.boolean(&q.TrustedOnly, "only verified/cross-checked/reviewed", "trusted")
 	f.boolean(&q.IncludeDeprecated, "include deprecated", "deprecated")
+	f.boolean(&q.NoDocs, "skip matching sections of the repo's own docs", "no-docs")
 	f.integer(&q.Limit, 0, "max results", "n", "limit")
 	f.boolean(&asJSON, "JSON output", "json")
 	pos, err := f.parse(args)
@@ -334,7 +339,12 @@ func (a *App) cmdSearch(args []string) error {
 		out := []hitJSON{}
 		for _, h := range hits {
 			m := h.Node.Meta()
-			out = append(out, hitJSON{h.Node.ID, h.Node.Project, h.Node.TypeKey, m.Title, m.Description, h.Trust.State, h.Trust.Stale, h.Trust.StaleReason, h.PathMatch, m.Resources, h.Score})
+			out = append(out, hitJSON{ID: h.Node.ID, Kind: "entry", Project: h.Node.Project, Type: h.Node.TypeKey, Title: m.Title, Description: m.Description, Trust: h.Trust.State, Stale: h.Trust.Stale, StaleReason: h.Trust.StaleReason, Anchored: h.PathMatch, Resources: m.Resources, Score: h.Score})
+		}
+		if q.Text != "" && !q.NoDocs {
+			for _, d := range s.SearchDocs(q.Text, q.Projects, q.AllProjects, q.DocLimit) {
+				out = append(out, hitJSON{ID: d.Section.Ref(), Kind: "doc", Project: d.Section.Project, Title: d.Section.Heading, Description: d.Section.Snippet(160), Path: d.Section.Path, Line: d.Section.Line, Score: d.Score})
+			}
 		}
 		return a.json(out)
 	}
@@ -795,7 +805,7 @@ func (a *App) cmdExtract(args []string) error {
 	case res.Skipped != "":
 		a.out("skipped: %s\n", res.Skipped)
 	default:
-		a.out("added %d claim(s), %d duplicate(s)\n", len(res.Added), res.Dupes)
+		a.out("added %d claim(s), %d duplicate(s), %d already in the repo's docs\n", len(res.Added), res.Dupes, res.Documented)
 		for _, id := range res.Added {
 			a.out("  %s [unverified]\n", id)
 		}

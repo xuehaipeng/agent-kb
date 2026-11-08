@@ -3,7 +3,7 @@ type: Decision
 title: CLI is the primary agent interface; MCP is stdio-only and optional
 description: Shell commands cost no context until used; the MCP server exposes five tools over stdio and never listens on the network.
 tags: [mcp, design]
-status: stable
+status: deprecated
 resources: [internal/mcp/**, internal/cli/**]
 generated: {by: claude-code, at: "2026-11-08T05:42:13Z", commit: add3b75b68f0}
 verified:

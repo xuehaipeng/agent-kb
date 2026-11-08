@@ -12,8 +12,12 @@ import (
 // searched scope, never as proof that nothing exists.
 func (s *Store) RenderHits(hits []Hit, q SearchQuery) string {
 	var b strings.Builder
+	var docs []DocHit
+	if q.Text != "" && !q.NoDocs {
+		docs = s.SearchDocs(q.Text, q.Projects, q.AllProjects, q.DocLimit)
+	}
 	if len(hits) == 0 {
-		b.WriteString("no matching knowledge")
+		b.WriteString("no matching knowledge entries")
 		if q.TrustedOnly {
 			b.WriteString(" (trusted only; drop --trusted to include unverified entries)")
 		}
@@ -30,6 +34,13 @@ func (s *Store) RenderHits(hits []Hit, q SearchQuery) string {
 	}
 	if n := s.Truncated(); n > 0 && len(hits) > 0 {
 		fmt.Fprintf(&b, "... %d more match(es); raise -n or narrow the query\n", n)
+	}
+	for _, d := range docs {
+		if sn := d.Section.Snippet(100); sn != "" {
+			fmt.Fprintf(&b, "doc %s - %s\n", d.Section.Ref(), sn)
+		} else {
+			fmt.Fprintf(&b, "doc %s\n", d.Section.Ref())
+		}
 	}
 	if len(q.Files) > 0 {
 		var files []string

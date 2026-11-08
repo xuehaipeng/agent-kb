@@ -236,8 +236,9 @@ func ParseClaims(out string) ([]Claim, error) {
 	return claims, nil
 }
 
-// Prompt builds the extraction prompt.
-func Prompt(transcript string, existing []string, maxClaims int, types []string) string {
+// Prompt builds the extraction prompt. docs lists the repository's own
+// documentation sections, which must not be restated.
+func Prompt(transcript string, existing, docs []string, maxClaims int, types []string) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, `You extract durable project knowledge from a coding-agent session transcript, for a knowledge base shared by several AI coding agents working on the same repository.
 
@@ -249,8 +250,15 @@ Include only knowledge that is:
 - likely to stay true and to matter in future sessions;
 - supported by the transcript, not speculation.
 Exclude task progress, TODOs, abandoned attempts without a lesson, generic programming advice, and any secrets, credentials or personal data.
+Exclude anything the repository's own documentation already states (sections listed below): agents read those docs directly, and copies drift. Only record what the docs do not say.
 Do not repeat knowledge that already exists (titles below). Returning [] is normal and expected when nothing qualifies.
 `, maxClaims, strings.Join(types, "|"))
+	if len(docs) > 0 {
+		b.WriteString("\nAlready documented in the repository (do not restate):\n")
+		for _, d := range docs {
+			b.WriteString("- " + d + "\n")
+		}
+	}
 	if len(existing) > 0 {
 		b.WriteString("\nExisting knowledge titles:\n")
 		for _, t := range existing {
@@ -277,10 +285,11 @@ type Options struct {
 
 // Result summarises an extraction run.
 type Result struct {
-	Skipped string
-	Added   []string
-	Dupes   int
-	Prompt  string
+	Skipped    string
+	Added      []string
+	Dupes      int
+	Documented int // claims dropped because the repo's docs already say them
+	Prompt     string
 }
 
 type state struct {
@@ -369,7 +378,7 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 			types = append(types, t)
 		}
 	}
-	prompt := Prompt(condensed, titles, s.Cfg.Extract.MaxClaims, types)
+	prompt := Prompt(condensed, titles, s.DocHeadings(80), s.Cfg.Extract.MaxClaims, types)
 	if o.DryRun {
 		res.Prompt = prompt
 		return res, nil
@@ -397,6 +406,13 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 		srcID = "sess-" + truncate(kb.Slugify(o.SessionID), 12)
 	}
 	for _, c := range claims {
+		if ms := s.DocCoverage(s.Project, c.Title+" "+c.Description); len(ms) > 0 && ms[0].Coverage >= kb.DocWarnCoverage {
+			res.Documented++
+			if o.Out != nil {
+				fmt.Fprintf(o.Out, "skip %q: already documented in %s\n", c.Title, ms[0].Section.Ref())
+			}
+			continue
+		}
 		body := strings.TrimSpace(c.Body)
 		if body == "" {
 			body = c.Description
@@ -411,9 +427,12 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 			}},
 		})
 		var dup *kb.DuplicateError
+		var documented *kb.DocCoveredError
 		switch {
 		case errors.As(err, &dup):
 			res.Dupes++
+		case errors.As(err, &documented):
+			res.Documented++
 		case err != nil:
 			if o.Out != nil {
 				fmt.Fprintf(o.Out, "skip %q: %v\n", c.Title, err)
@@ -535,7 +554,7 @@ func Scan(s *kb.Store, o ScanOptions) ([]string, error) {
 		case o.DryRun:
 			report = append(report, fmt.Sprintf("%s: would extract (%d-char prompt)", label, len(r.Prompt)))
 		default:
-			report = append(report, fmt.Sprintf("%s: added %d, duplicates %d %v", label, len(r.Added), r.Dupes, r.Added))
+			report = append(report, fmt.Sprintf("%s: added %d, duplicates %d, already documented %d %v", label, len(r.Added), r.Dupes, r.Documented, r.Added))
 		}
 	}
 	if len(report) == 0 {

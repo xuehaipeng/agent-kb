@@ -31,10 +31,19 @@ type AddInput struct {
 
 // AddResult reports what Add did.
 type AddResult struct {
-	Node     *Node
-	Trust    Trust
-	Related  []Similar // similar existing entries worth updating instead
-	Redacted int
+	Node       *Node
+	Trust      Trust
+	Related    []Similar  // similar existing entries worth updating instead
+	DocOverlap []DocMatch // repo doc sections that partly say the same
+	Redacted   int
+}
+
+// DocCoveredError is returned when an entry restates the repo's own docs,
+// which stay the source of truth (agents find them with kb search).
+type DocCoveredError struct{ Match DocMatch }
+
+func (e *DocCoveredError) Error() string {
+	return fmt.Sprintf("already documented in %s (coverage %.2f): the repo's docs are the source of truth and kb search shows them, so don't copy them into the knowledge base. Record only what the docs don't say, fix the doc if it is wrong, or pass --force", e.Match.Section.Ref(), e.Match.Coverage)
 }
 
 // Similar is a near-match found by the duplicate check.
@@ -139,6 +148,15 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 			if r.Score >= 0.4 {
 				res.Related = append(res.Related, r)
 			}
+		}
+	}
+
+	if !in.Force {
+		if ms := s.DocCoverage(project, in.Title+" "+in.Description); len(ms) > 0 {
+			if ms[0].Coverage >= DocBlockCoverage {
+				return nil, &DocCoveredError{Match: ms[0]}
+			}
+			res.DocOverlap = ms
 		}
 	}
 

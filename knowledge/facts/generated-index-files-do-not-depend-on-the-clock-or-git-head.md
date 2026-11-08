@@ -3,7 +3,7 @@ type: Fact
 title: Generated index files do not depend on the clock or git HEAD
 description: IndexFiles uses TrustStatic (no stale flag), so two machines regenerate identical bytes and union merges stay clean.
 tags: [index, determinism]
-status: stable
+status: deprecated
 resources: [internal/kb/index.go]
 generated: {by: claude-code, at: "2026-11-08T05:42:13Z", commit: add3b75b68f0}
 stale_after: "2027-02-06T13:56:17Z"

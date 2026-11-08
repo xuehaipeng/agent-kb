@@ -3,7 +3,7 @@ type: Decision
 title: Knowledge is grouped by project in one git-backed hub
 description: ~/.kb holds projects/<id>/ plus global/; the project comes from the current repo's git remote; installs are user-wide so team repos stay untouched.
 tags: [hub, projects, design]
-status: stable
+status: deprecated
 resources: [internal/kb/hub.go, internal/kb/store.go]
 generated: {by: claude-code, at: "2026-11-08T13:56:16Z", commit: a8425826899a}
 verified:

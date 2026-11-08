@@ -78,6 +78,7 @@ type Store struct {
 	registry *registry
 
 	lastTruncated int
+	docCache      map[string]*docCorpus
 }
 
 // Open opens a repo bundle or a hub directory.
@@ -491,6 +492,7 @@ func oneLine(s string, max int) string {
 func (s *Store) Refresh() {
 	s.loaded = false
 	s.gits = map[string]*gitCache{}
+	s.docCache = nil
 }
 
 // recordChange runs after every mutation: append to log.md, regenerate the

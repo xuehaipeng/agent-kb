@@ -17,3 +17,10 @@ Append-only record of changes made through `kb`. Newest last. Do not edit.
 - [2026-11-08T13:56:17Z] verify learnings/resolve-symlinks-before-comparing-paths-with-git-s-toplevel by claude-code - confirmed: Open() still resolves via realPath; kb tests open repos through a symlink
 - [2026-11-08T13:56:17Z] verify decisions/search-scans-the-bundle-in-process-with-bm25-instead by claude-code - confirmed: internal/kb/search.go Search() scans Nodes() in-process, no cache
 - [2026-11-08T13:56:17Z] verify decisions/cli-is-the-primary-agent-interface-mcp-is-stdio-only by claude-code - confirmed: internal/mcp is stdio-only (Serve on stdin/stdout); no listener
+- [2026-11-08T15:28:51Z] deprecate decisions/trust-is-derived-per-revision-an-author-s-evidence-makes by claude-code - restates docs/ARCHITECTURE.md §2.2 Trust model; the doc is the source of truth
+- [2026-11-08T15:28:51Z] deprecate decisions/knowledge-is-grouped-by-project-in-one-git-backed-hub by claude-code - restates docs/ARCHITECTURE.md §2.4 Multi-project hub
+- [2026-11-08T15:28:51Z] deprecate decisions/search-scans-the-bundle-in-process-with-bm25-instead by claude-code - restates docs/ARCHITECTURE.md §2.5 Index
+- [2026-11-08T15:28:51Z] deprecate decisions/writes-land-directly-in-the-typed-directory-evidence by claude-code - restates docs/ARCHITECTURE.md §2.6 Write path
+- [2026-11-08T15:28:51Z] deprecate decisions/cli-is-the-primary-agent-interface-mcp-is-stdio-only by claude-code - restates docs/ARCHITECTURE.md §2.7 and README MCP section
+- [2026-11-08T15:28:51Z] deprecate conventions/bundle-writes-go-through-store-methods-that-hold-store-lock by claude-code - restates AGENTS.md (always loaded): every mutation goes through a Store method holding Store.Lock()
+- [2026-11-08T15:28:51Z] deprecate facts/generated-index-files-do-not-depend-on-the-clock-or-git-head by claude-code - restates AGENTS.md (always loaded): generated outputs must be deterministic, use TrustStatic

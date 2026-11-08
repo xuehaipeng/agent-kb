@@ -381,6 +381,9 @@ func AddSummary(res *kb.AddResult) string {
 	if res.Redacted > 0 {
 		fmt.Fprintf(&b, "redacted %d likely secret(s)\n", res.Redacted)
 	}
+	for _, d := range res.DocOverlap {
+		fmt.Fprintf(&b, "overlaps repo doc %s (coverage %.2f): keep only what the doc doesn't say, or 'kb deprecate' this entry\n", d.Section.Ref(), d.Coverage)
+	}
 	for _, r := range res.Related {
 		fmt.Fprintf(&b, "related: %s (%q, similarity %.2f): if they overlap, merge with 'kb update %s'\n", r.ID, r.Title, r.Score, r.ID)
 	}

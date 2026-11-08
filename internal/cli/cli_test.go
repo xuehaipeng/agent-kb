@@ -406,3 +406,31 @@ func TestScanRoutesSessionsToProjects(t *testing.T) {
 		t.Fatalf("routed entries:\n%s", out)
 	}
 }
+
+func TestExtractSkipsDocumentedClaims(t *testing.T) {
+	dir := setupRepo(t)
+	os.MkdirAll(filepath.Join(dir, "docs"), 0o755)
+	os.WriteFile(filepath.Join(dir, "docs", "ops.md"), []byte("# Operations\n\n## Backups\n\nPostgres is backed up nightly with pg_dump to the S3 bucket, kept for 30 days.\n"), 0o644)
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-qm", "docs")
+	must(t, "", "init")
+	transcript := filepath.Join(dir, "s.jsonl")
+	long := strings.Repeat("We looked at backups and found the restore script needs PGPASSFILE. ", 40)
+	os.WriteFile(transcript, []byte(`{"type":"user","cwd":"`+dir+`","sessionId":"s1","message":{"role":"user","content":"`+long+`"}}`+"\n"), 0o644)
+	claims := filepath.Join(dir, "claims.json")
+	os.WriteFile(claims, []byte(`[`+
+		`{"type":"fact","title":"Postgres is backed up nightly with pg_dump to S3","description":"Nightly pg_dump backups go to the S3 bucket and are kept 30 days."},`+
+		`{"type":"learning","title":"restore.sh needs PGPASSFILE set","description":"Without PGPASSFILE the restore script prompts and hangs in cron."}]`), 0o644)
+	out, errs, code := kbRun(t, "claude-code", "", "extract", "--transcript", transcript, "--cmd", "cat "+claims)
+	if code != 0 || !strings.Contains(out, "added 1 claim(s), 0 duplicate(s), 1 already in the repo's docs") || !strings.Contains(errs, "already documented in docs/ops.md") {
+		t.Fatalf("extract: %d\n%s\n%s", code, out, errs)
+	}
+	// The extraction prompt lists the doc sections it must not restate.
+	fresh := filepath.Join(dir, "s2.jsonl")
+	data, _ := os.ReadFile(transcript)
+	os.WriteFile(fresh, data, 0o644)
+	out = must(t, "claude-code", "extract", "--transcript", fresh, "--dry-run")
+	if !strings.Contains(out, "Already documented in the repository (do not restate):") || !strings.Contains(out, "- docs/ops.md § Backups") {
+		t.Fatalf("prompt lacks doc headings:\n%s", out)
+	}
+}

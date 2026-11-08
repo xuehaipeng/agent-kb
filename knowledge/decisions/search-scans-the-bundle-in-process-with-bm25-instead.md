@@ -3,7 +3,7 @@ type: Decision
 title: Search scans the bundle in-process with BM25 instead of a SQLite FTS5 cache
 description: At hundreds of files a full parse plus BM25 takes milliseconds and can never disagree with disk.
 tags: [search, design]
-status: stable
+status: deprecated
 resources: [internal/kb/search.go]
 generated: {by: claude-code, at: "2026-11-08T05:42:13Z", commit: add3b75b68f0}
 verified:

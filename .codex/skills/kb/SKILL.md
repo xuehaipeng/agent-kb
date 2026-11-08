@@ -20,6 +20,11 @@ kb search "..." -p aiproxy                                         # a specific 
 kb show learnings/stream-timeout-must-propagate                    # full entry + trust trail
 ```
 
+Search also lists matching sections of the repository's own docs (README,
+`docs/`, ADRs, `AGENTS.md`) as `doc path:line (§ heading)`. Read them directly:
+they are the source of truth for what they cover, and kb never copies them.
+Use `--no-docs` to see entries only.
+
 States: `verified` (author checked it), `cross-checked` (another model family
 confirmed), `reviewed` (a human confirmed), `unverified` (a lead), `disputed`
 (latest check says wrong), `stale` (past `stale_after`, or the files in
@@ -28,7 +33,13 @@ confirmed), `reviewed` (a human confirmed), `unverified` (a lead), `disputed`
 ## Record
 
 Record durable, non-obvious knowledge: root causes, gotchas, invariants,
-decisions with reasons, procedures. Skip what the code or git log already says.
+decisions with reasons, procedures. Skip what the code, the git log or the
+repo's docs already say. The docs are the source of truth for what they
+cover: `kb add` refuses an entry that restates a doc section (it names the
+section), and warns on partial overlap. If a doc is wrong or missing something,
+fix the doc instead of recording a correction here. The knowledge base is for
+what the docs don't hold: gotchas found while working, cross-repo facts,
+undocumented decisions, environment quirks.
 Give `-e` when you know it from evidence (a test you ran, code you read) so it
 is `verified` right away; leave it out for hunches.
 

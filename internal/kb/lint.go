@@ -201,6 +201,11 @@ func (s *Store) Lint(opt LintOptions) ([]Issue, error) {
 				titles[key] = p
 			}
 		}
+		if n.TypeKey != "review" && s.TrustStatic(n, sup).State != StateDeprecated {
+			if ms := s.DocCoverage(n.Project, m.Title+" "+m.Description); len(ms) > 0 && ms[0].Coverage >= DocBlockCoverage {
+				add("warn", p, "restates %s (coverage %.2f): the doc is the source of truth; deprecate this entry or keep only what the doc lacks", ms[0].Section.Ref(), ms[0].Coverage)
+			}
+		}
 		if opt.Staged && s.Cfg.Types[n.TypeKey].Immutable {
 			s.checkImmutable(n, add)
 		}

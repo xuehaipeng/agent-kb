@@ -22,6 +22,11 @@ knowledge base they all read and write through a small CLI, `kb`:
 - **Staleness from git.** If the files an entry depends on change after it was
   last confirmed, it's flagged `stale` automatically, even when you search
   from another project.
+- **Docs stay the source of truth.** `kb search` also returns matching
+  sections of the repo's own docs (`doc docs/design.md:42 (§ Retry policy)`),
+  read live from the checkout. `kb add` refuses entries that just restate a
+  doc section, so the knowledge base holds only what the docs don't: gotchas,
+  cross-repo facts, environment quirks, undocumented decisions.
 - **Thin.** A ~20-line pointer in each agent's user-level instructions; the
   rest is pulled on demand with `kb search` (≈20 tokens per hit). No daemon,
   no database, no network listener. One static Go binary.
@@ -101,7 +106,9 @@ kb search "stream timeout" --file internal/gateway/stream.go
 #  aiproxy/learnings/stream-timeout-must-forward-cancel [verified] Stream timeout must forward cancel - ... (anchored: internal/gateway/stream.go)
 kb show stream-timeout
 
-# record something durable, with how you know it
+#  doc docs/gateway.md:88 (§ Cancellation) - Client cancel is forwarded to the upstream stream.
+
+# record something durable that the docs don't say, with how you know it
 kb add learning "Vitest deadlocks on Node 24 without --no-isolate" \
   -d "Worker pool deadlocks on Node 24.1 unless isolation is disabled." \
   -r "vitest.config.ts" -e "reproduced: pnpm test hangs; --no-isolate fixes it" \

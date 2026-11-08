@@ -157,7 +157,38 @@ unauthenticated write path.
 Per Doc C, hooks are not the only capture path: the pointer tells agents to
 record durable findings at the moment they're established.
 
-### 2.9 Reviews
+### 2.9 The repo's own docs are the source of truth *(new in rev 2)*
+
+When a project already has detailed, current documentation (README, `docs/`,
+ADRs, `AGENTS.md`), copying it into the knowledge base adds a second source of
+truth that drifts as soon as the doc changes. It also costs tokens, since
+agents can read the doc directly. The first dogfooding round showed the risk
+is real: 7 of this repository's 8 entries restated `docs/ARCHITECTURE.md` or
+`AGENTS.md`, because nothing told the agent the docs existed. Now:
+
+- **Search reads the docs live.** `kb search` also returns matching sections
+  of the docs tracked in the current project's checkout, as
+  `doc path:line (§ heading) - first sentence`. Nothing is copied; sections
+  are split by Markdown headings, and dependency, hidden and boilerplate files
+  are skipped. Agents find documented knowledge through the same command.
+- **`kb add` refuses restatements.** It measures how much of the new entry's
+  claim (title + description) a single doc section already states, weighting
+  rare terms higher. At coverage ≥ 0.65 it refuses and names the section
+  (`--force` overrides); from 0.45 it warns. Calibrated on real data: new
+  knowledge scored 0.17–0.27, partly documented claims 0.41–0.56, restated
+  sections 0.65–1.0.
+- **Extraction is stricter.** It drops claims at ≥ 0.45, and the prompt lists
+  the doc headings the model must not restate.
+- **`kb lint` warns** on existing entries that restate a doc section.
+- **The pointer and skill say it.** Record only what the docs don't say; if a
+  doc is wrong, fix the doc.
+
+So the knowledge base holds what docs typically don't: gotchas found while
+working, cross-repo facts, environment quirks and undocumented decisions.
+Coverage is lexical, so a heavy paraphrase can slip under the threshold; the
+guidance covers that case.
+
+### 2.10 Reviews
 
 Reviews are OKF Markdown packets (`type: Review`) bound to `base..head`. Files
 come from git, with knowledge anchored to the touched files attached. Verdicts
@@ -167,7 +198,7 @@ is a useful reviewer), keeping cross-family review as the stronger option.
 
 ## 3. Doc C (ChatGPT plan) review
 
-**Adopted in rev 2:**
+**Adopted in rev 2** (also: §2.9, repo docs as the source of truth):
 - Verification events scoped to a content revision.
 - Search reports truncation ("N more") and the scope searched, so a miss isn't presented as absence.
 - `kb show` fences entry content as data, not instructions.

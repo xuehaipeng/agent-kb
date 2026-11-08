@@ -3,7 +3,7 @@ type: Decision
 title: Trust is derived per revision; an author's evidence makes an entry verified
 description: verified/cross-checked/reviewed/unverified/disputed/deprecated are computed from the verified events of the current revision; the latest event wins; nothing stores the state.
 tags: [trust, design]
-status: stable
+status: deprecated
 resources: [internal/kb/trust.go]
 supersedes: [decisions/trust-state-is-derived-on-every-read-never-stored]
 generated: {by: claude-code, at: "2026-11-08T13:56:16Z", commit: a8425826899a}

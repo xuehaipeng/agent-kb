@@ -15,6 +15,8 @@ type SearchQuery struct {
 	Files             []string // repo-relative paths the caller will touch
 	Types             []string
 	IncludeDeprecated bool
+	NoDocs            bool // skip matching sections of the repo's own docs
+	DocLimit          int
 	TrustedOnly       bool // only corroborated / reviewed
 	Limit             int
 }
