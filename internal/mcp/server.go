@@ -98,7 +98,7 @@ func (s *Server) handle(req request) {
 			"protocolVersion": version,
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
 			"serverInfo":      map[string]any{"name": "agent-kb", "version": Version},
-			"instructions":    "Shared cross-agent knowledge for this repository. Call kb_search before changing code; claims marked unverified/disputed/stale are hypotheses. Verify other model families' claims with kb_verify; record durable lessons with kb_add.",
+			"instructions":    "Shared knowledge across agents and projects. Call kb_search before working on unfamiliar code; unverified/disputed/stale entries are leads to check. Record durable lessons with kb_add (pass evidence when you have it); fix stale or wrong entries with kb_update.",
 		}, nil)
 	case "notifications/initialized", "notifications/cancelled", "initialized":
 	case "ping":
@@ -157,10 +157,10 @@ func tools() []any {
 	return []any{
 		map[string]any{
 			"name":        "kb_search",
-			"description": "Search shared project knowledge. Returns one-line headers with trust badges. Pass files you will touch to get claims anchored to them.",
+			"description": "Search shared knowledge (current project + global by default). Returns one-line headers with trust badges. Pass files you will touch to get entries anchored to them; project or all_projects to widen.",
 			"inputSchema": schema(map[string]any{
-				"query": strP, "files": strsP, "types": strsP, "trusted_only": boolP, "include_deprecated": boolP,
-				"limit": map[string]any{"type": "integer"},
+				"query": strP, "files": strsP, "types": strsP, "project": strP, "all_projects": boolP,
+				"trusted_only": boolP, "include_deprecated": boolP, "limit": map[string]any{"type": "integer"},
 			}),
 		},
 		map[string]any{
@@ -170,15 +170,22 @@ func tools() []any {
 		},
 		map[string]any{
 			"name":        "kb_add",
-			"description": "Record a durable, non-obvious claim (starts unverified). type: fact|learning|decision|convention. resources: code globs it depends on.",
+			"description": "Record durable, non-obvious knowledge. type: fact|learning|decision|convention. evidence (how you know) makes it verified. resources: code globs it depends on. global: shared by all projects (projects: which ones it applies to).",
 			"inputSchema": schema(map[string]any{
-				"type": strP, "title": strP, "description": strP, "body": strP,
-				"resources": strsP, "tags": strsP, "supersedes": strsP,
+				"type": strP, "title": strP, "description": strP, "body": strP, "evidence": strP,
+				"resources": strsP, "tags": strsP, "supersedes": strsP, "project": strP, "global": boolP, "projects": strsP,
 			}, "type", "title", "description"),
 		},
 		map[string]any{
+			"name":        "kb_update",
+			"description": "Fix a stale or wrong entry in place (new revision). reason is required; evidence verifies the new content.",
+			"inputSchema": schema(map[string]any{
+				"id": strP, "reason": strP, "evidence": strP, "title": strP, "description": strP, "body": strP, "resources": strsP,
+			}, "id", "reason"),
+		},
+		map[string]any{
 			"name":        "kb_verify",
-			"description": "Record that you checked another model family's claim against the code. result: confirmed|disputed. evidence: what you checked.",
+			"description": "Record that you checked an entry against the code (any agent, including its author). result: confirmed|disputed. evidence: what you checked.",
 			"inputSchema": schema(map[string]any{
 				"id": strP, "result": map[string]any{"type": "string", "enum": []string{"confirmed", "disputed"}}, "evidence": strP,
 			}, "id", "result", "evidence"),
@@ -203,6 +210,8 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 			Query             string   `json:"query"`
 			Files             []string `json:"files"`
 			Types             []string `json:"types"`
+			Project           string   `json:"project"`
+			AllProjects       bool     `json:"all_projects"`
 			TrustedOnly       bool     `json:"trusted_only"`
 			IncludeDeprecated bool     `json:"include_deprecated"`
 			Limit             int      `json:"limit"`
@@ -210,7 +219,10 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 		if err := json.Unmarshal(orEmpty(raw), &a); err != nil {
 			return "", err
 		}
-		q := kb.SearchQuery{Text: a.Query, Files: a.Files, Types: a.Types, TrustedOnly: a.TrustedOnly, IncludeDeprecated: a.IncludeDeprecated, Limit: a.Limit}
+		q := kb.SearchQuery{Text: a.Query, Files: a.Files, Types: a.Types, AllProjects: a.AllProjects, TrustedOnly: a.TrustedOnly, IncludeDeprecated: a.IncludeDeprecated, Limit: a.Limit}
+		if a.Project != "" {
+			q.Projects = []string{a.Project}
+		}
 		if q.Text == "" && len(q.Files) == 0 {
 			return "", fmt.Errorf("give a query and/or files")
 		}
@@ -242,8 +254,9 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 		return strings.Join(parts, "\n---\n"), nil
 	case "kb_add":
 		var a struct {
-			Type, Title, Description, Body string
-			Resources, Tags, Supersedes    []string
+			Type, Title, Description, Body, Evidence, Project string
+			Resources, Tags, Supersedes, Projects             []string
+			Global                                            bool
 		}
 		if err := json.Unmarshal(orEmpty(raw), &a); err != nil {
 			return "", err
@@ -252,11 +265,37 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		res, err := s.Store.Add(kb.AddInput{Type: a.Type, Title: a.Title, Description: a.Description, Body: a.Body, Resources: a.Resources, Tags: a.Tags, Supersedes: a.Supersedes, Actor: actor})
+		if a.Global {
+			a.Project = kb.GlobalProject
+		}
+		res, err := s.Store.Add(kb.AddInput{Type: a.Type, Title: a.Title, Description: a.Description, Body: a.Body, Evidence: a.Evidence, Resources: a.Resources, Tags: a.Tags, Supersedes: a.Supersedes, Project: a.Project, Projects: a.Projects, Actor: actor})
 		if err != nil {
 			return "", err
 		}
 		return AddSummary(res), nil
+	case "kb_update":
+		var a struct {
+			ID, Reason, Evidence string
+			Title, Description   *string
+			Body                 *string
+			Resources            []string
+		}
+		if err := json.Unmarshal(orEmpty(raw), &a); err != nil {
+			return "", err
+		}
+		actor, err := s.actor()
+		if err != nil {
+			return "", err
+		}
+		in := kb.UpdateInput{Ref: a.ID, Reason: a.Reason, Evidence: a.Evidence, Title: a.Title, Description: a.Description, Body: a.Body, Actor: actor}
+		if len(a.Resources) > 0 {
+			in.Resources, in.SetResources = a.Resources, true
+		}
+		n, t, err := s.Store.Update(in)
+		if err != nil {
+			return "", err
+		}
+		return fmt.Sprintf("%s updated to revision %d [%s]\n", n.ID, t.Revision, t.Badge()), nil
 	case "kb_verify":
 		var a struct{ ID, Result, Evidence string }
 		if err := json.Unmarshal(orEmpty(raw), &a); err != nil {
@@ -335,12 +374,15 @@ func (s *Server) review(raw json.RawMessage) (string, error) {
 // AddSummary renders the result of an add for agents.
 func AddSummary(res *kb.AddResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "added %s [unverified]; another model family must verify it\n", res.Node.ID)
+	fmt.Fprintf(&b, "added %s [%s]\n", res.Node.ID, res.Trust.Badge())
+	if !res.Trust.Trusted() {
+		fmt.Fprintf(&b, "recorded as a lead: add -e \"<how you know>\" when you have evidence, or another agent can 'kb verify' it\n")
+	}
 	if res.Redacted > 0 {
 		fmt.Fprintf(&b, "redacted %d likely secret(s)\n", res.Redacted)
 	}
 	for _, r := range res.Related {
-		fmt.Fprintf(&b, "related: %s (%q, similarity %.2f): check whether it agrees or conflicts\n", r.ID, r.Title, r.Score)
+		fmt.Fprintf(&b, "related: %s (%q, similarity %.2f): if they overlap, merge with 'kb update %s'\n", r.ID, r.Title, r.Score, r.ID)
 	}
 	return b.String()
 }

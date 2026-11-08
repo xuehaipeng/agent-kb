@@ -31,41 +31,50 @@ type App struct {
 
 const usage = `kb - shared, cross-checked knowledge for coding agents (agent-kb)
 
-Retrieve:
-  kb search [query] [-f path]... [--type t] [--trusted] [--all] [-n N] [--json]
+Retrieve (in a hub: current repo's project + global by default):
+  kb search [query] [-f path]... [-p project] [--all] [--type t] [--trusted] [--deprecated] [-n N] [--json]
   kb show <id>... [--raw]
-  kb status [--brief] [--json]
+  kb status [--brief] [-p project] [--all] [--json]
 
-Record and cross-check:
-  kb add <fact|learning|decision|convention> <title> -d <one line> [-b body|-b -] [-r glob]... [-t tag]... [--supersedes id] [--force]
+Record and evolve:
+  kb add <fact|learning|decision|convention> <title> -d <one line> [-b body|-b -] [-r glob]... [-t tag]...
+         [-e evidence] [--global [--for p1,p2]] [-p project] [--supersedes id] [--force]
+  kb update <id> -m <why> [-t title] [-d line] [-b body|-b -] [-r glob]... [--tags t,..] [-e evidence]
   kb verify <id> --confirm|--dispute -e <evidence>
-  kb resolve <id> --keep|--deprecate [-m note] --as human:<name>
   kb deprecate <id> -m <reason>
+  kb resolve <id> --keep|--deprecate [-m note] --as human:<name>
+
+Projects (hub mode):
+  kb hub init [--remote <git url>]   create the multi-project hub (~/.kb or $KB_HOME)
+  kb hub clone <git url>             use an existing hub on this machine (e.g. the Hermes host)
+  kb hub import <repo>/knowledge [-p project]   move a repo bundle into the hub
+  kb project [list | link <id>]      show/list projects; map this repo to a project
 
 Cross-review:
   kb review submit <title> [-m summary] [--base ref] [--head ref] [-a assumption]...
-  kb review list [--for-me|--mine] [--all]
+  kb review list [--for-me|--mine] [--done] [-p project] [--all]
   kb review show <id>
   kb review verdict <id> --approve|--changes [-f finding]... [-m summary]
   kb review revise <id> [--head ref] [-m what changed]
   kb review close <id> [-m note]
 
 Set up and maintain:
-  kb init [--dir knowledge] [--install claude,codex,git-hooks]
-  kb install <claude|codex|cursor|antigravity|hermes|git-hooks|all>...
+  kb init [--dir knowledge] [--install claude,codex,git-hooks]   single-repo bundle (repo mode)
+  kb install <claude|codex|cursor|antigravity|hermes|git-hooks|all>... [--global|--repo]
   kb index [--quiet]          regenerate index.md files (deterministic)
   kb lint [--staged] [--fix]  deterministic checks; exit 1 on errors
   kb maintain                 index + pointer refresh + lint (cron-safe)
-  kb sync [--no-push]         git pull --rebase, reindex, commit knowledge/ only, push
+  kb sync [--no-push]         git pull --rebase, reindex, commit knowledge, push (hub or repo bundle)
   kb pointer                  print the always-on pointer text
 
 Capture and integration:
   kb extract --transcript <file> [--source claude|codex|text] [--final] [--dry-run]
-  kb extract --scan codex|claude [--days N]
+  kb extract --scan codex|claude [--days N]   (hub: routes each session to its project)
   kb hook claude              Claude Code hook entry point (reads hook JSON on stdin)
   kb mcp [--as actor]         stdio MCP server (kb_search, kb_show, kb_add, kb_verify, kb_review)
 
-Global: --root <bundle dir> (or KB_ROOT), --as <actor> (or KB_ACTOR, e.g. codex/gpt-5.2, human:alice)
+Global: --root <bundle or hub dir> (or KB_ROOT), --as <actor> (or KB_ACTOR, e.g. codex/gpt-5.2, human:alice)
+Hub location: $KB_HOME (default ~/.kb). A repo with knowledge/kb.yaml uses its own bundle instead.
 `
 
 // Run executes the command line and returns an exit code.
@@ -116,6 +125,12 @@ done:
 		err = a.cmdResolve(rest)
 	case "deprecate":
 		err = a.cmdDeprecate(rest)
+	case "update", "edit":
+		err = a.cmdUpdate(rest)
+	case "project", "projects":
+		err = a.cmdProject(rest)
+	case "hub":
+		err = a.cmdHub(rest)
 	case "review":
 		err = a.cmdReview(rest)
 	case "status":
@@ -193,7 +208,7 @@ func (a *App) cmdInit(args []string) error {
 	a.printResult(res)
 	a.out("knowledge bundle ready at %s\n", s.Dir)
 	for _, t := range expandTargets(targets) {
-		r, err := install.Run(s, t, nil)
+		r, err := install.Run(s, t, map[string]string{"scope": "repo"})
 		if err != nil {
 			return fmt.Errorf("install %s: %w", t, err)
 		}
@@ -202,6 +217,7 @@ func (a *App) cmdInit(args []string) error {
 	}
 	if len(targets) == 0 {
 		a.out("next: kb install claude codex git-hooks   (then commit %s/ and the pointer files)\n", dir)
+		a.out("tip: working across several repos? 'kb hub init' keeps every project's knowledge in one place instead\n")
 	}
 	return nil
 }
@@ -232,7 +248,10 @@ func (a *App) cmdInstall(args []string) error {
 	a.globals(f)
 	opts := map[string]string{}
 	var skills string
+	var global, repo bool
 	f.str(&skills, "", "Hermes skills directory", "skills-dir")
+	f.boolean(&global, "install user-wide (default with a hub)", "global")
+	f.boolean(&repo, "install into the current repository (default with a repo bundle)", "repo")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -240,7 +259,16 @@ func (a *App) cmdInstall(args []string) error {
 	if len(pos) == 0 {
 		return fmt.Errorf("install what? one or more of: %s, all", strings.Join(install.Targets, ", "))
 	}
+	if global && repo {
+		return errors.New("--global and --repo are exclusive")
+	}
 	opts["skills-dir"] = skills
+	if global {
+		opts["scope"] = "global"
+	}
+	if repo {
+		opts["scope"] = "repo"
+	}
 	s, err := a.store()
 	if err != nil {
 		return err
@@ -261,6 +289,7 @@ func (a *App) cmdInstall(args []string) error {
 
 type hitJSON struct {
 	ID          string   `json:"id"`
+	Project     string   `json:"project,omitempty"`
 	Type        string   `json:"type"`
 	Title       string   `json:"title"`
 	Description string   `json:"description"`
@@ -279,8 +308,10 @@ func (a *App) cmdSearch(args []string) error {
 	var asJSON bool
 	f.list(&q.Files, true, "file you will touch", "f", "file")
 	f.list(&q.Types, true, "type filter", "type")
-	f.boolean(&q.TrustedOnly, "only corroborated/reviewed", "trusted")
-	f.boolean(&q.IncludeDeprecated, "include deprecated", "all")
+	f.list(&q.Projects, true, "project(s) to search (hub)", "p", "project")
+	f.boolean(&q.AllProjects, "search every project (hub)", "all")
+	f.boolean(&q.TrustedOnly, "only verified/cross-checked/reviewed", "trusted")
+	f.boolean(&q.IncludeDeprecated, "include deprecated", "deprecated")
 	f.integer(&q.Limit, 0, "max results", "n", "limit")
 	f.boolean(&asJSON, "JSON output", "json")
 	pos, err := f.parse(args)
@@ -303,7 +334,7 @@ func (a *App) cmdSearch(args []string) error {
 		out := []hitJSON{}
 		for _, h := range hits {
 			m := h.Node.Meta()
-			out = append(out, hitJSON{h.Node.ID, h.Node.TypeKey, m.Title, m.Description, h.Trust.State, h.Trust.Stale, h.Trust.StaleReason, h.PathMatch, m.Resources, h.Score})
+			out = append(out, hitJSON{h.Node.ID, h.Node.Project, h.Node.TypeKey, m.Title, m.Description, h.Trust.State, h.Trust.Stale, h.Trust.StaleReason, h.PathMatch, m.Resources, h.Score})
 		}
 		return a.json(out)
 	}
@@ -367,13 +398,21 @@ func (a *App) cmdAdd(args []string) error {
 	f.list(&in.Resources, true, "code glob", "r", "resource", "resources")
 	f.list(&in.Tags, true, "tag", "t", "tag", "tags")
 	f.list(&in.Supersedes, true, "id this replaces", "s", "supersedes")
+	f.str(&in.Evidence, "", "how you know (makes the entry verified)", "e", "evidence")
+	f.str(&in.Project, "", "target project (hub)", "p", "project")
+	f.list(&in.Projects, true, "with --global: projects it applies to", "for")
+	var global bool
+	f.boolean(&global, "store in the global scope shared by all projects (hub)", "global")
 	f.boolean(&in.Force, "skip duplicate check", "force")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
 	}
 	if len(pos) < 2 {
-		return errors.New("usage: kb add <fact|learning|decision|convention> <title> -d <one line> [-b body] [-r glob]...")
+		return errors.New("usage: kb add <fact|learning|decision|convention> <title> -d <one line> [-b body] [-r glob]... [-e evidence] [--global]")
+	}
+	if global {
+		in.Project = kb.GlobalProject
 	}
 	in.Type, in.Title = pos[0], strings.Join(pos[1:], " ")
 	if bodyFile != "" {
@@ -501,8 +540,11 @@ func (a *App) cmdStatus(args []string) error {
 	f := newFlags("status")
 	a.globals(f)
 	var brief, asJSON bool
+	var o kb.StatusOptions
 	f.boolean(&brief, "only what needs attention", "brief")
 	f.boolean(&asJSON, "JSON output", "json")
+	f.list(&o.Projects, true, "project(s) (hub)", "p", "project")
+	f.boolean(&o.AllProjects, "every project (hub)", "all")
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
@@ -510,8 +552,8 @@ func (a *App) cmdStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	me, _ := a.actor()
-	r, err := s.Status(me)
+	o.Me, _ = a.actor()
+	r, err := s.StatusFor(o)
 	if err != nil {
 		return err
 	}
@@ -662,16 +704,7 @@ func (a *App) cmdPointer(args []string) error {
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
-	rel := kb.DefaultBundleDir
-	if s, err := a.store(); err == nil {
-		data, err := os.ReadFile(filepath.Join(s.Dir, "POINTER.md"))
-		if err == nil {
-			a.out("%s", data)
-			return nil
-		}
-		rel = filepath.Base(s.Dir)
-	}
-	a.out("%s", install.Pointer(rel))
+	a.out("%s", install.Pointer())
 	return nil
 }
 
@@ -707,8 +740,17 @@ func (a *App) cmdExtract(args []string) error {
 	f.str(&cmdStr, "", "override extractor command (space separated)", "cmd")
 	f.boolean(&o.Final, "advance the offset even if too short", "final")
 	f.boolean(&o.DryRun, "print the prompt, do not call a model", "dry-run")
+	var thenSync bool
+	f.boolean(&thenSync, "run 'kb sync' afterwards (hub mode)", "sync")
 	if _, err := f.parse(args); err != nil {
 		return err
+	}
+	if thenSync {
+		defer func() {
+			if err := a.cmdSync(nil); err != nil {
+				fmt.Fprintln(a.Stderr, "kb: sync after extract:", err)
+			}
+		}()
 	}
 	s, err := a.store()
 	if err != nil {

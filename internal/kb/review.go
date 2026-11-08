@@ -33,7 +33,11 @@ func (s *Store) ReviewSubmit(in SubmitInput) (*Node, error) {
 		return nil, errors.New("a one-line task summary (title) is required")
 	}
 	if !s.InGit() {
-		return nil, errors.New("reviews need a git work tree at code_root")
+		return nil, errors.New("reviews need to run inside the project's git repository")
+	}
+	project, err := s.targetProject("")
+	if err != nil {
+		return nil, err
 	}
 	head := in.Head
 	if head == "" {
@@ -88,7 +92,7 @@ func (s *Store) ReviewSubmit(in SubmitInput) (*Node, error) {
 	concepts := cleanList(in.Concepts)
 	if len(concepts) == 0 {
 		// Attach the verified knowledge anchored to the touched files.
-		hits, _ := s.Search(SearchQuery{Files: files, Limit: 10})
+		hits, _ := s.Search(SearchQuery{Files: files, Limit: 10, Projects: projectList(project)})
 		for _, h := range hits {
 			concepts = append(concepts, h.Node.ID)
 		}
@@ -133,13 +137,16 @@ func (s *Store) ReviewSubmit(in SubmitInput) (*Node, error) {
 	if ttl := s.Cfg.Types["review"].TTLDays; ttl > 0 {
 		meta.StaleAfter = now.Add(time.Duration(ttl) * 24 * time.Hour).Format(time.RFC3339)
 	}
+	if err := s.ensureProject(project); err != nil {
+		return nil, err
+	}
 	dir := s.Cfg.Types["review"].Dir
-	id := s.uniqueID(dir, now.Format("20060102")+"-"+Slugify(in.Title))
-	n := &Node{ID: id, Path: filepath.Join(s.Dir, filepath.FromSlash(id)+".md"), TypeKey: "review", Doc: okf.New(meta, body.String())}
+	local := s.uniqueLocalID(project, dir, now.Format("20060102")+"-"+Slugify(in.Title))
+	n := &Node{ID: joinID(project, local), Project: project, Path: s.pathFor(project, local), TypeKey: "review", Doc: okf.New(meta, body.String())}
 	if err := s.writeNode(n); err != nil {
 		return nil, err
 	}
-	return n, s.recordChange("review-submit", id, in.Actor, fmt.Sprintf("%s..%s %s", baseSHA, headSHA, in.Title))
+	return n, s.recordChange("review-submit", n.ID, in.Actor, fmt.Sprintf("%s..%s %s", baseSHA, headSHA, in.Title))
 }
 
 func (s *Store) defaultBase() string {
@@ -159,7 +166,19 @@ func (s *Store) defaultBase() string {
 	return ""
 }
 
+// codePathspecFor limits a diff in root to code, excluding a repo-mode
+// bundle that lives inside the same repository.
+func (s *Store) codePathspecFor(root string) []string {
+	if !s.Hub && root == s.CodeRoot {
+		return s.CodePathspec()
+	}
+	return []string{"--"}
+}
+
 func (s *Store) bundleRelToTop() string {
+	if s.Hub {
+		return ""
+	}
 	top := s.GitTop()
 	if top == "" {
 		return ""
@@ -207,10 +226,10 @@ func (s *Store) ReviewVerdict(in VerdictInput) (*Node, string, error) {
 	if st, _ := s.ReviewState(n); st == ReviewClosed {
 		return nil, "", fmt.Errorf("%s is closed", n.ID)
 	}
+	// Same-family reviews are allowed (a fresh session catches a lot) but
+	// labelled, since they are less independent than a cross-family review.
 	authorFam := s.Cfg.FamilyOf(m.Generated.By)
-	if fam := s.Cfg.Family(in.Actor); fam == authorFam && fam != "human" {
-		return nil, "", fmt.Errorf("self-review rejected: %s was authored by %s (family %s); a different model family or a human must review it", n.ID, m.Generated.By, authorFam)
-	}
+	sameFamily := s.Cfg.Family(in.Actor) == authorFam && authorFam != "human"
 	result := ResultApproved
 	if !in.Approve {
 		result = ResultChanges
@@ -226,7 +245,11 @@ func (s *Store) ReviewVerdict(in VerdictInput) (*Node, string, error) {
 	}
 	n.Doc.AppendVerified(okf.Event{By: in.Actor.String(), At: s.nowString(), Result: result, Commit: head, Evidence: evidence})
 	var b strings.Builder
-	fmt.Fprintf(&b, "\n### %s by %s at %s (head %s)\n\n", result, in.Actor, s.Now().UTC().Format("2006-01-02 15:04Z"), head)
+	label := ""
+	if sameFamily {
+		label = ", same model family as the author"
+	}
+	fmt.Fprintf(&b, "\n### %s by %s at %s (head %s%s)\n\n", result, in.Actor, s.Now().UTC().Format("2006-01-02 15:04Z"), head, label)
 	if summary != "" {
 		b.WriteString(summary + "\n\n")
 	}
@@ -251,6 +274,9 @@ func (s *Store) ReviewRevise(ref, head, note string, actor Actor) (*Node, error)
 	}
 	if head == "" {
 		head = "HEAD"
+	}
+	if !s.InGit() {
+		return nil, errors.New("run 'kb review revise' inside the project's git repository")
 	}
 	sha, err := Git(s.CodeRoot, "rev-parse", "--short=12", head)
 	if err != nil {
@@ -341,9 +367,11 @@ type ReviewItem struct {
 
 // ReviewFilter selects reviews for listing.
 type ReviewFilter struct {
-	All    bool  // include closed and approved
-	ForMe  Actor // awaiting a verdict that this actor may give
-	MineBy Actor // authored by this actor's family
+	All         bool  // include closed and approved
+	ForMe       Actor // pending reviews authored by another model family
+	MineBy      Actor // authored by this actor's family
+	Projects    []string
+	AllProjects bool
 }
 
 // Reviews lists reviews, newest first.
@@ -352,9 +380,10 @@ func (s *Store) Reviews(f ReviewFilter) ([]ReviewItem, error) {
 	if err != nil {
 		return nil, err
 	}
+	inScope := s.scopeFilter(f.Projects, f.AllProjects)
 	var out []ReviewItem
 	for _, n := range nodes {
-		if n.TypeKey != "review" {
+		if n.TypeKey != "review" || !inScope(n) {
 			continue
 		}
 		st, v := s.ReviewState(n)

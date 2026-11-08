@@ -107,3 +107,5 @@ func (f *flags) parse(args []string) ([]string, error) {
 	}
 	return pos, nil
 }
+
+type flagT = flag.Flag

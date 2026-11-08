@@ -1,241 +1,248 @@
 # AgentKB architecture
 
-This document reviews the two input designs, picks an architecture, and
-records every place the implementation deviates from them and why.
+This document reviews the input designs, records the architecture that was
+built, and explains every deviation. Revision 2 (2026-11-08) folds in the
+user's clarified priorities; the decisions it changed are marked.
 
 Inputs:
 
 - **Doc A**: *Build a git-backed knowledge bundle agents push into*, plus its
-  2026-11-08 addendum (Claude Code and Codex primary, Hermes remote, goal is
-  cross-checking facts and cross-reviewing tasks, retrieval must stay thin).
+  addendum (Claude Code and Codex primary, Hermes remote, thin retrieval).
 - **Doc B**: *Technical Design & Implementation Plan: AgentKB* (single binary,
-  `kb_search` / `kb_fetch` / `kb_propose` / `kb_verify` / `kb_review`,
-  code-anchored staleness, bilateral review packets, Tailscale or git sync for
-  Hermes).
-- A ChatGPT share link was also supplied but could not be retrieved (the page
-  requires a logged-in browser), so it did not inform this design.
+  `kb_search`/`kb_fetch`/`kb_propose`/`kb_verify`/`kb_review`, code-anchored
+  staleness, review packets).
+- **Doc C**: *Cross-Agent Knowledge and Review System* (the ChatGPT plan):
+  evidence model, exact-artifact reviews, publication guarantees, evaluation.
+- **User priorities (rev 2):**
+  1. Knowledge sharing is the main goal; cross-checking is one function among others.
+  2. A confident agent's knowledge should count without a second agent; keeping entries current matters more than gating them.
+  3. Knowledge must be grouped by project/repo across many repositories (personal and organisation repos).
 
-## 1. Where the two designs agree
+## 1. What all inputs agree on (kept as-is)
 
-Both designs land on the same skeleton, and the implementation keeps it as-is:
-
-| Decision | Doc A | Doc B |
-|---|---|---|
-| Canonical store is plain Markdown + YAML frontmatter in git | `knowledge/` OKF v0.2 bundle | `.agent-kb/concepts/` OKF-style nodes |
-| One atomic claim per file | Zettelkasten granularity | "single atomic concept" |
-| Retrieval is index-first and progressive, not injected | ~25-line pointer, hierarchical indexes, search CLI | <150-token bootstrapper, `kb_search` then `kb_fetch` |
-| Writes go through a tool, never raw edits | `kn add` / MCP | `kb_propose` |
-| Every claim is a small state machine verified by a *different* agent | `status: draft` until another family verifies | `unverified -> corroborated/disputed`, self-verification rejected |
-| Cross-review is a first-class record | `Review` task, `reviewer_must_differ_from` | review packet with git range |
-| Hermes syncs over git | git transport, cron pull | git auto-sync fallback |
-| Deterministic lint, index is generated | pre-commit schema + retired-terms lint | `agent-kb lint`, `sync-index` |
-
-## 2. Where they differ, and what this implementation picks
-
-### 2.1 Directory and schema: OKF-native fields (Doc A) + code anchors (Doc B)
-
-Doc B invents its own frontmatter (`id`, `trust_state`, `proposed_by`,
-`verified_by`, `verified_commit`). Doc A uses OKF v0.2's own vocabulary
-(`generated`, `verified`, `status`, `stale_after`, `sources`). **We use the OKF
-vocabulary**, because OKF already defines exactly these concepts and an
-OKF-aware tool (Obsidian exporter, `okf-mcp`, future agents) can read the bundle
-without translation. We add Doc B's best idea as OKF extension keys, which the
-spec permits:
-
-- `resources:` code globs the claim is about. This powers path-aware search and
-  code-anchored staleness.
-- `generated.commit` / `verified[].commit`: the git `HEAD` at write/verify time.
-- `verified[].result` (`confirmed` | `disputed` | `approved` | `changes_requested`)
-  and `verified[].evidence`.
-- `supersedes:` for Decision chains, `review:` for review packets.
-
-Two of Doc B's fields are dropped on purpose:
-
-- **No `id` field.** OKF says a concept's ID is its path. A stored ID can drift
-  from the filename; a path can't.
-- **No stored `trust_state`.** Trust is *derived* on every read from the
-  append-only `verified` list, `stale_after`, `supersedes` links and git
-  history. A stored state field is a second source of truth that drifts, which
-  is the exact failure mode both documents are trying to prevent. OKF `status`
-  (`draft|stable|deprecated`) is kept for OKF compatibility, written only by the
-  tool, and checked by lint.
-
-The directory is `knowledge/` (Doc A), not `.agent-kb/` (Doc B): visible
-directories show up in PR review, in Obsidian (which ignores dot-folders), and
-in GitHub's file browser. Typed subdirectories (`facts/`, `learnings/`,
-`decisions/`, `conventions/`, `reviews/`) make per-directory indexes and
-per-type lifecycle rules trivial.
-
-### 2.2 Trust model: family-level guardrail, human override, derived states
-
-Doc B rejects `verifier == proposer` at the agent level. Doc A requires a
-different *agent family*. **We implement Doc A's rule**, because the point of
-cross-checking is model independence: Cursor running Claude corroborating Claude
-Code is not independent. Family is resolved from the actor string
-`<producer>/<model>`: a recognised model prefix wins (`cursor/claude-sonnet-4.5`
-is `anthropic`), otherwise the producer default applies (`codex` is `openai`).
-The mapping lives in `kb.yaml`.
-
-Derived states, highest precedence first:
-
-| State | Rule |
+| Decision | Where it comes from |
 |---|---|
-| `deprecated` | `status: deprecated`, or another node `supersedes` it |
-| `disputed` | a cross-family `disputed` event after the last human event |
-| `reviewed` | last human event confirmed it, no dispute since |
-| `corroborated` | at least one cross-family `confirmed` event |
-| `unverified` | everything else |
+| Canonical store is Markdown + YAML frontmatter in git | A, B, C |
+| One small claim per file | A (Zettelkasten), B (atomic concepts) |
+| Retrieval is index-first and on demand, not injected | A addendum, B, C §7 |
+| Writes go through a tool, never raw edits | A, B, C §9 |
+| `generated` and `verified` are separate events | A (OKF), C §3.3 |
+| Reviews bind to exact commits; a new head invalidates old verdicts | B, C §8.3 |
+| Changed dependencies trigger revalidation, not falsification | B (git staleness), C §9.2 |
+| Hermes reaches the knowledge over git, not a shared home dir | A, C §10 |
+| Deterministic lint and generated indexes | A, B |
 
-`stale` is an orthogonal flag, set when `stale_after` has passed **or** when any
-file matched by `resources` changed in git since the anchoring commit (the last
-confirming commit, else the generation commit). Disputes are resolved only by a
-human (`kb resolve --as human:<id>`), per Doc A.
+## 2. Decisions and deviations
 
-### 2.3 Index: in-process BM25 instead of a SQLite FTS5 cache
+### 2.1 Schema: OKF vocabulary + code anchors
 
-Both documents specify a derived, gitignored SQLite FTS5 database. **We don't
-ship one.** At the scale both documents target (hundreds of files, with
-embeddings deferred past ~200), parsing the whole bundle and ranking with BM25
-in-process takes milliseconds. A cache adds the exact bug class the research
-warns about (an index that disagrees with disk), plus a WAL file, an
-invalidation hook, and a 10 MB SQLite dependency on every host including
-Hermes. The search layer is one function behind a small interface, so a
-persistent FTS or embeddings index can be added later without changing callers.
+OKF v0.2 fields (`type`, `title`, `description`, `generated`, `verified`,
+`status`, `stale_after`, `sources`) plus extension keys: `resources` (code
+globs), `revision`/`updated` (rev 2), `projects` (global entries, rev 2),
+`supersedes`, `review`, and per-event `result`, `rev`, `commit`, `evidence`.
 
-### 2.4 Write path: trust state is the inbox
+Dropped from Doc B: a stored `id` (OKF IDs are paths) and a stored
+`trust_state` (a second source of truth that drifts). OKF `status` is kept
+for compatibility, written only by the tool, and checked by lint.
 
-Doc A stages proposals in `.inbox/` and promotes them with a nightly
-consolidator. Doc B writes directly as `unverified`. **We follow Doc B.** With
-the claims ledger from Doc A's addendum, `unverified` already *is* the staging
-area: unverified claims are labelled as hypotheses and ranked below verified
-ones. A second staging layer would hide new claims from the agents who are
-supposed to verify them. Duplicate control moves to write time: `kb add`
-rejects near-duplicates (title/description Jaccard ≥ 0.85) and reports related
-claims in the 0.5–0.85 band so the agent can verify or dispute them instead.
+### 2.2 Trust model *(changed in rev 2)*
 
-Rewrite corruption is bounded by policy, as in Doc A: agents never rewrite a
-file. The tool appends to `verified`, sets `status`/`stale_after`, and appends
-review verdicts. Content changes happen by superseding. `decisions/` and
-`learnings/` are immutable, and `kb lint --staged` fails a commit that edits
-their body.
+Rev 1 required a different model family before an entry counted
+(`unverified` until cross-checked; same-family verification rejected). The
+user rejected this as too strict: most simple-to-medium tasks are done by one
+agent, and gating knowledge behind a second agent starves sharing. Rev 2:
 
-### 2.5 CLI first, MCP second
+| State | Rule (computed from events on the **current revision**) |
+|---|---|
+| `deprecated` | `status: deprecated`, or superseded |
+| `disputed` | the latest event is a dispute |
+| `reviewed` | a human confirmed it after the latest dispute |
+| `cross-checked` | a family other than the content author's confirmed it |
+| `verified` | the author's family confirmed it with evidence, including at write time (`kb add -e`) |
+| `unverified` | no evidence yet: a lead |
 
-Doc B makes MCP primary. Doc A's addendum makes a CLI primary with an MCP
-wrapper for clients that cannot shell out. **We follow the addendum.** Claude
-Code, Codex, Cursor and Hermes can all run shell commands, and a CLI costs zero
-context per session, while every MCP tool schema is paid for in every session.
-The same binary serves `kb mcp` (stdio, five tools) for Hermes gateways and IDEs
-that prefer it. There is no HTTP listener: Doc B's Tailscale endpoint is a
-network-exposed write path (the claude-mem port-37777 class of problem). Git
-transport covers Hermes.
+`stale` stays an orthogonal flag (past `stale_after`, or `resources` changed
+in git since the last confirmation). Nothing stores the state.
 
-### 2.6 Capture: hooks where they exist, honest gaps elsewhere
+The latest event wins, so agents can settle a dispute themselves by
+re-checking or by fixing the entry; `kb resolve` remains for explicit human
+calls. Following Doc C ("repetition is not corroboration"; "different brands
+are not statistical independence"), cross-family confirmation is shown as a
+stronger signal and ranked higher, not counted as proof.
 
-- **Claude Code**: `SessionStart` prints a one-to-three-line brief (reviews
-  waiting for you, disputed claims) into context. `PreCompact` and `SessionEnd`
-  spawn a detached `kb extract`, which condenses the transcript and runs a cheap
-  model (configurable, default `claude -p --model haiku`) to propose at most
-  five claims as `unverified`. A per-session byte offset prevents re-extracting
-  after compaction. A recursion guard (`KB_EXTRACTING`) stops the extractor's
-  own session from triggering the hook.
-- **Codex**: no lifecycle hooks are documented, so `kb extract --scan codex`
-  walks `~/.codex/sessions/**/rollout-*.jsonl` filtered to this repo's `cwd`
-  (run it nightly), plus the pointer instruction to `kb add` explicitly.
-- **Hermes**: the skill instructs it to use `kb`. `kb sync` on cron does pull,
-  re-index, commit `knowledge/` only, and push.
-- **Cursor / Antigravity / GrokBot**: read-mostly via the `AGENTS.md` pointer.
+### 2.3 Evolving entries *(new in rev 2)*
 
-### 2.7 Reviews as Markdown, not JSON
+`kb update` rewrites an entry's content as a new revision: `revision: N`,
+`updated: {by, at, commit, evidence: <reason>}`. Each verification event
+carries the revision it checked (Doc C's `record_revision`), so the new
+content starts fresh, the old checks stay visible as history, and git keeps
+every prior version (hub autocommit gives one commit per change). Any agent
+may update or deprecate with a reason.
 
-Doc B stores review packets as JSON. **We store them as OKF Markdown**
-(`type: Review`) so they are human-readable, diffable, linted and searchable
-like everything else. The packet holds summary, assumptions, `base..head`,
-touched files (computed from git) and `reviewer_must_differ_from`. Following
-Doc A's independence rule, the packet contains claims and the diff only, not the
-author's reasoning. `kb review show` adds the diffstat and the corroborated
-invariants whose `resources` match the touched files. Verdicts are appended
-events, and the reviewer's family must differ from the author's. `kb review
-revise` records a new `head` after fixes and reopens the review.
+Rewrite drift (Doc A's ~25% corruption after 20 LLM edits) is bounded by
+keeping entries small, requiring a reason per revision, keeping git history,
+and showing which revision each check covered. Decisions remain immutable and
+change by superseding, because the sequence of decisions is itself knowledge.
+Learnings are mutable in rev 2 (they were immutable in rev 1).
 
-### 2.8 Things deliberately left out (for now)
+### 2.4 Multi-project hub *(new in rev 2)*
 
-- `.inbox/` and a nightly LLM consolidator (see 2.4). `kb maintain` (index +
-  lint) is deterministic and cron-safe.
-- Embeddings, Notion/Obsidian/NotebookLM publishing, Tailscale HTTP MCP.
-- A `local`/`user` scope inside the bundle. Per Doc A's addendum, user
-  preferences stay in each agent's private memory; machine-local state lives in
-  the gitignored `knowledge/.kb/`.
-- A "digest" injected every turn (Doc A's original draft, replaced by its own
-  addendum with the pointer + search model).
+Rev 1 put a `knowledge/` bundle inside each repo. For a user working across
+many repos, including organisation repos shared with teammates, that:
+1. needs the team's buy-in to commit agent files into shared repos;
+2. leaves no home for knowledge that spans projects;
+3. makes Hermes clone every code repo to read knowledge.
 
-## 3. Resulting architecture
+Rev 2 makes a hub the default:
+
+- `~/.kb` (or `$KB_HOME`) is one git repo, ideally with a private remote. It
+  holds `global/` and `projects/<id>/`, each with the usual typed directories.
+- **Project detection:** the current repo's `origin` URL is normalised
+  (`git@github.com:Org/Repo.git` becomes `github.com/org/repo`) and looked up
+  in each `projects/<id>/project.yaml` `repos:` list. Otherwise the id is the
+  repo name, or `owner-name` if another repo already claimed that name.
+  `kb project link <id>` maps forks, renames and multi-repo projects (backend
+  + frontend).
+- **Scope:** default search, status and review lists cover the current
+  project plus global entries whose `projects:` list is empty or includes it.
+  Outside any repo (e.g. on Hermes) the default is every project. `-p` and
+  `--all` widen it.
+- **Staleness across projects:** a gitignored registry (`.kb/registry.json`)
+  records local checkouts as `kb` runs in them, so an entry from another
+  project is still checked against its own repo when that repo is on this
+  machine.
+- **Sharing:** every write autocommits to the hub. `kb sync` does pull,
+  rebase, reindex and push. Claude Code hooks pull at session start and push
+  after extraction at session end, both in the background.
+- **Installs are user-wide:** `~/.claude/CLAUDE.md` imports
+  `~/.kb/POINTER.md`; `~/.codex/AGENTS.md` carries the pointer; skills live in
+  `~/.claude/skills` and `~/.codex/skills`. Nothing is written into code
+  repos.
+- **Repo mode stays:** a repo with `knowledge/kb.yaml` uses its own bundle
+  (this repository does), and `kb hub import` moves such a bundle into the
+  hub.
+
+### 2.5 Index: in-process BM25, no SQLite cache
+
+Docs A and B proposed a gitignored SQLite FTS5 index. At hundreds of entries
+per project, parsing everything and ranking with BM25 in-process takes
+milliseconds and can't disagree with disk. Search sits behind one function,
+so a persistent or embedding index can be added later. Han, Kana and Hangul
+text are tokenised as unigrams and bigrams.
+
+### 2.6 Write path: no inbox
+
+Entries land directly in their typed directory, verified or unverified
+depending on evidence (rev 2). A Doc A-style `.inbox/` plus consolidator would
+hide new knowledge from the agents who need it. Duplicates are caught at write
+time (Jaccard ≥ 0.85 within the project), and related entries (0.4–0.85) are
+pointed out so agents update them instead of adding variants.
+
+### 2.7 CLI first, MCP second
+
+Shell commands cost no context until used, and every MCP tool schema is paid
+for in every session. `kb mcp` serves six tools over stdio for clients that
+prefer tools. There is no HTTP listener, since that would be an
+unauthenticated write path.
+
+### 2.8 Capture
+
+- **Claude Code:**
+  - `SessionStart` prints at most a few lines (reviews waiting, disputes, stale entries) and pulls the hub.
+  - `PreCompact`/`SessionEnd` run `kb extract` detached, then sync.
+  - Per-transcript offsets and a recursion guard make it safe.
+- **Codex:** no hooks, so `kb extract --scan codex` reads `~/.codex/sessions` and routes each session to the project of its `cwd`.
+- **Hermes:** the skill, `kb add -p <project>`, and `kb sync` on cron.
+
+Per Doc C, hooks are not the only capture path: the pointer tells agents to
+record durable findings at the moment they're established.
+
+### 2.9 Reviews
+
+Reviews are OKF Markdown packets (`type: Review`) bound to `base..head`. Files
+come from git, with knowledge anchored to the touched files attached. Verdicts
+are events scoped to the head; `kb review revise` moves the head and reopens
+the review. Rev 2 allows same-family reviews but labels them (a fresh session
+is a useful reviewer), keeping cross-family review as the stronger option.
+
+## 3. Doc C (ChatGPT plan) review
+
+**Adopted in rev 2:**
+- Verification events scoped to a content revision.
+- Search reports truncation ("N more") and the scope searched, so a miss isn't presented as absence.
+- `kb show` fences entry content as data, not instructions.
+- `kb status` shows knowledge not yet shared (uncommitted files, unpushed commits).
+- Global entries can name the projects they apply to.
+
+**Not adopted:**
+- A central always-on record service with queues, leases, caches and an outbox. A git hub already gives an authority (the remote), offline pending writes (unpushed commits) and history, with nothing to operate.
+- Re-platforming on Basic Memory or Notion Lore. Neither has evidence-scoped verification, code-anchored staleness or commit-bound reviews. Basic Memory is AGPL with no built-in local sync; Lore keeps the authority in Notion.
+
+**Backlog, in priority order:**
+1. An `incomplete` verdict plus coverage fields (criteria checked, tests run or unavailable) and acceptance criteria in review packets.
+2. `kb review run`, which dispatches the other agent non-interactively.
+3. Decision authority (who decided) kept separate from verification of the implementation.
+4. A verification `method` (inspected vs reproduced) and `derived_from` lineage.
+5. Branch applicability via `git merge-base --is-ancestor`.
+6. Verification events as separate files, so two machines checking the same entry between syncs never conflict.
+7. Doc C's four-condition evaluation (baseline / memory only / review only / both).
+
+## 4. Resulting architecture
 
 ```
-repo/
-  AGENTS.md                 <!-- kb:begin --> ~20-line pointer <!-- kb:end -->  (Codex, Cursor, Antigravity)
-  CLAUDE.md                 @knowledge/POINTER.md                           (Claude Code)
-  .claude/settings.json     hooks: SessionStart / PreCompact / SessionEnd -> kb hook claude
-  .claude/skills/kb/        progressive-disclosure skill (full command reference)
-  knowledge/
-    kb.yaml                 config: types, TTLs, families, retired terms, extractor commands
-    POINTER.md              generated pointer (same text everywhere)
-    README.md               for humans
-    index.md                generated root index (<= 60 lines)
-    log.md                  append-only audit log (merge=union)
-    facts/ learnings/ decisions/ conventions/ reviews/
-      index.md              generated per-directory index (<= 200 lines)
-      <slug>.md             one OKF node per claim
-    .kb/                    gitignored: lock file, extraction offsets, logs
+ agent ──(pointer, ~20 lines, user-wide)──> kb search ──> kb show
+   │                                          │ BM25 + path boost, scope = project + global
+   │                                          │ trust derived per revision, staleness from git
+   └── kb add / update / verify / deprecate ──┴─> flock ─> atomic write ─> log.md + reindex
+                                                                         └─> hub autocommit
+ ~/.kb (git) <── kb sync ──> private remote <── kb sync ── Hermes host (~/.kb clone)
 ```
-
-```
-              read (no tool schema cost)                write (tool-stamped, append-only)
- agent ──> pointer ──> kb search --file ──> kb show      kb add ─┐
-                         │  BM25 + path boost            kb verify ─┼─> flock ─> atomic write ─> log.md
-                         │  derived trust + git staleness kb review ─┘
-                         ▼
-              knowledge/*.md  <── git ──>  Hermes host (kb sync on cron)
-```
-
-Single static Go binary `kb` (only dependency: `gopkg.in/yaml.v3`):
 
 | Command | Purpose |
 |---|---|
-| `kb init` | create bundle, config, pointer, `.gitignore`/`.gitattributes` entries |
-| `kb install claude\|codex\|cursor\|antigravity\|hermes\|git-hooks` | write pointer blocks, skill, hooks, git hooks; print MCP snippets |
-| `kb search [query] [--file p]...` | compact ranked headers with trust badges (≈ 15–25 tokens per hit) |
-| `kb show <id>...` | condensed node(s): trust trail, resources, body |
-| `kb add <type> <title> -d -b -r -t -s` | propose a claim (`unverified`), duplicate check, secret redaction |
-| `kb verify <id> --confirm\|--dispute -e` | cross-family verification, commit-stamped |
-| `kb resolve <id> --keep\|--deprecate --as human:x` | human resolution of disputes |
-| `kb deprecate <id>` | retract (human or the generating family) |
-| `kb review submit\|list\|show\|verdict\|revise\|close` | cross-review loop |
-| `kb status [--brief]` | counts, disputes, stale, reviews waiting |
-| `kb index` / `kb lint [--staged] [--fix]` / `kb maintain` | deterministic upkeep |
-| `kb extract` / `kb hook claude` | capture from transcripts |
-| `kb sync` | git pull/rebase, re-index, commit `knowledge/`, push |
-| `kb mcp [--as actor]` | stdio MCP server: `kb_search`, `kb_show`, `kb_add`, `kb_verify`, `kb_review` |
+| `kb hub init / clone / import` | create, copy, or migrate into the multi-project hub |
+| `kb project [list / link <id>]` | show/list projects; map a repo to a project |
+| `kb install claude / codex / cursor / antigravity / hermes / git-hooks [--global / --repo]` | pointer, skill, hooks (user-wide with a hub) |
+| `kb search [query] [-f path] [-p project] [--all]` | compact ranked headers with trust badges |
+| `kb show <id>` | entry with trust trail, revisions, resources, fenced body |
+| `kb add <type> <title> -d ... [-e evidence] [--global [--for ...]]` | record knowledge |
+| `kb update <id> -m <why> [...] [-e evidence]` | new revision of an entry |
+| `kb verify <id> --confirm / --dispute -e ...` | record a check (any agent) |
+| `kb deprecate <id> -m ...`, `kb resolve` (human) | retire or decide |
+| `kb review submit / list / show / verdict / revise / close` | optional cross-review |
+| `kb status [--all]`, `kb lint`, `kb index`, `kb maintain` | health and upkeep |
+| `kb sync` | pull/rebase, reindex, commit, push |
+| `kb extract`, `kb hook claude` | capture from transcripts |
+| `kb mcp` | stdio MCP server (6 tools) |
 
-## 4. Phasing (revised)
+## 5. Phasing
 
-1. **Done in this repository:** format, CLI, trust state machine, reviews, lint,
-   index, pointer/skill/hook installers, MCP server, Claude Code capture, Codex
-   rollout importer, git sync for Hermes.
-2. **Next:** run it on a real repo for two weeks; measure per Doc A's metrics
-   (`kb status --json`: unverified age, stale count, disputes, claims per actor).
-3. **Conditional:** embeddings behind `kb search` past ~200 nodes; Notion or
-   Obsidian as viewers; HTTP MCP only behind authentication.
+1. **Done:**
+   - Format, CLI, trust model, evolving revisions.
+   - Hub with projects, user-wide installers, sync, reviews, lint and index.
+   - MCP, Claude Code capture, and the Codex scanner with project routing.
+2. **Next:**
+   - Run it across the real repos for two weeks.
+   - Watch `kb status --all --json`: stale and unverified counts, entries per producer, updates per entry.
+   - Then take the top backlog items in §3.
+3. **Conditional:**
+   - Embeddings once a project passes ~200 entries.
+   - Obsidian as a viewer of `~/.kb`.
+   - HTTP MCP only behind authentication.
 
-## 5. Unverified integration details
+## 6. Unverified integration details
 
-Things this implementation relies on that should be checked against current
-vendor docs before depending on them:
+These should be checked against current vendor docs and installed versions:
 
-- Claude Code hook input fields (`transcript_path`, `session_id`,
-  `hook_event_name`) and that `SessionStart` stdout is added to context.
-- Claude Code exports `CLAUDECODE=1` to tool shells (used for actor detection).
-- Codex rollout location `~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl` and its
-  `session_meta.cwd` field; the env var Codex sets in tool shells (we recommend
-  setting `KB_ACTOR=codex` explicitly via `shell_environment_policy`).
-- Codex skills directory (`.codex/skills/`) and Hermes skills/MCP config paths.
+- **Claude Code:**
+  - hook input fields (`transcript_path`, `session_id`, `hook_event_name`, `cwd`);
+  - whether `SessionStart` stdout is added to context;
+  - `@~/...` imports in `~/.claude/CLAUDE.md`;
+  - `CLAUDECODE=1` in tool shells.
+- **Codex:**
+  - rollout location `~/.codex/sessions/**/rollout-*.jsonl` and `session_meta.cwd`;
+  - whether `~/.codex/AGENTS.md` is read globally;
+  - the skills directory;
+  - `shell_environment_policy.set`.
+- **Hermes:** skills directory and MCP config keys.
+- **Antigravity:** reads `~/.gemini/GEMINI.md`.

@@ -18,6 +18,7 @@ type Event struct {
 	By       string `yaml:"by"`
 	At       string `yaml:"at"`
 	Result   string `yaml:"result,omitempty"`
+	Rev      int    `yaml:"rev,omitempty"` // content revision the event applies to
 	Commit   string `yaml:"commit,omitempty"`
 	Evidence string `yaml:"evidence,omitempty"`
 }
@@ -70,7 +71,10 @@ type Meta struct {
 	Tags        StringList `yaml:"tags"`
 	Status      string     `yaml:"status"`
 	Resources   StringList `yaml:"resources"`
+	Revision    int        `yaml:"revision"` // content revision; 0 or absent means 1
+	Projects    StringList `yaml:"projects"` // for global entries: projects they apply to
 	Generated   Event      `yaml:"generated"`
+	Updated     *Event     `yaml:"updated"` // last content update (revision > 1)
 	Verified    []Event    `yaml:"verified"`
 	StaleAfter  string     `yaml:"stale_after"`
 	Sources     []Source   `yaml:"sources"`
@@ -147,6 +151,9 @@ func New(m Meta, body string) *Doc {
 	}
 	if len(m.Resources) > 0 {
 		d.Set("resources", flowList(m.Resources))
+	}
+	if len(m.Projects) > 0 {
+		d.Set("projects", flowList(m.Projects))
 	}
 	if len(m.Supersedes) > 0 {
 		d.Set("supersedes", flowList(m.Supersedes))
@@ -309,9 +316,33 @@ func EventNode(e Event, flow bool) *yaml.Node {
 	add("by", e.By)
 	add("at", e.At)
 	add("result", e.Result)
+	if e.Rev > 0 {
+		m.Content = append(m.Content, str("rev"), &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: fmt.Sprint(e.Rev)})
+	}
 	add("commit", e.Commit)
 	add("evidence", e.Evidence)
 	return m
+}
+
+// IntNode renders an integer scalar.
+func IntNode(v int) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: fmt.Sprint(v)}
+}
+
+// Rev returns the content revision (absent or 0 means 1).
+func (m *Meta) Rev() int {
+	if m.Revision < 1 {
+		return 1
+	}
+	return m.Revision
+}
+
+// EventRev returns the revision an event applies to (absent means 1).
+func EventRev(e Event) int {
+	if e.Rev < 1 {
+		return 1
+	}
+	return e.Rev
 }
 
 func sourceNode(s Source) *yaml.Node {
@@ -345,3 +376,6 @@ func reviewNode(r *Review) *yaml.Node {
 
 // ReviewNode exposes reviewNode for callers updating a review block.
 func ReviewNode(r *Review) *yaml.Node { return reviewNode(r) }
+
+// ListNode renders a list of strings (flow style when short).
+func ListNode(items []string) *yaml.Node { return flowList(items) }

@@ -29,8 +29,13 @@ type RetiredTerm struct {
 
 // Config is the content of knowledge/kb.yaml.
 type Config struct {
-	Version  int                   `yaml:"version"`
-	CodeRoot string                `yaml:"code_root,omitempty"`
+	Version  int    `yaml:"version"`
+	Mode     string `yaml:"mode,omitempty"` // "hub" for a multi-project hub
+	CodeRoot string `yaml:"code_root,omitempty"`
+	Hub      struct {
+		// Autocommit commits every kb write to the hub's git repo (default true).
+		Autocommit *bool `yaml:"autocommit,omitempty"`
+	} `yaml:"hub,omitempty"`
 	Types    map[string]TypeConfig `yaml:"types"`
 	Families struct {
 		Producers map[string]string `yaml:"producers"`
@@ -60,8 +65,9 @@ version: 1
 # directory). Used for path-aware search and code-change staleness.
 code_root: ..
 
-# Knowledge types. ttl_days sets stale_after at write/confirm time.
-# Immutable types can only be superseded or deprecated, never edited.
+# Knowledge types. ttl_days sets stale_after at write/confirm/update time.
+# Entries evolve with 'kb update'; immutable types (decisions) change only by
+# superseding, so the history of the decision stays readable.
 types:
   fact:
     dir: facts
@@ -69,8 +75,7 @@ types:
     description: Stable project facts and invariants.
   learning:
     dir: learnings
-    ttl_days: 30
-    immutable: true
+    ttl_days: 60
     description: Gotchas, root causes, debugging lessons.
   decision:
     dir: decisions
@@ -84,7 +89,8 @@ types:
     ttl_days: 14
     description: Cross-agent review packets.
 
-# Model family resolution for the cross-family verification rule.
+# Model family resolution: a confirmation from a family other than the
+# author's upgrades an entry from 'verified' to 'cross-checked'.
 # An actor is "<producer>/<model>". A recognised model prefix wins over the
 # producer default, so cursor/claude-sonnet-4.5 is anthropic.
 families:
@@ -159,6 +165,8 @@ func LoadConfig(bundleDir string) (*Config, error) {
 	if user.CodeRoot != "" {
 		cfg.CodeRoot = user.CodeRoot
 	}
+	cfg.Mode = user.Mode
+	cfg.Hub = user.Hub
 	if len(user.Types) > 0 {
 		cfg.Types = user.Types
 	}
@@ -250,4 +258,11 @@ func DisplayType(key string) string {
 		return ""
 	}
 	return strings.ToUpper(key[:1]) + key[1:]
+}
+
+// HubConfigYAML is the kb.yaml written by 'kb hub init'.
+func HubConfigYAML() string {
+	s := strings.Replace(DefaultConfigYAML, "version: 1\n", "version: 1\nmode: hub\n\n# Commit every kb write to this hub's git history; 'kb sync' pushes it.\nhub:\n  autocommit: true\n", 1)
+	// In a hub, each project's code root is the repo kb runs in.
+	return strings.Replace(s, "# Git work tree whose files 'resources:' globs refer to (relative to this\n# directory). Used for path-aware search and code-change staleness.\ncode_root: ..\n\n", "", 1)
 }

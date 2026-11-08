@@ -51,6 +51,12 @@ func (a *App) cmdHook(args []string) int {
 				fmt.Fprintln(a.Stdout, b)
 			}
 		}
+		// Hub: pull what other machines (e.g. Hermes) recorded, in the background.
+		if s.Hub && hasOrigin(s) && os.Getenv(extract.GuardEnv) == "" {
+			if err := a.spawn(s, in, []string{"--root", s.Dir, "sync", "--quiet"}, "sync"); err != nil {
+				logLine(s, "hook: "+err.Error())
+			}
+		}
 	case "PreCompact", "SessionEnd", "Stop":
 		if os.Getenv(extract.GuardEnv) != "" || in.TranscriptPath == "" {
 			return 0
@@ -64,10 +70,6 @@ func (a *App) cmdHook(args []string) int {
 
 // spawnExtract runs 'kb extract' detached so the session is not blocked.
 func (a *App) spawnExtract(s *kb.Store, in hookInput) error {
-	exe, err := os.Executable()
-	if err != nil {
-		return err
-	}
 	actor := a.as
 	if actor == "" {
 		actor = os.Getenv("KB_ACTOR")
@@ -78,6 +80,19 @@ func (a *App) spawnExtract(s *kb.Store, in hookInput) error {
 	args := []string{"--root", s.Dir, "--as", actor, "extract", "--transcript", in.TranscriptPath, "--source", "claude", "--session", in.SessionID}
 	if in.HookEventName == "SessionEnd" {
 		args = append(args, "--final")
+		if s.Hub && hasOrigin(s) {
+			args = append(args, "--sync")
+		}
+	}
+	return a.spawn(s, in, args, "extract")
+}
+
+// spawn starts a detached kb subprocess, logging to .kb/extract.log. It runs
+// in the session's directory so a hub attaches the right project.
+func (a *App) spawn(s *kb.Store, in hookInput, args []string, label string) error {
+	exe, err := os.Executable()
+	if err != nil {
+		return err
 	}
 	if err := os.MkdirAll(s.LocalPath(), 0o755); err != nil {
 		return err
@@ -87,16 +102,30 @@ func (a *App) spawnExtract(s *kb.Store, in hookInput) error {
 		return err
 	}
 	defer logf.Close()
-	fmt.Fprintf(logf, "--- %s %s session=%s\n", in.HookEventName, filepath.Base(in.TranscriptPath), in.SessionID)
+	fmt.Fprintf(logf, "--- %s %s %s session=%s\n", in.HookEventName, label, filepath.Base(in.TranscriptPath), in.SessionID)
 	cmd := exec.Command(exe, args...)
 	cmd.Env = append(os.Environ(), extract.GuardEnv+"=1")
 	cmd.Stdout, cmd.Stderr = logf, logf
 	cmd.Dir = s.Dir
+	if s.CodeRoot != "" {
+		cmd.Dir = s.CodeRoot
+	} else if in.CWD != "" {
+		cmd.Dir = in.CWD
+	}
 	detach(cmd)
 	if err := cmd.Start(); err != nil {
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+func hasOrigin(s *kb.Store) bool {
+	top := s.KnowledgeTop()
+	if top == "" {
+		return false
+	}
+	_, err := kb.Git(top, "remote", "get-url", "origin")
+	return err == nil
 }
 
 func logLine(s *kb.Store, msg string) {

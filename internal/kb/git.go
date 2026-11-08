@@ -46,42 +46,68 @@ type gitCache struct {
 	files   []string            // tracked files (lazy)
 }
 
-func (s *Store) gitc() *gitCache {
-	if s.git != nil {
-		return s.git
+// gitFor returns the (cached) git view of a work tree; root "" yields a
+// cache that reports no repository.
+func (s *Store) gitFor(root string) *gitCache {
+	if s.gits == nil {
+		s.gits = map[string]*gitCache{}
+	}
+	if g, ok := s.gits[root]; ok {
+		return g
 	}
 	g := &gitCache{changed: map[string][]string{}, bad: map[string]bool{}}
-	if top, err := Git(s.CodeRoot, "rev-parse", "--show-toplevel"); err == nil {
-		g.ok = true
-		g.top = realPath(top)
-		if h, err := Git(s.CodeRoot, "rev-parse", "--short=12", "HEAD"); err == nil {
-			g.head = h
+	if root != "" {
+		if top, err := Git(root, "rev-parse", "--show-toplevel"); err == nil {
+			g.ok = true
+			g.top = realPath(top)
+			if h, err := Git(root, "rev-parse", "--short=12", "HEAD"); err == nil {
+				g.head = h
+			}
 		}
 	}
-	s.git = g
+	s.gits[root] = g
 	return g
 }
 
-// HeadCommit returns the short HEAD commit of the code work tree, or "".
+func (s *Store) gitc() *gitCache { return s.gitFor(s.CodeRoot) }
+
+// HeadCommit returns the short HEAD commit of the current work tree, or "".
 func (s *Store) HeadCommit() string { return s.gitc().head }
 
-// InGit reports whether the code root is a git work tree.
+// headFor returns the HEAD of the work tree a project's resources refer to.
+func (s *Store) headFor(project string) string {
+	if s.Hub && project == GlobalProject {
+		return ""
+	}
+	return s.gitFor(s.CheckoutFor(project)).head
+}
+
+// InGit reports whether the current work tree is a git repository.
 func (s *Store) InGit() bool { return s.gitc().ok }
 
-// GitTop returns the top-level directory of the code work tree.
+// GitTop returns the top-level directory of the current work tree.
 func (s *Store) GitTop() string { return s.gitc().top }
 
-// ChangedSince lists repo-relative files that differ between commit and HEAD.
-// ok is false when the commit is unknown (e.g. a shallow clone).
-func (s *Store) ChangedSince(commit string) (files []string, ok bool) {
-	g := s.gitc()
+// ChangedSince lists files that differ between commit and HEAD in the
+// current work tree. ok is false when the commit is unknown.
+func (s *Store) ChangedSince(commit string) ([]string, bool) {
+	return s.changedIn(s.CodeRoot, commit)
+}
+
+// changedSinceFor is ChangedSince in the work tree of a node's project.
+func (s *Store) changedSinceFor(n *Node, commit string) ([]string, bool) {
+	return s.changedIn(s.codeRootFor(n), commit)
+}
+
+func (s *Store) changedIn(root, commit string) ([]string, bool) {
+	g := s.gitFor(root)
 	if !g.ok || g.head == "" || commit == "" || g.bad[commit] {
 		return nil, false
 	}
 	if f, hit := g.changed[commit]; hit {
 		return f, true
 	}
-	out, err := Git(s.CodeRoot, "diff", "--name-only", commit, "HEAD", "--")
+	out, err := Git(root, "diff", "--name-only", commit, "HEAD", "--")
 	if err != nil {
 		g.bad[commit] = true
 		return nil, false
@@ -94,6 +120,26 @@ func (s *Store) ChangedSince(commit string) (files []string, ok bool) {
 	}
 	g.changed[commit] = list
 	return list, true
+}
+
+// trackedIn lists tracked files of a work tree (cached).
+func (s *Store) trackedIn(root string) []string {
+	g := s.gitFor(root)
+	if !g.ok {
+		return nil
+	}
+	if g.files != nil {
+		return g.files
+	}
+	g.files = []string{}
+	if out, err := Git(root, "ls-files"); err == nil {
+		for _, l := range strings.Split(out, "\n") {
+			if l = strings.TrimSpace(l); l != "" {
+				g.files = append(g.files, l)
+			}
+		}
+	}
+	return g.files
 }
 
 // RelToCode converts a path (absolute or relative to cwd) into a path

@@ -61,7 +61,7 @@ func TestMCPSession(t *testing.T) {
 		t.Fatalf("init: %v", init)
 	}
 	tools := replies[1]["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 5 {
+	if len(tools) != 6 {
 		t.Fatalf("tools: %d", len(tools))
 	}
 	text := func(i int) string {
@@ -74,9 +74,9 @@ func TestMCPSession(t *testing.T) {
 	if !strings.Contains(text(3), "[unverified] Ports are fixed") {
 		t.Fatalf("search: %s", text(3))
 	}
-	// clientInfo said codex, so codex verifying its own claim is rejected.
-	if r := replies[4]["result"].(map[string]any); r["isError"] != true || !strings.Contains(text(4), "self-verification") {
-		t.Fatalf("verify: %v", r)
+	// clientInfo said codex: the author may verify its own entry (verified, not cross-checked).
+	if r := replies[4]["result"].(map[string]any); r["isError"] == true || !strings.Contains(text(4), "is now verified") || !strings.Contains(text(2), "added facts/ports-are-fixed [unverified]") {
+		t.Fatalf("verify: %v / %s", r, text(2))
 	}
 	if replies[5]["error"].(map[string]any)["code"].(float64) != -32601 {
 		t.Fatalf("unknown method: %v", replies[5])

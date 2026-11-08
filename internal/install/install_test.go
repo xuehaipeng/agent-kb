@@ -57,7 +57,7 @@ func TestMergeClaudeSettingsPreservesUserKeys(t *testing.T) {
 }
 
 func TestPointerIsSmall(t *testing.T) {
-	p := Pointer("knowledge")
+	p := Pointer()
 	words := len(strings.Fields(p))
 	// Roughly 1.3 tokens per word: keep the always-on cost near 300 tokens.
 	if words > 240 {

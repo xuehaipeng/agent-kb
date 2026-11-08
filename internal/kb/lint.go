@@ -138,7 +138,7 @@ func (s *Store) Lint(opt LintOptions) ([]Issue, error) {
 		}
 		// Supersedes targets.
 		for _, ref := range m.Supersedes {
-			if _, err := s.Get(ref); err != nil {
+			if s.resolveRef(n, ref) == nil {
 				add("error", p, "supersedes %q: not found", ref)
 			}
 		}
@@ -151,7 +151,7 @@ func (s *Store) Lint(opt LintOptions) ([]Issue, error) {
 			target = strings.SplitN(target, "#", 2)[0]
 			var abs string
 			if strings.HasPrefix(target, "/") {
-				abs = filepath.Join(s.Dir, filepath.FromSlash(target))
+				abs = filepath.Join(s.BundleDir(n.Project), filepath.FromSlash(target))
 			} else {
 				abs = filepath.Join(filepath.Dir(n.Path), filepath.FromSlash(target))
 			}
@@ -160,8 +160,8 @@ func (s *Store) Lint(opt LintOptions) ([]Issue, error) {
 			}
 		}
 		// Resource globs should point at something that exists.
-		if len(m.Resources) > 0 && s.InGit() && n.TypeKey != "review" && s.TrustStatic(n, sup).State != StateDeprecated {
-			files := s.trackedFiles()
+		if root := s.codeRootFor(n); len(m.Resources) > 0 && root != "" && s.gitFor(root).ok && n.TypeKey != "review" && s.TrustStatic(n, sup).State != StateDeprecated {
+			files := s.trackedIn(root)
 			for _, g := range m.Resources {
 				found := false
 				for _, f := range files {
@@ -225,11 +225,16 @@ func (s *Store) Lint(opt LintOptions) ([]Issue, error) {
 }
 
 func (s *Store) checkImmutable(n *Node, add func(sev, path, format string, a ...any)) {
-	rel := s.relToTop(n.Path)
-	if rel == "" {
+	top := s.KnowledgeTop()
+	if top == "" {
 		return
 	}
-	old, err := Git(s.CodeRoot, "show", "HEAD:"+rel)
+	r, err := filepath.Rel(top, n.Path)
+	if err != nil || strings.HasPrefix(r, "..") {
+		return
+	}
+	rel := filepath.ToSlash(r)
+	old, err := Git(top, "show", "HEAD:"+rel)
 	if err != nil {
 		return // new file
 	}
@@ -239,31 +244,14 @@ func (s *Store) checkImmutable(n *Node, add func(sev, path, format string, a ...
 	}
 	cur := n.Doc
 	// Compare what is about to be committed (the index), not the work tree.
-	if staged, err := Git(s.CodeRoot, "show", ":"+rel); err == nil {
+	if staged, err := Git(top, "show", ":"+rel); err == nil {
 		if d, err := okf.Parse([]byte(staged + "\n")); err == nil {
 			cur = d
 		}
 	}
 	if prev.ContentKey(mutableKeys) != cur.ContentKey(mutableKeys) {
-		add("error", n.ID+".md", "%s entries are immutable: supersede it ('kb add --supersedes %s') instead of editing", n.TypeKey, n.ID)
+		add("error", n.ID+".md", "%s entries are immutable: supersede it ('kb add %s ... --supersedes %s') instead of editing", n.TypeKey, n.TypeKey, n.ID)
 	}
-}
-
-func (s *Store) trackedFiles() []string {
-	g := s.gitc()
-	if g.files != nil {
-		return g.files
-	}
-	out, err := Git(s.CodeRoot, "ls-files")
-	g.files = []string{}
-	if err == nil {
-		for _, l := range strings.Split(out, "\n") {
-			if l = strings.TrimSpace(l); l != "" {
-				g.files = append(g.files, l)
-			}
-		}
-	}
-	return g.files
 }
 
 func (s *Store) rel(p string) string {
@@ -271,18 +259,6 @@ func (s *Store) rel(p string) string {
 		return filepath.ToSlash(r)
 	}
 	return p
-}
-
-func (s *Store) relToTop(p string) string {
-	top := s.GitTop()
-	if top == "" {
-		return ""
-	}
-	r, err := filepath.Rel(top, p)
-	if err != nil || strings.HasPrefix(r, "..") {
-		return ""
-	}
-	return filepath.ToSlash(r)
 }
 
 func hasOffset(v string) bool {

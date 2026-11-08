@@ -355,7 +355,7 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 	}
 	var titles []string
 	for _, n := range nodes {
-		if n.TypeKey != "review" && s.Trust(n).State != kb.StateDeprecated {
+		if n.TypeKey != "review" && (n.Project == s.Project || n.Project == kb.GlobalProject || !s.Hub) && s.Trust(n).State != kb.StateDeprecated {
 			titles = append(titles, n.Meta().Title)
 		}
 	}
@@ -509,23 +509,41 @@ func Scan(s *kb.Store, o ScanOptions) ([]string, error) {
 	var report []string
 	for _, f := range files {
 		tr, err := ReadMeta(f)
-		if err != nil || tr.CWD == "" || !within(repo, tr.CWD) {
+		if err != nil || tr.CWD == "" {
 			continue
 		}
-		r, err := Run(s, Options{Path: f, Source: o.Source, Actor: actor, Command: o.Command, DryRun: o.DryRun, Final: true, Out: o.Out})
+		target := s
+		if s.Hub {
+			// Route each session to the project of the repo it ran in.
+			target = s.ForDir(tr.CWD)
+			if target.Project == "" {
+				continue
+			}
+		} else if !within(repo, tr.CWD) {
+			continue
+		}
+		label := filepath.Base(f)
+		if target.Project != "" {
+			label = target.Project + " " + label
+		}
+		r, err := Run(target, Options{Path: f, Source: o.Source, Actor: actor, Command: o.Command, DryRun: o.DryRun, Final: true, Out: o.Out})
 		switch {
 		case err != nil:
-			report = append(report, fmt.Sprintf("%s: error: %v", filepath.Base(f), err))
+			report = append(report, fmt.Sprintf("%s: error: %v", label, err))
 		case r.Skipped != "":
-			report = append(report, fmt.Sprintf("%s: skipped (%s)", filepath.Base(f), r.Skipped))
+			report = append(report, fmt.Sprintf("%s: skipped (%s)", label, r.Skipped))
 		case o.DryRun:
-			report = append(report, fmt.Sprintf("%s: would extract (%d-char prompt)", filepath.Base(f), len(r.Prompt)))
+			report = append(report, fmt.Sprintf("%s: would extract (%d-char prompt)", label, len(r.Prompt)))
 		default:
-			report = append(report, fmt.Sprintf("%s: added %d, duplicates %d %v", filepath.Base(f), len(r.Added), r.Dupes, r.Added))
+			report = append(report, fmt.Sprintf("%s: added %d, duplicates %d %v", label, len(r.Added), r.Dupes, r.Added))
 		}
 	}
 	if len(report) == 0 {
-		report = append(report, fmt.Sprintf("no %s sessions for %s in the last %d day(s) under %s", o.Source, repo, o.Days, root))
+		where := repo
+		if s.Hub {
+			where = "any hub project"
+		}
+		report = append(report, fmt.Sprintf("no %s sessions for %s in the last %d day(s) under %s", o.Source, where, o.Days, root))
 	}
 	return report, nil
 }

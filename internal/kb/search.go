@@ -10,6 +10,8 @@ import (
 // SearchQuery describes a knowledge lookup.
 type SearchQuery struct {
 	Text              string
+	Projects          []string // hub: restrict to these projects (plus matching global entries)
+	AllProjects       bool     // hub: search every project
 	Files             []string // repo-relative paths the caller will touch
 	Types             []string
 	IncludeDeprecated bool
@@ -51,6 +53,7 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 		}
 	}
 
+	inScope := s.scopeFilter(q.Projects, q.AllProjects)
 	sup := s.supersededIndex()
 	type doc struct {
 		n    *Node
@@ -61,6 +64,9 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 	df := map[string]int{}
 	var total float64
 	for _, n := range nodes {
+		if !inScope(n) {
+			continue
+		}
 		if len(types) > 0 && !types[n.TypeKey] {
 			continue
 		}
@@ -127,7 +133,7 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 			score += 6
 		}
 		tr := s.trust(d.n, sup, true)
-		if q.TrustedOnly && tr.State != StateCorroborated && tr.State != StateReviewed {
+		if q.TrustedOnly && !tr.Trusted() {
 			continue
 		}
 		score *= trustWeight(tr)
@@ -139,10 +145,52 @@ func (s *Store) Search(q SearchQuery) ([]Hit, error) {
 		}
 		return hits[i].Node.ID < hits[j].Node.ID
 	})
+	s.lastTruncated = 0
 	if len(hits) > q.Limit {
+		s.lastTruncated = len(hits) - q.Limit
 		hits = hits[:q.Limit]
 	}
 	return hits, nil
+}
+
+// Truncated reports how many matches the last Search left out.
+func (s *Store) Truncated() int { return s.lastTruncated }
+
+// scopeFilter returns the project filter for searches and listings. In a
+// hub, the default scope is the current project plus global entries that
+// apply to it; outside any project it is every project.
+func (s *Store) scopeFilter(projects []string, all bool) func(*Node) bool {
+	if !s.Hub || all {
+		return func(*Node) bool { return true }
+	}
+	want := map[string]bool{}
+	for _, p := range projects {
+		want[p] = true
+	}
+	if len(want) == 0 {
+		if s.Project == "" {
+			return func(*Node) bool { return true }
+		}
+		want[s.Project] = true
+	}
+	return func(n *Node) bool {
+		if want[n.Project] {
+			return true
+		}
+		if n.Project != GlobalProject || want[GlobalProject] {
+			return want[n.Project]
+		}
+		ps := n.Meta().Projects
+		if len(ps) == 0 {
+			return true
+		}
+		for _, p := range ps {
+			if want[p] {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 func trustWeight(t Trust) float64 {
@@ -150,8 +198,10 @@ func trustWeight(t Trust) float64 {
 	switch t.State {
 	case StateReviewed:
 		w = 1.3
-	case StateCorroborated:
-		w = 1.2
+	case StateCrossChecked:
+		w = 1.25
+	case StateVerified:
+		w = 1.15
 	case StateUnverified:
 		w = 0.85
 	case StateDisputed:

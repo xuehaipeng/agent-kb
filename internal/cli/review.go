@@ -49,10 +49,13 @@ func (a *App) cmdReview(args []string) error {
 		return nil
 
 	case "list", "ls":
-		var forMe, mine, all bool
-		f.boolean(&forMe, "reviews waiting for your verdict", "for-me")
+		var forMe, mine, done, allProjects bool
+		var projects []string
+		f.boolean(&forMe, "pending reviews authored by another model family", "for-me")
 		f.boolean(&mine, "reviews you (your family) authored", "mine")
-		f.boolean(&all, "include approved and closed", "all")
+		f.boolean(&done, "include approved and closed", "done")
+		f.boolean(&allProjects, "every project (hub)", "all")
+		f.list(&projects, true, "project(s) (hub)", "p", "project")
 		if _, err := f.parse(rest); err != nil {
 			return err
 		}
@@ -60,7 +63,7 @@ func (a *App) cmdReview(args []string) error {
 		if err != nil {
 			return err
 		}
-		filter := kb.ReviewFilter{All: all}
+		filter := kb.ReviewFilter{All: done, Projects: projects, AllProjects: allProjects}
 		if forMe || mine {
 			me, err := a.actor()
 			if err != nil {

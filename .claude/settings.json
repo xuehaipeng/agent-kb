@@ -41,7 +41,10 @@
       "Bash(kb status:*)",
       "Bash(kb add:*)",
       "Bash(kb verify:*)",
-      "Bash(kb review:*)"
+      "Bash(kb review:*)",
+      "Bash(kb update:*)",
+      "Bash(kb deprecate:*)",
+      "Bash(kb project:*)"
     ]
   }
 }

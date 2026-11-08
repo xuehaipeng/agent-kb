@@ -61,7 +61,7 @@ func gitRun(t *testing.T, s *Store, args ...string) {
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("git %v: %v\n%s", args, err, out)
 	}
-	s.git = nil
+	s.gits = map[string]*gitCache{}
 }
 
 var (
@@ -176,7 +176,7 @@ func TestAddVerifyLifecycle(t *testing.T) {
 	if n.ID != "learnings/stream-timeout-must-propagate-context-cancel" {
 		t.Fatalf("id %s", n.ID)
 	}
-	if n.Meta().Generated.Commit == "" || n.Meta().Status != "draft" || n.Meta().StaleAfter != "2026-12-08T12:00:00Z" {
+	if n.Meta().Generated.Commit == "" || n.Meta().Status != "draft" || n.Meta().StaleAfter != "2027-01-07T12:00:00Z" {
 		t.Fatalf("meta %+v", n.Meta())
 	}
 	if got := s.Trust(n); got.State != StateUnverified || got.Stale {
@@ -190,21 +190,22 @@ func TestAddVerifyLifecycle(t *testing.T) {
 		t.Fatalf("want duplicate error, got %v", err)
 	}
 
-	// Same family cannot verify.
-	if _, _, err := s.Verify(VerifyInput{Ref: n.ID, Result: ResultConfirmed, Evidence: "x", Actor: Actor{Producer: "cursor", Model: "claude-sonnet-4.5"}}); err == nil || !strings.Contains(err.Error(), "self-verification") {
-		t.Fatalf("want self-verification rejection, got %v", err)
-	}
 	// Evidence required.
 	if _, _, err := s.Verify(VerifyInput{Ref: n.ID, Result: ResultConfirmed, Actor: codex}); err == nil {
 		t.Fatal("want evidence error")
 	}
-	// Cross-family confirm by short ref.
+	// Same family may verify: it becomes verified, not cross-checked.
+	_, tr, err := s.Verify(VerifyInput{Ref: n.ID, Result: ResultConfirmed, Evidence: "ran go test ./internal/gateway", Actor: Actor{Producer: "cursor", Model: "claude-sonnet-4.5"}})
+	if err != nil || tr.State != StateVerified {
+		t.Fatalf("same-family verify: %v %+v", err, tr)
+	}
+	// A different family upgrades it, by short ref.
 	n2, tr, err := s.Verify(VerifyInput{Ref: "stream-timeout", Result: ResultConfirmed, Evidence: "read stream.go; test passes", Actor: codex})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if tr.State != StateCorroborated || n2.Meta().Status != "stable" {
-		t.Fatalf("after confirm: %+v status=%s", tr, n2.Meta().Status)
+	if tr.State != StateCrossChecked || n2.Meta().Status != "stable" {
+		t.Fatalf("after cross confirm: %+v status=%s", tr, n2.Meta().Status)
 	}
 
 	// Code change under resources makes it stale.
@@ -216,16 +217,20 @@ func TestAddVerifyLifecycle(t *testing.T) {
 		t.Fatalf("want code-stale, got %+v", tr)
 	}
 
-	// Dispute from a third family -> disputed; human resolves.
+	// The latest check wins: a dispute, then a re-confirmation with evidence.
 	_, tr, err = s.Verify(VerifyInput{Ref: n.ID, Result: ResultDisputed, Evidence: "cancel no longer forwarded after refactor", Actor: Actor{Producer: "antigravity", Model: "gemini-3"}})
 	if err != nil || tr.State != StateDisputed {
 		t.Fatalf("dispute: %v %+v", err, tr)
 	}
+	_, tr, err = s.Verify(VerifyInput{Ref: n.ID, Result: ResultConfirmed, Evidence: "forwardCancel() still called in stream.go:40", Actor: claude})
+	if err != nil || tr.State != StateVerified || tr.Stale {
+		t.Fatalf("re-confirm after dispute: %v %+v", err, tr)
+	}
 	if _, _, err := s.Resolve(n.ID, true, "", codex); err == nil {
-		t.Fatal("agents must not resolve")
+		t.Fatal("resolve is for humans")
 	}
 	_, tr, err = s.Resolve(n.ID, true, "checked: still forwarded", human)
-	if err != nil || tr.State != StateReviewed || tr.Stale {
+	if err != nil || tr.State != StateReviewed {
 		t.Fatalf("resolve: %v %+v", err, tr)
 	}
 
@@ -243,7 +248,7 @@ func TestAddVerifyLifecycle(t *testing.T) {
 		}
 	}
 	log, _ := os.ReadFile(filepath.Join(s.Dir, "log.md"))
-	if strings.Count(string(log), "\n- [") != 4 {
+	if strings.Count(string(log), "\n- [") != 6 {
 		t.Errorf("log entries:\n%s", log)
 	}
 }
@@ -315,9 +320,6 @@ func TestReviewFlow(t *testing.T) {
 	if items, _ := s.Reviews(ReviewFilter{ForMe: codex}); len(items) != 1 {
 		t.Fatal("codex should see the review")
 	}
-	if _, _, err := s.ReviewVerdict(VerdictInput{Ref: rv.ID, Approve: true, Actor: claude}); err == nil {
-		t.Fatal("self-review must be rejected")
-	}
 	_, st, err := s.ReviewVerdict(VerdictInput{Ref: rv.ID, Approve: false, Findings: []string{"timeout_test.go does not cover cancel"}, Actor: codex})
 	if err != nil || st != ReviewChanges {
 		t.Fatalf("verdict: %v %s", err, st)
@@ -338,6 +340,17 @@ func TestReviewFlow(t *testing.T) {
 	}
 	if !strings.Contains(n.Doc.Body, "revised by") {
 		t.Fatalf("body: %s", n.Doc.Body)
+	}
+	// Same-family reviews are allowed and labelled.
+	write(t, filepath.Join(s.CodeRoot, "internal/gateway/stream.go"), "package gateway\nfunc Y() {}\n")
+	gitRun(t, s, "commit", "-qam", "more")
+	rv2, err := s.ReviewSubmit(SubmitInput{Title: "Add Y", Base: "HEAD~1", Actor: claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	n2, st, err := s.ReviewVerdict(VerdictInput{Ref: rv2.ID, Approve: true, Summary: "fresh-session check", Actor: claude})
+	if err != nil || st != ReviewApproved || !strings.Contains(n2.Doc.Body, "same model family") {
+		t.Fatalf("same-family review: %v %s\n%s", err, st, n2.Doc.Body)
 	}
 }
 
@@ -363,7 +376,7 @@ func TestLintCatchesProblems(t *testing.T) {
 
 func TestImmutableStagedLint(t *testing.T) {
 	s := newRepo(t)
-	res, err := s.Add(AddInput{Type: "learning", Title: "Vitest hangs on Node 24", Description: "Use --no-isolate.", Actor: claude})
+	res, err := s.Add(AddInput{Type: "decision", Title: "Use Vitest with --no-isolate", Description: "Node 24 deadlocks otherwise.", Body: "Use --no-isolate.", Actor: claude})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -388,7 +401,7 @@ func TestImmutableStagedLint(t *testing.T) {
 	}
 	// Hand edit of the body is not.
 	data, _ := os.ReadFile(res.Node.Path)
-	write(t, res.Node.Path, strings.Replace(string(data), "Use --no-isolate.", "Pin Node 22.", 1))
+	write(t, res.Node.Path, strings.Replace(string(data), "Use --no-isolate.\n", "Pin Node 22.\n", 1))
 	gitRun(t, s, "add", "-A")
 	issues, _ = s.Lint(LintOptions{Staged: true})
 	found := false
@@ -436,5 +449,67 @@ func TestStatusBrief(t *testing.T) {
 	}
 	if len(r.Disputed) != 1 || !strings.Contains(r.Brief(), "disputed") {
 		t.Fatalf("status: %+v brief=%q", r, r.Brief())
+	}
+}
+
+func TestSelfVerifyUpdateAndDeprecate(t *testing.T) {
+	s := newRepo(t)
+	// Evidence at write time: verified by its author, no second agent needed.
+	res, err := s.Add(AddInput{Type: "fact", Title: "Gateway listens on 8080", Description: "HTTP port is 8080.", Resources: []string{"internal/gateway/**"}, Evidence: "read main.go flag default", Actor: claude})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Trust.State != StateVerified || res.Node.Meta().Status != "stable" {
+		t.Fatalf("add with evidence: %+v status=%s", res.Trust, res.Node.Meta().Status)
+	}
+	// Update without evidence: new revision, starts unverified.
+	body := "HTTP port is 9090 since the ingress change."
+	desc := "HTTP port is 9090."
+	n, tr, err := s.Update(UpdateInput{Ref: res.Node.ID, Description: &desc, Body: &body, Reason: "port changed in PR 42", Actor: codex})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.Revision != 2 || tr.State != StateUnverified || n.Meta().Updated == nil || n.Meta().Updated.By != "codex/gpt-5.2" {
+		t.Fatalf("update: %+v %+v", tr, n.Meta().Updated)
+	}
+	if !strings.Contains(s.RenderNode(n), "confirmed [rev 1]: claude-code") {
+		t.Fatalf("old verification should show as history:\n%s", s.RenderNode(n))
+	}
+	// The updater is now the content author: a claude confirmation cross-checks it.
+	_, tr, err = s.Verify(VerifyInput{Ref: n.ID, Result: ResultConfirmed, Evidence: "main.go:12 says 9090", Actor: claude})
+	if err != nil || tr.State != StateCrossChecked {
+		t.Fatalf("verify rev 2: %v %+v", err, tr)
+	}
+	// Update with evidence verifies the new revision directly.
+	title := "Gateway listens on 9090"
+	_, tr, err = s.Update(UpdateInput{Ref: n.ID, Title: &title, Reason: "title matched old port", Evidence: "main.go:12", Actor: claude})
+	if err != nil || tr.Revision != 3 || tr.State != StateVerified {
+		t.Fatalf("update with evidence: %v %+v", err, tr)
+	}
+	if _, _, err := s.Update(UpdateInput{Ref: n.ID, Reason: "x", Actor: claude}); err == nil {
+		t.Fatal("empty update accepted")
+	}
+	// Decisions are superseded, not edited.
+	d, _ := s.Add(AddInput{Type: "decision", Title: "Use Redis for rate limits", Description: "Shared buckets across replicas.", Actor: claude})
+	if _, _, err := s.Update(UpdateInput{Ref: d.Node.ID, Body: &body, Reason: "x", Actor: claude}); err == nil || !strings.Contains(err.Error(), "supersedes") {
+		t.Fatalf("decision update: %v", err)
+	}
+	// Any agent may deprecate with a reason.
+	if _, err := s.Deprecate(n.ID, "", codex); err == nil {
+		t.Fatal("reason required")
+	}
+	if _, err := s.Deprecate(n.ID, "gateway removed", codex); err != nil {
+		t.Fatal(err)
+	}
+	s.Invalidate()
+	n, _ = s.Get(n.ID)
+	if s.Trust(n).State != StateDeprecated {
+		t.Fatal("not deprecated")
+	}
+	issues, _ := s.Lint(LintOptions{})
+	for _, i := range issues {
+		if i.Severity == "error" {
+			t.Errorf("lint: %s", i)
+		}
 	}
 }

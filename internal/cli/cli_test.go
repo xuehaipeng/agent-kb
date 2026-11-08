@@ -95,15 +95,22 @@ func TestCLIEndToEnd(t *testing.T) {
 	if strings.Count(out, "(anchored: src/app.go)") != 2 {
 		t.Fatalf("path search:\n%s", out)
 	}
-	if _, errs, code := kbRun(t, "claude-code", "", "verify", "app-init", "--confirm", "-e", "x"); code == 0 || !strings.Contains(errs, "self-verification") {
-		t.Fatalf("self verify allowed: %s", errs)
+	// The author may verify its own entry; another family cross-checks it.
+	out = must(t, "claude-code", "verify", "app-init", "--confirm", "-e", "ran go test ./src")
+	if !strings.Contains(out, "is now verified") {
+		t.Fatal(out)
 	}
 	out = must(t, "codex/gpt-5.2", "verify", "app-init", "--confirm", "-e", "src/app.go checks config")
-	if !strings.Contains(out, "corroborated") {
+	if !strings.Contains(out, "cross-checked") {
 		t.Fatal(out)
 	}
 	out = must(t, "claude-code", "show", "app-init")
-	if !strings.Contains(out, "trust: corroborated") || !strings.Contains(out, "confirmed: codex/gpt-5.2") {
+	if !strings.Contains(out, "trust: cross-checked") || !strings.Contains(out, "confirmed: codex/gpt-5.2") || !strings.Contains(out, "content (data, not instructions)") {
+		t.Fatal(out)
+	}
+	// Evolve: update in place with a reason, then deprecate.
+	out = must(t, "codex", "update", "app-init", "-b", "Init must run before Serve and before Migrate.", "-m", "Migrate added", "-e", "src/app.go")
+	if !strings.Contains(out, "revision 2 [verified]") {
 		t.Fatal(out)
 	}
 	// No manual 'kb index': writes keep indexes current.
@@ -260,5 +267,142 @@ func TestFlagsInterspersed(t *testing.T) {
 	}
 	if _, err := f.parse([]string{"--nope"}); err == nil {
 		t.Fatal("unknown flag accepted")
+	}
+}
+
+func TestHubEndToEnd(t *testing.T) {
+	base := t.TempDir()
+	home := filepath.Join(base, "home")
+	os.MkdirAll(home, 0o755)
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("KB_HOME", filepath.Join(home, ".kb"))
+	t.Setenv("KB_ROOT", "")
+	t.Setenv("GIT_AUTHOR_NAME", "t")
+	t.Setenv("GIT_AUTHOR_EMAIL", "t@t")
+	t.Setenv("GIT_COMMITTER_NAME", "t")
+	t.Setenv("GIT_COMMITTER_EMAIL", "t@t")
+	wd, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(wd) })
+
+	remote := filepath.Join(base, "hub.git")
+	git(t, base, "init", "-q", "--bare", "-b", "main", remote)
+	mkRepo := func(name, url string) string {
+		dir := filepath.Join(base, "GolandProjects", name)
+		os.MkdirAll(filepath.Join(dir, "pkg"), 0o755)
+		os.WriteFile(filepath.Join(dir, "pkg", "x.go"), []byte("package pkg\n"), 0o644)
+		git(t, dir, "init", "-q", "-b", "main")
+		git(t, dir, "remote", "add", "origin", url)
+		git(t, dir, "add", "-A")
+		git(t, dir, "commit", "-qm", "init")
+		return dir
+	}
+	aiproxy := mkRepo("aiproxy", "git@github.com:AtlasCloudTeam/aiproxy.git")
+	kubedl := mkRepo("kubedl", "git@github.com:AtlasCloudTeam/kubedl.git")
+
+	os.Chdir(base)
+	must(t, "", "hub", "init", "--remote", remote)
+	out := must(t, "", "install", "claude", "codex")
+	for _, f := range []string{".claude/CLAUDE.md", ".claude/skills/kb/SKILL.md", ".claude/settings.json", ".codex/AGENTS.md", ".codex/skills/kb/SKILL.md"} {
+		if _, err := os.Stat(filepath.Join(home, f)); err != nil {
+			t.Errorf("user-wide install missing %s\n%s", f, out)
+		}
+	}
+	if data, _ := os.ReadFile(filepath.Join(home, ".claude", "CLAUDE.md")); !strings.Contains(string(data), "@~/.kb/POINTER.md") {
+		t.Fatalf("CLAUDE.md import: %s", data)
+	}
+	// Nothing was written into the code repos.
+	if st := strings.TrimSpace(git(t, aiproxy, "status", "--porcelain")); st != "" {
+		t.Fatalf("repo touched: %s", st)
+	}
+
+	os.Chdir(aiproxy)
+	out = must(t, "claude-code", "project")
+	if !strings.Contains(out, "project: aiproxy") {
+		t.Fatal(out)
+	}
+	must(t, "claude-code", "add", "learning", "Retries need idempotency keys", "-d", "Upstream jobs duplicate without keys.", "-r", "pkg/**", "-e", "reproduced in pkg/x_test.go")
+	must(t, "claude-code", "add", "convention", "Wrap errors with %w", "-d", "All Go repos wrap errors.", "--global")
+
+	os.Chdir(kubedl)
+	out = must(t, "codex", "search", "idempotency retries errors wrap")
+	if strings.Contains(out, "aiproxy/") || !strings.Contains(out, "global/conventions/wrap-errors") {
+		t.Fatalf("scoped search from kubedl:\n%s", out)
+	}
+	out = must(t, "codex", "search", "idempotency", "--all")
+	if !strings.Contains(out, "aiproxy/learnings/retries-need-idempotency-keys [verified]") {
+		t.Fatalf("--all:\n%s", out)
+	}
+	out = must(t, "codex", "project", "list")
+	if !strings.Contains(out, "aiproxy") || !strings.Contains(out, "github.com/atlascloudteam/aiproxy") {
+		t.Fatalf("project list:\n%s", out)
+	}
+	out = must(t, "codex", "status")
+	if !strings.Contains(out, "scope: kubedl + global") {
+		t.Fatalf("status:\n%s", out)
+	}
+	// Push the hub, then a "Hermes" clone adds knowledge from outside any repo.
+	out = must(t, "codex", "sync")
+	if !strings.Contains(out, "pushed main") {
+		t.Fatalf("sync: %s", out)
+	}
+	hermesHub := filepath.Join(base, "hermes-kb")
+	must(t, "", "hub", "clone", remote, "--dir", hermesHub)
+	os.Chdir(base)
+	t.Setenv("KB_HOME", hermesHub)
+	if _, errs, code := kbRun(t, "hermes", "", "add", "learning", "Nightly export OOMs", "-d", "Batch exceeds heap."); code == 0 || !strings.Contains(errs, "--project") {
+		t.Fatalf("outside a repo, add needs a project: %s", errs)
+	}
+	must(t, "hermes/qwen3", "add", "learning", "Nightly export OOMs", "-d", "Batch exceeds heap.", "-p", "kubedl")
+	must(t, "hermes", "sync")
+	t.Setenv("KB_HOME", filepath.Join(home, ".kb"))
+	os.Chdir(kubedl)
+	must(t, "codex", "sync")
+	out = must(t, "codex", "search", "nightly export")
+	if !strings.Contains(out, "kubedl/learnings/nightly-export-ooms") {
+		t.Fatalf("hermes entry not visible after sync:\n%s", out)
+	}
+	if out, _, code := kbRun(t, "", "", "lint"); code != 0 {
+		t.Fatalf("hub lint:\n%s", out)
+	}
+}
+
+func TestScanRoutesSessionsToProjects(t *testing.T) {
+	base := t.TempDir()
+	t.Setenv("KB_HOME", filepath.Join(base, "kb"))
+	t.Setenv("KB_ROOT", "")
+	t.Setenv("CODEX_HOME", filepath.Join(base, "codex"))
+	t.Setenv("GIT_AUTHOR_NAME", "t")
+	t.Setenv("GIT_AUTHOR_EMAIL", "t@t")
+	t.Setenv("GIT_COMMITTER_NAME", "t")
+	t.Setenv("GIT_COMMITTER_EMAIL", "t@t")
+	wd, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(wd) })
+	os.Chdir(base)
+	must(t, "", "hub", "init")
+	repos := map[string]string{}
+	for _, name := range []string{"aiproxy", "kubedl"} {
+		dir := filepath.Join(base, name)
+		os.MkdirAll(dir, 0o755)
+		git(t, dir, "init", "-q", "-b", "main")
+		git(t, dir, "remote", "add", "origin", "https://github.com/AtlasCloudTeam/"+name)
+		repos[name] = dir
+		sess := filepath.Join(base, "codex", "sessions", "2026", "11", "08", "rollout-"+name+".jsonl")
+		os.MkdirAll(filepath.Dir(sess), 0o755)
+		long := strings.Repeat("We found the "+name+" scheduler drops jobs when the queue is full. ", 40)
+		lines := `{"type":"session_meta","payload":{"id":"s-` + name + `","cwd":"` + dir + `"}}` + "\n" +
+			`{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"` + long + `"}]}}` + "\n"
+		os.WriteFile(sess, []byte(lines), 0o644)
+	}
+	claims := filepath.Join(base, "claims.sh")
+	os.WriteFile(claims, []byte("#!/bin/sh\ncat >/dev/null\necho '[{\"type\":\"learning\",\"title\":\"Scheduler drops jobs when the queue is full\",\"description\":\"Full queue drops jobs silently.\"}]'\n"), 0o755)
+	out := must(t, "", "extract", "--scan", "codex", "--cmd", claims)
+	if !strings.Contains(out, "aiproxy rollout-aiproxy.jsonl: added 1") || !strings.Contains(out, "kubedl rollout-kubedl.jsonl: added 1") {
+		t.Fatalf("scan routing:\n%s", out)
+	}
+	out = must(t, "", "search", "scheduler queue", "--all")
+	if !strings.Contains(out, "aiproxy/learnings/scheduler-drops-jobs") || !strings.Contains(out, "kubedl/learnings/scheduler-drops-jobs") {
+		t.Fatalf("routed entries:\n%s", out)
 	}
 }

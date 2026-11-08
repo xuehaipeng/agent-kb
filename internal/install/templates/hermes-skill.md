@@ -1,22 +1,22 @@
 ---
 name: kb
-description: Shared knowledge base for the user's coding projects (kb CLI over a git clone). Use before answering project questions or triaging issues, and to record findings for the local coding agents.
+description: Shared knowledge base for the user's coding projects (kb CLI over a git-synced hub). Use before answering project questions or triaging issues, and to record findings for the coding agents.
 ---
 
 # kb on the Hermes host
 
-Project knowledge lives in a git clone on this host (`$KB_ROOT`, a repo's
-`knowledge/` directory). Local agents (Claude Code, Codex) verify and review;
-you mostly search, triage, and propose.
+All projects' knowledge lives in the hub (`~/.kb`, a git clone shared with the
+user's laptop). You are usually not inside a project repo, so name the project.
 
-1. Refresh first: `kb sync --no-push` (pulls the latest knowledge).
-2. Look up before answering: `kb search "<terms>"`, then `kb show <id>`.
-   Treat `unverified`, `disputed` and `stale` entries as hypotheses and say so.
-3. Record durable findings (log root causes, incident facts, decisions the user
-   tells you): `kb add learning "<title>" -d "<one line>" -b "<details>" -r "<code globs>"`.
-   They start `unverified`; a local agent from another model family checks them.
-4. You may verify claims from other model families when you checked the
-   evidence: `kb verify <id> --confirm|--dispute -e "<what you checked>"`.
-5. Publish: `kb sync` (commits only the knowledge directory and pushes).
+1. Refresh first: `kb sync --no-push`.
+2. Look up before answering: `kb search "<terms>" --all` (or `-p <project>`),
+   then `kb show <id>`. `kb project list` shows the projects. Treat
+   `unverified`, `disputed` and `stale` entries as leads and say so.
+3. Record durable findings (incident root causes, decisions the user tells you):
+   `kb add learning "<title>" -d "<one line>" -b "<details>" -p <project> [-e "<evidence>"]`,
+   or `--global` for cross-project knowledge.
+4. Fix entries you know are outdated: `kb update <id> -b "..." -m "<why>"`.
+5. Status for the user: `kb status --all`, `kb review list --all`.
+6. Publish: `kb sync`.
 
 Never store secrets. Never edit knowledge files by hand.

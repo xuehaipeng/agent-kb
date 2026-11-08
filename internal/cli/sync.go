@@ -3,6 +3,7 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -17,26 +18,36 @@ import (
 func (a *App) cmdSync(args []string) error {
 	f := newFlags("sync")
 	a.globals(f)
-	var noPush bool
+	var noPush, quiet bool
 	var msg string
 	f.boolean(&noPush, "do not push", "no-push")
+	f.boolean(&quiet, "no output unless something fails", "quiet", "q")
 	f.str(&msg, "", "commit message", "m", "message")
 	if _, err := f.parse(args); err != nil {
 		return err
+	}
+	if quiet {
+		a = &App{Stdin: a.Stdin, Stdout: io.Discard, Stderr: a.Stderr, root: a.root, as: a.as}
 	}
 	s, err := a.store()
 	if err != nil {
 		return err
 	}
-	top := s.GitTop()
+	top := s.KnowledgeTop()
 	if top == "" {
-		return errors.New("sync needs the bundle inside a git work tree")
+		return fmt.Errorf("sync needs %s inside a git repository (hub: 'kb hub init' creates one)", s.Dir)
 	}
 	rel, err := filepath.Rel(top, s.Dir)
 	if err != nil || strings.HasPrefix(rel, "..") {
-		return errors.New("bundle is outside the git work tree")
+		return errors.New("knowledge directory is outside its git work tree")
 	}
 	rel = filepath.ToSlash(rel)
+	// Serialise with kb writes (and their hub autocommits).
+	unlock, err := s.Lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	upstream, _ := kb.Git(top, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
 	pull := func() error {
 		if upstream == "" {
@@ -64,13 +75,15 @@ func (a *App) cmdSync(args []string) error {
 			a.out(" with %s", upstream)
 		}
 		a.out("\n")
-		if noPush || upstream == "" {
+		if noPush {
 			return nil
 		}
-		// Push commits that may exist locally from earlier --no-push runs.
-		ahead, _ := kb.Git(top, "rev-list", "--count", "@{upstream}..HEAD")
-		if ahead == "" || ahead == "0" {
-			return nil
+		if upstream != "" {
+			// Push commits made locally (autocommits, earlier --no-push runs).
+			ahead, _ := kb.Git(top, "rev-list", "--count", "@{upstream}..HEAD")
+			if ahead == "" || ahead == "0" {
+				return nil
+			}
 		}
 	} else {
 		if msg == "" {
@@ -90,6 +103,12 @@ func (a *App) cmdSync(args []string) error {
 	}
 	if noPush {
 		return nil
+	}
+	if upstream == "" {
+		if _, err := kb.Git(top, "remote", "get-url", "origin"); err != nil {
+			a.out("no remote 'origin': knowledge is committed locally only (git -C %s remote add origin <url>)\n", top)
+			return nil
+		}
 	}
 	branch, err := kb.Git(top, "rev-parse", "--abbrev-ref", "HEAD")
 	if err != nil {
