@@ -24,3 +24,4 @@ Append-only record of changes made through `kb`. Newest last. Do not edit.
 - [2026-11-08T15:28:51Z] deprecate decisions/cli-is-the-primary-agent-interface-mcp-is-stdio-only by claude-code - restates docs/ARCHITECTURE.md §2.7 and README MCP section
 - [2026-11-08T15:28:51Z] deprecate conventions/bundle-writes-go-through-store-methods-that-hold-store-lock by claude-code - restates AGENTS.md (always loaded): every mutation goes through a Store method holding Store.Lock()
 - [2026-11-08T15:28:51Z] deprecate facts/generated-index-files-do-not-depend-on-the-clock-or-git-head by claude-code - restates AGENTS.md (always loaded): generated outputs must be deterministic, use TrustStatic
+- [2026-11-08T15:29:29Z] verify learnings/resolve-symlinks-before-comparing-paths-with-git-s-toplevel by claude-code - confirmed: store.go Open() and gitFor() still resolve via realPath at HEAD; kb tests open repos through a symlink

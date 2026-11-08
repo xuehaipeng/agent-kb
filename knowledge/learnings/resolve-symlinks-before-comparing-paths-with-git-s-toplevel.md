@@ -6,7 +6,7 @@ tags: [macos, paths, git]
 status: stable
 resources: [internal/kb/store.go, internal/kb/git.go]
 generated: {by: claude-code, at: "2026-11-08T10:33:19Z", commit: 11aeb9f53509}
-stale_after: "2026-12-08T13:56:17Z"
+stale_after: "2026-12-08T15:29:29Z"
 verified:
   - by: claude-code
     at: "2026-11-08T13:56:17Z"
@@ -14,5 +14,11 @@ verified:
     rev: 1
     commit: a8425826899a
     evidence: Open() still resolves via realPath; kb tests open repos through a symlink
+  - by: claude-code
+    at: "2026-11-08T15:29:29Z"
+    result: confirmed
+    rev: 1
+    commit: a66b97423584
+    evidence: store.go Open() and gitFor() still resolve via realPath at HEAD; kb tests open repos through a symlink
 ---
 Found via CI: TestImmutableStagedLint failed only on macos-latest because t.TempDir() lives under /var/folders, a symlink to /private/var. relToTop returned "" and the immutability lint skipped instead of failing. Open() and the git toplevel now go through filepath.EvalSymlinks (realPath), and kb tests open the repo through a symlink so Linux CI catches regressions.
