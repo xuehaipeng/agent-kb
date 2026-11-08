@@ -1,0 +1,4 @@
+/bin/
+/kb
+*.test
+.DS_Store
