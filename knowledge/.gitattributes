@@ -1,0 +1,4 @@
+# Append-only and generated files merge by union; 'kb index' then rewrites indexes.
+log.md merge=union
+index.md merge=union
+*/index.md merge=union

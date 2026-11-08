@@ -1,0 +1,84 @@
+# AgentKB configuration. See docs/ARCHITECTURE.md in the agent-kb repository.
+version: 1
+
+# Git work tree whose files 'resources:' globs refer to (relative to this
+# directory). Used for path-aware search and code-change staleness.
+code_root: ..
+
+# Knowledge types. ttl_days sets stale_after at write/confirm time.
+# Immutable types can only be superseded or deprecated, never edited.
+types:
+  fact:
+    dir: facts
+    ttl_days: 90
+    description: Stable project facts and invariants.
+  learning:
+    dir: learnings
+    ttl_days: 30
+    immutable: true
+    description: Gotchas, root causes, debugging lessons.
+  decision:
+    dir: decisions
+    immutable: true
+    description: Architectural decisions (ADR); superseded, never edited.
+  convention:
+    dir: conventions
+    description: Coding and workflow conventions.
+  review:
+    dir: reviews
+    ttl_days: 14
+    description: Cross-agent review packets.
+
+# Model family resolution for the cross-family verification rule.
+# An actor is "<producer>/<model>". A recognised model prefix wins over the
+# producer default, so cursor/claude-sonnet-4.5 is anthropic.
+families:
+  producers:
+    claude-code: anthropic
+    claude: anthropic
+    codex: openai
+    chatgpt: openai
+    cursor: cursor
+    antigravity: google
+    gemini-cli: google
+    gemini: google
+    grokbot: xai
+    grok: xai
+    hermes: nous
+  models:
+    claude: anthropic
+    opus: anthropic
+    sonnet: anthropic
+    haiku: anthropic
+    gpt: openai
+    o1: openai
+    o3: openai
+    o4: openai
+    codex: openai
+    gemini: google
+    grok: xai
+    hermes: nous
+    qwen: alibaba
+    deepseek: deepseek
+    kimi: moonshot
+    glm: zhipu
+
+search:
+  limit: 8
+
+lint:
+  # - term: publish.sh
+  #   hint: replaced by 'make release' in 2026-10
+  retired_terms: []
+  max_body_bytes: 6000
+
+# Transcript capture ('kb extract'). The command receives the prompt on stdin
+# and must print a JSON array of claims.
+extract:
+  commands:
+    claude: [claude, -p, --model, haiku]
+    codex: [codex, exec, --skip-git-repo-check, "-"]
+    text: [claude, -p, --model, haiku]
+  max_claims: 5
+  min_chars: 1500
+  timeout_sec: 240

@@ -351,13 +351,27 @@ func Slugify(title string) string {
 	}
 	slug := strings.Trim(b.String(), "-")
 	if r := []rune(slug); len(r) > 60 {
-		slug = strings.Trim(string(r[:60]), "-")
-		if i := strings.LastIndex(slug, "-"); i > 30 {
-			slug = slug[:i]
+		cut := strings.Trim(string(r[:61]), "-")
+		if len(r) > 61 && r[61] != '-' {
+			// Cut mid-word: back off to the previous word boundary.
+			if i := strings.LastIndex(cut, "-"); i > 30 {
+				cut = cut[:i]
+			}
 		}
+		slug = cut
+	}
+	// Don't end on filler words ("...-instead-of-a").
+	for {
+		i := strings.LastIndex(slug, "-")
+		if i <= 0 || !slugFiller[slug[i+1:]] {
+			break
+		}
+		slug = slug[:i]
 	}
 	return slug
 }
+
+var slugFiller = map[string]bool{"a": true, "an": true, "the": true, "of": true, "and": true, "or": true, "to": true, "in": true, "on": true, "for": true, "with": true, "is": true, "be": true, "by": true, "at": true}
 
 func cleanList(in []string) []string {
 	var out []string

@@ -1,0 +1,47 @@
+{
+  "hooks": {
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "command": "kb hook claude",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "command": "kb hook claude",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "command": "kb hook claude",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
+    ]
+  },
+  "permissions": {
+    "allow": [
+      "Bash(kb search:*)",
+      "Bash(kb show:*)",
+      "Bash(kb status:*)",
+      "Bash(kb add:*)",
+      "Bash(kb verify:*)",
+      "Bash(kb review:*)"
+    ]
+  }
+}

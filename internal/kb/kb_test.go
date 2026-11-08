@@ -139,6 +139,9 @@ func TestSlugify(t *testing.T) {
 	if got := Slugify("pnpm test hangs under Node 24 (without --no-isolate)!"); got != "pnpm-test-hangs-under-node-24-without-no-isolate" {
 		t.Fatal(got)
 	}
+	if got := Slugify("Search scans the bundle in-process with BM25 instead of a SQLite FTS5 cache"); got != "search-scans-the-bundle-in-process-with-bm25-instead" {
+		t.Fatal(got)
+	}
 	if got := Slugify("网关 超时 传播"); got != "网关-超时-传播" {
 		t.Fatal(got)
 	}
