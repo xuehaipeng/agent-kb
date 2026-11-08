@@ -139,7 +139,7 @@ func (s *Store) ReviewSubmit(in SubmitInput) (*Node, error) {
 	if err := s.writeNode(n); err != nil {
 		return nil, err
 	}
-	return n, s.AppendLog("review-submit", id, in.Actor, fmt.Sprintf("%s..%s %s", baseSHA, headSHA, in.Title))
+	return n, s.recordChange("review-submit", id, in.Actor, fmt.Sprintf("%s..%s %s", baseSHA, headSHA, in.Title))
 }
 
 func (s *Store) defaultBase() string {
@@ -240,7 +240,7 @@ func (s *Store) ReviewVerdict(in VerdictInput) (*Node, string, error) {
 	if err := s.writeNode(n); err != nil {
 		return nil, "", err
 	}
-	return n, state, s.AppendLog("review-verdict", n.ID, in.Actor, result+" "+evidence)
+	return n, state, s.recordChange("review-verdict", n.ID, in.Actor, result+" "+evidence)
 }
 
 // ReviewRevise points a review at a new head after the author addressed
@@ -299,7 +299,7 @@ func (s *Store) ReviewRevise(ref, head, note string, actor Actor) (*Node, error)
 	if err := s.writeNode(n); err != nil {
 		return nil, err
 	}
-	return n, s.AppendLog("review-revise", n.ID, actor, prev+" -> "+sha+": "+note)
+	return n, s.recordChange("review-revise", n.ID, actor, prev+" -> "+sha+": "+note)
 }
 
 // ReviewClose marks a review closed (author family or human).
@@ -328,7 +328,7 @@ func (s *Store) ReviewClose(ref, note string, actor Actor) (*Node, error) {
 	if err := s.writeNode(n); err != nil {
 		return nil, err
 	}
-	return n, s.AppendLog("review-close", n.ID, actor, note)
+	return n, s.recordChange("review-close", n.ID, actor, note)
 }
 
 // ReviewItem is a review with its derived state.

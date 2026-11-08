@@ -140,7 +140,7 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	if len(supIDs) > 0 {
 		detail += " (supersedes " + strings.Join(supIDs, ", ") + ")"
 	}
-	if err := s.AppendLog("add", id, in.Actor, detail); err != nil {
+	if err := s.recordChange("add", id, in.Actor, detail); err != nil {
 		return nil, err
 	}
 	res.Node = n
@@ -203,7 +203,7 @@ func (s *Store) Verify(in VerifyInput) (*Node, Trust, error) {
 	if err := s.writeNode(n); err != nil {
 		return nil, Trust{}, err
 	}
-	if err := s.AppendLog("verify", n.ID, in.Actor, in.Result+": "+in.Evidence); err != nil {
+	if err := s.recordChange("verify", n.ID, in.Actor, in.Result+": "+in.Evidence); err != nil {
 		return nil, Trust{}, err
 	}
 	return n, after, nil
@@ -249,7 +249,7 @@ func (s *Store) Resolve(ref string, keep bool, note string, actor Actor) (*Node,
 	if !keep {
 		op = "resolve-deprecate"
 	}
-	if err := s.AppendLog(op, n.ID, actor, note); err != nil {
+	if err := s.recordChange(op, n.ID, actor, note); err != nil {
 		return nil, Trust{}, err
 	}
 	return n, t, nil
@@ -283,7 +283,7 @@ func (s *Store) Deprecate(ref, reason string, actor Actor) (*Node, error) {
 	if err := s.writeNode(n); err != nil {
 		return nil, err
 	}
-	return n, s.AppendLog("deprecate", n.ID, actor, reason)
+	return n, s.recordChange("deprecate", n.ID, actor, reason)
 }
 
 // applyStatus keeps OKF `status` consistent with the derived trust state.

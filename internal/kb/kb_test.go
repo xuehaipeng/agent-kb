@@ -29,7 +29,13 @@ func newRepo(t *testing.T) *Store {
 	write(t, filepath.Join(dir, "knowledge", ConfigFile), DefaultConfigYAML)
 	run("add", "-A")
 	run("commit", "-q", "-m", "init")
-	s, err := Open(filepath.Join(dir, "knowledge"))
+	// Open through a symlink, as macOS does for t.TempDir (/var -> /private/var),
+	// so path handling is exercised against git's resolved toplevel everywhere.
+	link := filepath.Join(t.TempDir(), "link")
+	if err := os.Symlink(dir, link); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Open(filepath.Join(link, "knowledge"))
 	if err != nil {
 		t.Fatal(err)
 	}

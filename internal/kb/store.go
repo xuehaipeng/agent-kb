@@ -62,16 +62,32 @@ func Open(dir string) (*Store, error) {
 	if st, err := os.Stat(abs); err != nil || !st.IsDir() {
 		return nil, fmt.Errorf("knowledge bundle %s not found (run 'kb init')", abs)
 	}
+	// Resolve symlinks so paths compare cleanly with git's resolved toplevel
+	// (macOS: /var -> /private/var, /tmp -> /private/tmp). Without this,
+	// filepath.Rel against the toplevel yields "../.." and path-scoped checks,
+	// such as the immutability lint, silently skip.
+	abs = realPath(abs)
 	cfg, err := LoadConfig(abs)
 	if err != nil {
 		return nil, err
 	}
 	code := abs
 	if cfg.CodeRoot != "" {
-		code = filepath.Clean(filepath.Join(abs, cfg.CodeRoot))
+		code = realPath(filepath.Clean(filepath.Join(abs, cfg.CodeRoot)))
 	}
 	return &Store{Dir: abs, CodeRoot: code, Cfg: cfg, Now: time.Now}, nil
 }
+
+// realPath resolves symlinks, falling back to the cleaned input on error.
+func realPath(p string) string {
+	if r, err := filepath.EvalSymlinks(p); err == nil {
+		return r
+	}
+	return filepath.Clean(p)
+}
+
+// RealPath is realPath for other packages comparing paths with the store.
+func RealPath(p string) string { return realPath(p) }
 
 // Discover finds the bundle: explicit root, $KB_ROOT, or walking up from cwd
 // looking for <dir>/knowledge/kb.yaml (or a kb.yaml in the directory itself).
@@ -322,4 +338,15 @@ func oneLine(s string, max int) string {
 func (s *Store) Refresh() {
 	s.loaded = false
 	s.git = nil
+}
+
+// recordChange runs after every mutation: append to log.md and regenerate
+// the (deterministic) indexes, so a commit made right after a kb write
+// passes lint without a manual 'kb index'.
+func (s *Store) recordChange(op, id string, actor Actor, detail string) error {
+	if err := s.AppendLog(op, id, actor, detail); err != nil {
+		return err
+	}
+	_, err := s.WriteIndex()
+	return err
 }

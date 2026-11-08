@@ -531,7 +531,7 @@ func Scan(s *kb.Store, o ScanOptions) ([]string, error) {
 }
 
 func within(root, p string) bool {
-	rel, err := filepath.Rel(root, p)
+	rel, err := filepath.Rel(kb.RealPath(root), kb.RealPath(p))
 	return err == nil && !strings.HasPrefix(rel, "..")
 }
 

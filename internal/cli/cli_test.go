@@ -106,7 +106,7 @@ func TestCLIEndToEnd(t *testing.T) {
 	if !strings.Contains(out, "trust: corroborated") || !strings.Contains(out, "confirmed: codex/gpt-5.2") {
 		t.Fatal(out)
 	}
-	must(t, "", "index", "--quiet")
+	// No manual 'kb index': writes keep indexes current.
 	out, _, code = kbRun(t, "", "", "lint")
 	if code != 0 {
 		t.Fatalf("lint failed:\n%s", out)

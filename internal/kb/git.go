@@ -53,7 +53,7 @@ func (s *Store) gitc() *gitCache {
 	g := &gitCache{changed: map[string][]string{}, bad: map[string]bool{}}
 	if top, err := Git(s.CodeRoot, "rev-parse", "--show-toplevel"); err == nil {
 		g.ok = true
-		g.top = top
+		g.top = realPath(top)
 		if h, err := Git(s.CodeRoot, "rev-parse", "--short=12", "HEAD"); err == nil {
 			g.head = h
 		}
@@ -108,6 +108,7 @@ func (s *Store) RelToCode(p string) string {
 		base = s.CodeRoot
 	}
 	if filepath.IsAbs(p) {
+		p = realPath(p)
 		if rel, err := filepath.Rel(base, p); err == nil && !strings.HasPrefix(rel, "..") {
 			return filepath.ToSlash(rel)
 		}
@@ -116,7 +117,7 @@ func (s *Store) RelToCode(p string) string {
 	// Prefer cwd-relative when that file exists; otherwise treat the path as
 	// already relative to the repository root (what agents usually pass).
 	if abs, err := filepath.Abs(p); err == nil && fileExists(abs) {
-		if rel, err := filepath.Rel(base, abs); err == nil && !strings.HasPrefix(rel, "..") {
+		if rel, err := filepath.Rel(base, realPath(abs)); err == nil && !strings.HasPrefix(rel, "..") {
 			return filepath.ToSlash(rel)
 		}
 	}
