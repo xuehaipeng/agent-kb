@@ -140,7 +140,25 @@ kb add rule "Write commit messages in English" -d "team convention" -e "user sai
 kb rules import                                 # ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md (global)
                                                 # + CLAUDE.md, GEMINI.md, .claude/rules, .cursor/rules, .agents/rules (this project)
 kb extract --scan memories                      # Claude Code, Codex, Hermes and Antigravity memory files (changed ones only)
+kb extract --scan memories -p aiproxy -p kubedl # ... only what belongs to these projects
 ```
+
+An agent can also seed what it remembers about particular projects itself, in
+one call. Each item goes through the usual duplicate, doc-overlap and
+project-name checks, and is reported individually:
+
+```bash
+kb add --from - -e "from my claude-code memory" <<'JSON'
+[{"type":"learning","project":"aiproxy","title":"Upstream 429 storms need jittered backoff",
+  "description":"Retries without jitter amplify throttling.","resources":["pkg/retry/**"]},
+ {"type":"rule","project":"kubedl","title":"Create the volcano queue before submitting jobs","description":"Jobs pend forever otherwise."},
+ {"type":"rule","global":true,"title":"Keep PR descriptions short","description":"User preference."}]
+JSON
+```
+
+Writing to a project that has no entries yet needs `--new-project`, so a typo
+like `-p kubdl` is refused with "did you mean kubedl?" instead of creating a
+stray project.
 
 | Agent | How rules arrive |
 |---|---|

@@ -239,6 +239,17 @@ Rev 2 shares all three.
     rather than searched.
 - **Ownership marker:** user-level managed blocks carry a marker naming the
   hub that wrote them, and refreshes only touch blocks they own.
+- **Agent-driven seeding:** an agent that already knows things about some
+  projects writes them itself with `kb add --from` (a JSON array or JSON
+  lines; per-item `project` or `global`). That's the cheap path inside a
+  session: no extra model call, and the agent judges what is durable. The
+  importer can also be limited with `kb extract --scan memories -p <id>`; a
+  filtered run never records the file as imported, so a later full run still
+  takes the rest.
+- **Project-name guard:** writing to a project that doesn't exist (other than
+  the current repo's) needs `--new-project`; otherwise kb refuses with a
+  did-you-mean suggestion, so seeding into named projects can't silently
+  create stray ones.
 
 ### 2.11 Reviews
 

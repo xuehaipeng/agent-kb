@@ -15,7 +15,10 @@ user's laptop). You are usually not inside a project repo, so name the project.
    `unverified`, `disputed` and `stale` entries as leads and say so.
 3. Record durable findings (incident root causes, decisions the user tells you):
    `kb add learning "<title>" -d "<one line>" -b "<details>" -p <project> [-e "<evidence>"]`,
-   or `--global` for cross-project knowledge.
+   or `--global` for cross-project knowledge. A project with no entries yet needs
+   `--new-project`. To seed many things you remember at once:
+   `kb add --from - -e "from my hermes memory"` with a JSON array of entries
+   (each may set "project" or "global": true).
 4. Fix entries you know are outdated: `kb update <id> -b "..." -m "<why>"`.
    When the user states a lasting rule or preference: `kb add rule "<instruction>" -d "<why>" -e "user said so" [-p <project> | --global]`.
    Share your own memory with the other agents: `kb extract --scan hermes-memory`.

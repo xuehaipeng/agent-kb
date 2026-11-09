@@ -181,7 +181,7 @@ func tools() []any {
 			"description": "Record durable, non-obvious knowledge. type: fact|learning|decision|convention. evidence (how you know) makes it verified. resources: code globs it depends on. global: shared by all projects (projects: which ones it applies to).",
 			"inputSchema": schema(map[string]any{
 				"type": strP, "title": strP, "description": strP, "body": strP, "evidence": strP,
-				"resources": strsP, "tags": strsP, "supersedes": strsP, "project": strP, "global": boolP, "projects": strsP,
+				"resources": strsP, "tags": strsP, "supersedes": strsP, "project": strP, "global": boolP, "projects": strsP, "new_project": boolP,
 			}, "type", "title", "description"),
 		},
 		map[string]any{
@@ -265,6 +265,7 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 			Type, Title, Description, Body, Evidence, Project string
 			Resources, Tags, Supersedes, Projects             []string
 			Global                                            bool
+			NewProject                                        bool `json:"new_project"`
 		}
 		if err := json.Unmarshal(orEmpty(raw), &a); err != nil {
 			return "", err
@@ -276,7 +277,7 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 		if a.Global {
 			a.Project = kb.GlobalProject
 		}
-		res, err := s.Store.Add(kb.AddInput{Type: a.Type, Title: a.Title, Description: a.Description, Body: a.Body, Evidence: a.Evidence, Resources: a.Resources, Tags: a.Tags, Supersedes: a.Supersedes, Project: a.Project, Projects: a.Projects, Actor: actor})
+		res, err := s.Store.Add(kb.AddInput{Type: a.Type, Title: a.Title, Description: a.Description, Body: a.Body, Evidence: a.Evidence, Resources: a.Resources, Tags: a.Tags, Supersedes: a.Supersedes, Project: a.Project, Projects: a.Projects, NewProject: a.NewProject, Actor: actor})
 		if err != nil {
 			return "", err
 		}

@@ -92,11 +92,38 @@ kb deprecate <id> -m "feature removed in v3"
 Each update is a new revision (history in git); earlier verifications stay in
 the trail for the revision they checked.
 
+## Seed what you already know
+
+When asked to share your memories (or what you learned in earlier sessions)
+about some projects, seed the durable ones in one call:
+
+1. `kb project list` shows the project ids (inside a repo, `kb project`).
+2. Keep what is durable, non-obvious and not in the repo's docs: gotchas, root
+   causes, decisions and the user's rules or preferences. Skip notes about one
+   finished task, personal data and secrets.
+3. Write them as a JSON array (or JSON lines); each item may set `project` or
+   `"global": true`, otherwise `-p` applies:
+
+```bash
+kb add --from - -e "from my claude-code memory" <<'JSON'
+[{"type":"learning","project":"aiproxy","title":"Upstream 429 storms need jittered backoff",
+  "description":"Retries without jitter amplify throttling.","resources":["pkg/retry/**"]},
+ {"type":"rule","project":"kubedl","title":"Create the volcano queue before submitting jobs","description":"Jobs pend forever otherwise."},
+ {"type":"rule","global":true,"title":"Keep PR descriptions short","description":"User preference."}]
+JSON
+```
+
+Each item gets the usual checks; duplicates, restated docs and unknown project
+ids are reported per item. A project with no entries yet needs `--new-project`
+(this guards against typos creating stray projects). `-e` marks the items as
+verified: use it only for things you actually know.
+
 ## Agents' own memories
 
 What agents save in their private memory (Claude Code auto memory, Codex
 memories, Hermes MEMORY.md/USER.md, Antigravity knowledge items) is imported
-so every agent can use it: `kb extract --scan memories`. Claude Code's is
+so every agent can use it: `kb extract --scan memories`, or only for some
+projects: `kb extract --scan memories -p aiproxy -p kubedl`. Claude Code's is
 imported automatically at session end; files are only re-read when they change.
 
 ## Projects (hub mode)

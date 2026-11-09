@@ -1,6 +1,7 @@
 package kb
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -211,7 +212,7 @@ func TestHubClaimsRepoLessProject(t *testing.T) {
 	newHub(t)
 	// Hermes, outside any repo, records knowledge for "kubedl" first.
 	h := openAt(t, t.TempDir())
-	if _, err := h.Add(AddInput{Type: "learning", Title: "Nightly export OOMs", Description: "Batch exceeds heap.", Project: "kubedl", Actor: Actor{Producer: "hermes"}}); err != nil {
+	if _, err := h.Add(AddInput{Type: "learning", Title: "Nightly export OOMs", Description: "Batch exceeds heap.", Project: "kubedl", NewProject: true, Actor: Actor{Producer: "hermes"}}); err != nil {
 		t.Fatal(err)
 	}
 	repo := newCodeRepo(t, "git@github.com:AtlasCloudTeam/kubedl.git")
@@ -224,5 +225,27 @@ func TestHubClaimsRepoLessProject(t *testing.T) {
 	}
 	if pf := k.ProjectFiles()["kubedl"]; len(pf.Repos) != 1 || pf.Repos[0] != "github.com/atlascloudteam/kubedl" {
 		t.Fatalf("repo not recorded: %+v", pf)
+	}
+}
+
+func TestUnknownProjectGuard(t *testing.T) {
+	newHub(t)
+	repo := newCodeRepo(t, "git@github.com:AtlasCloudTeam/aiproxy.git")
+	a := openAt(t, repo)
+	// The current repo's own project may be created implicitly.
+	if _, err := a.Add(AddInput{Type: "fact", Title: "Gateway port is 8080", Description: "HTTP listener.", Actor: claude}); err != nil {
+		t.Fatal(err)
+	}
+	h := openAt(t, t.TempDir())
+	_, err := h.Add(AddInput{Type: "fact", Title: "Typo target", Description: "x y z", Project: "aiprxy", Actor: claude})
+	var up *UnknownProjectError
+	if !errors.As(err, &up) || !strings.Contains(err.Error(), `did you mean "aiproxy"`) || !strings.Contains(err.Error(), "--new-project") {
+		t.Fatalf("want unknown-project error with suggestion, got %v", err)
+	}
+	if _, err := h.Add(AddInput{Type: "fact", Title: "Seeded remotely", Description: "for a project with no entries yet", Project: "kubedl", NewProject: true, Actor: claude}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := h.Add(AddInput{Type: "fact", Title: "Into an existing project", Description: "no flag needed", Project: "aiproxy", Actor: claude}); err != nil {
+		t.Fatal(err)
 	}
 }

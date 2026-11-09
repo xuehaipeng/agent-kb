@@ -355,7 +355,10 @@ func TestHubEndToEnd(t *testing.T) {
 	if _, errs, code := kbRun(t, "hermes", "", "add", "learning", "Nightly export OOMs", "-d", "Batch exceeds heap."); code == 0 || !strings.Contains(errs, "--project") {
 		t.Fatalf("outside a repo, add needs a project: %s", errs)
 	}
-	must(t, "hermes/qwen3", "add", "learning", "Nightly export OOMs", "-d", "Batch exceeds heap.", "-p", "kubedl")
+	if _, errs, code := kbRun(t, "hermes/qwen3", "", "add", "learning", "Nightly export OOMs", "-d", "Batch exceeds heap.", "-p", "kubedl"); code == 0 || !strings.Contains(errs, "--new-project") {
+		t.Fatalf("a project with no entries yet needs --new-project: %s", errs)
+	}
+	must(t, "hermes/qwen3", "add", "learning", "Nightly export OOMs", "-d", "Batch exceeds heap.", "-p", "kubedl", "--new-project")
 	must(t, "hermes", "sync")
 	t.Setenv("KB_HOME", filepath.Join(home, ".kb"))
 	os.Chdir(kubedl)
@@ -592,5 +595,80 @@ func TestImportRuleFiles(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("codex should now get %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestSeedProjectMemories(t *testing.T) {
+	base, home := hubEnv(t)
+	aiproxy := mkRemoteRepo(t, base, "aiproxy")
+	kubedl := mkRemoteRepo(t, base, "kubedl")
+	os.MkdirAll(filepath.Join(aiproxy, "docs"), 0o755)
+	os.WriteFile(filepath.Join(aiproxy, "docs", "ops.md"), []byte("# Ops\n\n## Deploy\n\nDeploys go through Argo CD with a manual sync to the prod cluster.\n"), 0o644)
+	git(t, aiproxy, "add", "-A")
+	git(t, aiproxy, "commit", "-qm", "docs")
+	must(t, "", "hub", "init")
+	os.Chdir(aiproxy)
+	must(t, "claude-code", "project") // registers the checkout
+	must(t, "claude-code", "add", "fact", "aiproxy listens on 8080", "-d", "HTTP port.", "-e", "main.go")
+	os.Chdir(kubedl)
+	must(t, "claude-code", "add", "fact", "kubedl uses volcano", "-d", "Scheduler.", "-e", "values.yaml")
+
+	// An agent seeds what it remembers about particular projects, in one call.
+	os.Chdir(base)
+	seed := `[
+  {"type":"learning","project":"aiproxy","title":"Upstream 429 storms need jittered backoff","description":"Retries without jitter amplify throttling.","resources":["pkg/**"]},
+  {"type":"rule","project":"kubedl","title":"Create the volcano queue before submitting jobs","description":"Jobs pend forever otherwise."},
+  {"type":"rule","global":true,"title":"Keep PR descriptions short","description":"User preference."},
+  {"type":"fact","project":"aiproxy","title":"aiproxy listens on 8080","description":"HTTP port."},
+  {"type":"fact","project":"aiproxy","title":"Deploys go through Argo CD with a manual sync to prod","description":"Argo CD manual sync to the prod cluster."},
+  {"type":"learning","project":"kubdl","title":"Typo project","description":"should be refused"}
+]`
+	out, errs, code := kbRun(t, "claude-code", seed, "add", "--from", "-", "-e", "from my claude-code memory")
+	if code != 0 {
+		t.Fatalf("seed: %s %s", out, errs)
+	}
+	for _, want := range []string{
+		"added      aiproxy/learnings/upstream-429-storms-need-jittered-backoff [verified]",
+		"added      kubedl/conventions/create-the-volcano-queue-before-submitting-jobs [verified]",
+		"added      global/conventions/keep-pr-descriptions-short [verified]",
+		`duplicate  "aiproxy listens on 8080": already aiproxy/facts/aiproxy-listens-on-8080`,
+		`documented "Deploys go through Argo CD with a manual sync to prod": the repo's docs already say it in aiproxy:docs/ops.md:3`,
+		`skipped    "Typo project": unknown project "kubdl" (did you mean "kubedl"?)`,
+		"seeded 3 of 6 (1 duplicate, 1 already documented, 1 skipped)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("seed output missing %q:\n%s", want, out)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(home, ".kb", "projects", "kubdl")); err == nil {
+		t.Fatal("typo created a stray project")
+	}
+	// The seeded rule reaches agents working in kubedl.
+	os.Chdir(kubedl)
+	if out := must(t, "codex", "rules"); !strings.Contains(out, "Create the volcano queue before submitting jobs") || !strings.Contains(out, "Keep PR descriptions short") {
+		t.Fatalf("seeded rules not delivered:\n%s", out)
+	}
+}
+
+func TestMemoryScanForParticularProjects(t *testing.T) {
+	base, home := hubEnv(t)
+	aiproxy := mkRemoteRepo(t, base, "aiproxy")
+	kubedl := mkRemoteRepo(t, base, "kubedl")
+	must(t, "", "hub", "init")
+	for name, dir := range map[string]string{"aiproxy": aiproxy, "kubedl": kubedl} {
+		pdir := filepath.Join(home, ".claude", "projects", "-x-"+name)
+		os.MkdirAll(filepath.Join(pdir, "memory"), 0o755)
+		os.WriteFile(filepath.Join(pdir, "t.jsonl"), []byte(`{"type":"user","cwd":"`+dir+`","message":{"role":"user","content":"hi"}}`+"\n"), 0o644)
+		os.WriteFile(filepath.Join(pdir, "memory", "MEMORY.md"), []byte("- "+name+" note that is long enough to import.\n"), 0o644)
+	}
+	cmd, _ := fakeModel(t, base, "m", `[{"type":"learning","title":"A remembered gotcha","description":"From memory."}]`)
+	out := must(t, "", "extract", "--scan", "claude-memory", "-p", "aiproxy", "--cmd", cmd)
+	if !strings.Contains(out, "-x-aiproxy/memory/MEMORY.md: added 1") || !strings.Contains(out, "-x-kubedl/memory/MEMORY.md: skipped (not in the selected projects)") {
+		t.Fatalf("filtered scan:\n%s", out)
+	}
+	// The filtered run did not mark files as done: a full scan still takes kubedl.
+	out = must(t, "", "extract", "--scan", "claude-memory", "--cmd", cmd)
+	if !strings.Contains(out, "-x-kubedl/memory/MEMORY.md: added 1") {
+		t.Fatalf("full scan after filtered one:\n%s", out)
 	}
 }

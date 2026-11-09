@@ -42,10 +42,23 @@ type FileSource struct {
 
 // ImportOptions controls an import run.
 type ImportOptions struct {
-	Command []string // override extractor command
-	DryRun  bool     // print the prompt instead of calling the model
-	Force   bool     // re-import even if the file is unchanged
-	Out     io.Writer
+	Command  []string // override extractor command
+	DryRun   bool     // print the prompt instead of calling the model
+	Force    bool     // re-import even if the file is unchanged
+	Projects []string // hub: only import what belongs to these projects
+	Out      io.Writer
+}
+
+func (o ImportOptions) wants(project string) bool {
+	if len(o.Projects) == 0 {
+		return true
+	}
+	for _, p := range o.Projects {
+		if p == project {
+			return true
+		}
+	}
+	return false
 }
 
 var kbBlockRe = regexp.MustCompile(`(?s)<!-- kb:begin.*?<!-- kb:end -->\n?`)
@@ -66,8 +79,15 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	hash := hex.EncodeToString(sum[:])
 	abs, _ := filepath.Abs(src.Path)
 	st := loadState(s, abs)
-	if !o.Force && st.Hash == hash {
+	// A project-filtered run only takes part of the file, so it neither
+	// skips on, nor records, the content hash.
+	filtered := len(o.Projects) > 0
+	if !o.Force && !filtered && st.Hash == hash {
 		res.Skipped = "unchanged since last import"
+		return res, nil
+	}
+	if filtered && src.Project != "" && src.Project != kb.GlobalProject && !o.wants(src.Project) {
+		res.Skipped = "not in the selected projects"
 		return res, nil
 	}
 	if len(content) < minImportContentLen {
@@ -78,6 +98,9 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		return res, nil
 	}
 	prompt := importPrompt(s, src, content)
+	if filtered {
+		prompt = strings.Replace(prompt, "\nFile ", fmt.Sprintf("\nOnly extract notes about these projects: %s. Ignore everything else.\n\nFile ", strings.Join(o.Projects, ", ")), 1)
+	}
 	if o.DryRun {
 		res.Prompt = prompt
 		return res, nil
@@ -125,6 +148,9 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 				project = kb.GlobalProject
 			}
 		}
+		if filtered && !o.wants(projectOr(s, project)) {
+			continue
+		}
 		typ := c.Type
 		if src.Kind == KindRules || typ == "" {
 			typ = "convention"
@@ -133,7 +159,9 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 			Type: typ, Title: c.Title, Description: c.Description, Body: strings.TrimSpace(c.Body),
 			Tags: c.Tags, Resources: c.Resources, Project: project, Actor: src.Agent,
 			Evidence: evidence, NoDocCheck: src.Kind == KindRules,
-			Sources: []okf.Source{{ID: srcID, Resource: displayPath(src.Path), Author: src.Agent.String(), LastModified: time.Now().UTC().Format(time.RFC3339)}},
+			// The default project comes from a real repository (or is global).
+			NewProject: project == src.Project,
+			Sources:    []okf.Source{{ID: srcID, Resource: displayPath(src.Path), Author: src.Agent.String(), LastModified: time.Now().UTC().Format(time.RFC3339)}},
 		}
 		if in.Description == "" {
 			in.Description = c.Title
@@ -167,6 +195,9 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		default:
 			res.Added = append(res.Added, r.Node.ID)
 		}
+	}
+	if filtered {
+		return res, nil
 	}
 	return res, saveHash(s, abs, hash)
 }

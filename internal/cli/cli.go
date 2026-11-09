@@ -44,7 +44,8 @@ Rules (always-on conventions, delivered at session start):
 
 Record and evolve:
   kb add <fact|learning|decision|convention> <title> -d <one line> [-b body|-b -] [-r glob]... [-t tag]...
-         [-e evidence] [--global [--for p1,p2]] [-p project] [--supersedes id] [--force]
+         [-e evidence] [--global [--for p1,p2]] [-p project [--new-project]] [--supersedes id] [--force]
+  kb add --from <file|-> [type] [-p project] [-e evidence]   seed many entries (JSON array or JSON lines)
   kb update <id> -m <why> [-t title] [-d line] [-b body|-b -] [-r glob]... [--tags t,..] [-e evidence]
   kb verify <id> --confirm|--dispute -e <evidence>
   kb deprecate <id> -m <reason>
@@ -76,7 +77,7 @@ Set up and maintain:
 Capture and integration:
   kb extract --transcript <file> [--source claude|codex|text] [--final] [--dry-run]
   kb extract --scan codex|claude [--days N]   (hub: routes each session to its project)
-  kb extract --scan memories|claude-memory|codex-memory|hermes-memory|antigravity-memory [--force]
+  kb extract --scan memories|claude-memory|codex-memory|hermes-memory|antigravity-memory [-p project]... [--force]
                               import what agents saved in their own memory (only changed files)
   kb hook claude              Claude Code hook entry point (reads hook JSON on stdin)
   kb mcp [--as actor]         stdio MCP server (kb_search, kb_show, kb_add, kb_verify, kb_review)
@@ -421,17 +422,29 @@ func (a *App) cmdAdd(args []string) error {
 	f.str(&in.Project, "", "target project (hub)", "p", "project")
 	f.list(&in.Projects, true, "with --global: projects it applies to", "for")
 	var global bool
+	var from string
 	f.boolean(&global, "store in the global scope shared by all projects (hub)", "global")
 	f.boolean(&in.Force, "skip duplicate check", "force")
+	f.boolean(&in.NewProject, "allow creating the --project if it does not exist yet", "new-project")
+	f.str(&from, "", "seed many entries from a JSON array or JSON lines file (- for stdin)", "from")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
 	}
-	if len(pos) < 2 {
-		return errors.New("usage: kb add <fact|learning|decision|convention> <title> -d <one line> [-b body] [-r glob]... [-e evidence] [--global]")
-	}
 	if global {
 		in.Project = kb.GlobalProject
+	}
+	if from != "" {
+		if len(pos) > 0 {
+			in.Type = pos[0] // default type for items that omit it
+		}
+		if in.Actor, err = a.actor(); err != nil {
+			return err
+		}
+		return a.seed(from, in)
+	}
+	if len(pos) < 2 {
+		return errors.New("usage: kb add <fact|learning|decision|convention> <title> -d <one line> [-b body] [-r glob]... [-e evidence] [--global]")
 	}
 	in.Type, in.Title = pos[0], strings.Join(pos[1:], " ")
 	if bodyFile != "" {
@@ -762,6 +775,8 @@ func (a *App) cmdExtract(args []string) error {
 	var thenSync, forceImport bool
 	f.boolean(&thenSync, "run 'kb sync' afterwards (hub mode)", "sync")
 	f.boolean(&forceImport, "memory scans: re-import unchanged files", "force")
+	var scanProjects []string
+	f.list(&scanProjects, true, "memory scans: only these projects (hub)", "p", "project")
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
@@ -785,7 +800,7 @@ func (a *App) cmdExtract(args []string) error {
 		if scan == "memories" {
 			which = "all"
 		}
-		report := extract.ImportAll(s, extract.MemorySources(s, which), extract.ImportOptions{Command: command, DryRun: o.DryRun, Force: forceImport, Out: a.Stderr})
+		report := extract.ImportAll(s, extract.MemorySources(s, which), extract.ImportOptions{Command: command, DryRun: o.DryRun, Force: forceImport, Projects: scanProjects, Out: a.Stderr})
 		a.out("%s\n", strings.Join(report, "\n"))
 		return nil
 	}

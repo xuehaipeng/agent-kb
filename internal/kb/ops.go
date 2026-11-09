@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -28,6 +29,7 @@ type AddInput struct {
 	Actor       Actor
 	Force       bool // skip the near-duplicate and doc-overlap checks
 	NoDocCheck  bool // imported rules: they are pushed to agents, not searched
+	NewProject  bool // allow creating Project if it does not exist yet
 }
 
 // AddResult reports what Add did.
@@ -62,7 +64,7 @@ func (e *DuplicateError) Error() string {
 }
 
 // targetProject picks the hub project an entry is written to.
-func (s *Store) targetProject(p string) (string, error) {
+func (s *Store) targetProject(p string, allowNew bool) (string, error) {
 	if !s.Hub {
 		return "", nil
 	}
@@ -75,7 +77,78 @@ func (s *Store) targetProject(p string) (string, error) {
 	case "global", "--global":
 		return GlobalProject, nil
 	}
-	return p, validProjectID(p)
+	if err := validProjectID(p); err != nil {
+		return "", err
+	}
+	// Writing into a project that does not exist yet is usually a typo (and
+	// would silently create a stray project), unless it is this repo's own
+	// project or the caller asks for a new one.
+	if _, ok := s.ProjectFiles()[p]; !ok && p != s.Project && !allowNew {
+		return "", &UnknownProjectError{Project: p, Known: s.projectIDs()}
+	}
+	return p, nil
+}
+
+// UnknownProjectError reports a write to a project that does not exist.
+type UnknownProjectError struct {
+	Project string
+	Known   []string
+}
+
+func (e *UnknownProjectError) Error() string {
+	msg := fmt.Sprintf("unknown project %q", e.Project)
+	if near := closest(e.Project, e.Known); near != "" {
+		msg += fmt.Sprintf(" (did you mean %q?)", near)
+	}
+	if len(e.Known) > 0 {
+		msg += "; known: " + strings.Join(e.Known, ", ")
+	}
+	return msg + ". Pass --new-project to create it (or run kb inside its repository)"
+}
+
+func (s *Store) projectIDs() []string {
+	var ids []string
+	for id := range s.ProjectFiles() {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// closest returns the known id within edit distance 2 (or sharing a prefix).
+func closest(p string, known []string) string {
+	best, bestD := "", 3
+	for _, k := range known {
+		d := editDistance(p, k)
+		if strings.HasPrefix(k, p) || strings.HasPrefix(p, k) {
+			d = min(d, 1)
+		}
+		if d < bestD {
+			best, bestD = k, d
+		}
+	}
+	return best
+}
+
+func editDistance(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	prev := make([]int, len(rb)+1)
+	for j := range prev {
+		prev[j] = j
+	}
+	for i := 1; i <= len(ra); i++ {
+		cur := make([]int, len(rb)+1)
+		cur[0] = i
+		for j := 1; j <= len(rb); j++ {
+			cost := 1
+			if ra[i-1] == rb[j-1] {
+				cost = 0
+			}
+			cur[j] = min(prev[j]+1, cur[j-1]+1, prev[j-1]+cost)
+		}
+		prev = cur
+	}
+	return prev[len(rb)]
 }
 
 // Add writes a new entry. With evidence it is verified by its author at
@@ -99,7 +172,7 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	if in.Description == "" {
 		return nil, errors.New("description (one line) is required")
 	}
-	project, err := s.targetProject(in.Project)
+	project, err := s.targetProject(in.Project, in.NewProject)
 	if err != nil {
 		return nil, err
 	}

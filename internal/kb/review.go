@@ -35,7 +35,7 @@ func (s *Store) ReviewSubmit(in SubmitInput) (*Node, error) {
 	if !s.InGit() {
 		return nil, errors.New("reviews need to run inside the project's git repository")
 	}
-	project, err := s.targetProject("")
+	project, err := s.targetProject("", false)
 	if err != nil {
 		return nil, err
 	}
