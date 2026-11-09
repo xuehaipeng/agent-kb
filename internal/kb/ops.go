@@ -26,7 +26,8 @@ type AddInput struct {
 	Project     string   // hub: target project ("" = current, "global" = shared)
 	Evidence    string   // how the author knows; makes the entry verified
 	Actor       Actor
-	Force       bool // skip the near-duplicate check
+	Force       bool // skip the near-duplicate and doc-overlap checks
+	NoDocCheck  bool // imported rules: they are pushed to agents, not searched
 }
 
 // AddResult reports what Add did.
@@ -151,7 +152,7 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 		}
 	}
 
-	if !in.Force {
+	if !in.Force && !in.NoDocCheck {
 		if ms := s.DocCoverage(project, in.Title+" "+in.Description); len(ms) > 0 {
 			if ms[0].Coverage >= DocBlockCoverage {
 				return nil, &DocCoveredError{Match: ms[0]}

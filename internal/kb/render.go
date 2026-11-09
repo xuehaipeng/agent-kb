@@ -271,6 +271,11 @@ func RenderStatus(r *StatusReport) string {
 	if len(prod) > 0 {
 		fmt.Fprintf(&b, "claims by producer: %s\n", strings.Join(prod, ", "))
 	}
+	fmt.Fprintf(&b, "rules delivered at session start: %d", r.Rules)
+	if len(r.PendingRules) > 0 {
+		fmt.Fprintf(&b, " (+%d proposed, awaiting confirmation: kb rules)", len(r.PendingRules))
+	}
+	b.WriteString("\n")
 	fmt.Fprintf(&b, "reviews open: %d\n", r.ReviewsOpen)
 	if len(r.ReviewsForMe) > 0 {
 		fmt.Fprintf(&b, "waiting for your review: %s\n", strings.Join(r.ReviewsForMe, ", "))

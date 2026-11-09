@@ -22,6 +22,15 @@ knowledge base they all read and write through a small CLI, `kb`:
 - **Staleness from git.** If the files an entry depends on change after it was
   last confirmed, it's flagged `stale` automatically, even when you search
   from another project.
+- **Rules reach every agent.** Conventions are always-on rules: Claude Code
+  gets them at session start, Codex and Antigravity in their user-level
+  instructions, MCP clients in the server instructions, and any agent with
+  `kb rules`. Rules you wrote for one agent (`~/.claude/CLAUDE.md`,
+  `.cursor/rules/`, ...) are shared with `kb rules import`.
+- **Agents' memories are shared.** What each agent saved in its private
+  memory (Claude Code auto memory, Codex memories, Hermes `MEMORY.md`,
+  Antigravity knowledge items) is imported into the shared base,
+  `kb extract --scan memories`, automatically for Claude Code.
 - **Docs stay the source of truth.** `kb search` also returns matching
   sections of the repo's own docs (`doc docs/design.md:42 (§ Retry policy)`),
   read live from the checkout. `kb add` refuses entries that just restate a
@@ -122,6 +131,30 @@ kb verify stream-timeout --confirm -e "still true at HEAD: go test ./internal/ga
 kb deprecate stream-timeout -m "gateway replaced by envoy"
 ```
 
+### Rules and agents' memories
+
+```bash
+kb rules                                        # rules for this project + global; proposed ones awaiting confirmation
+kb add rule "Use pnpm, never npm" -d "lockfile is pnpm-lock.yaml" -e "user said so"
+kb add rule "Write commit messages in English" -d "team convention" -e "user said so" --global
+kb rules import                                 # ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md (global)
+                                                # + CLAUDE.md, GEMINI.md, .claude/rules, .cursor/rules, .agents/rules (this project)
+kb extract --scan memories                      # Claude Code, Codex, Hermes and Antigravity memory files (changed ones only)
+```
+
+| Agent | How rules arrive |
+|---|---|
+| Claude Code | `SessionStart` hook prints the rules for the session's project + global |
+| Codex, Antigravity | global rules inside the managed block of `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md` (refreshed on every rule change); project rules via `kb rules`, as the pointer says |
+| MCP clients (Cursor, Hermes) | the server's `instructions` |
+| Hermes | the skill runs `kb rules -p <project>` |
+
+Only evidence-backed rules are delivered (`-e "user said so"`, an imported
+rule file, a memory the agent saved). A rule an agent inferred on its own waits
+as *proposed* until confirmed, so one agent's guess never steers all of them.
+`AGENTS.md` itself is not imported because Codex, Cursor and Antigravity read
+it natively.
+
 ### Trust states
 
 | State | Meaning |
@@ -181,9 +214,9 @@ so the history of a decision stays readable; everything else evolves with
 
 | Agent | Read path | Write path |
 |---|---|---|
-| Claude Code | user-level `CLAUDE.md` imports the pointer; `kb` skill | `PreCompact`/`SessionEnd` hooks run `kb extract` in the background, then `kb sync`; `SessionStart` prints reviews, disputes and stale entries, and pulls the hub |
-| Codex | `~/.codex/AGENTS.md` pointer; `kb` skill | `kb add` per the pointer; nightly `kb extract --scan codex` routes each session in `~/.codex/sessions` to its project |
-| Hermes (remote) | `kb` skill + `kb hub clone` | `kb add -p <project>`; `kb sync` on cron |
+| Claude Code | user-level `CLAUDE.md` imports the pointer; `kb` skill; rules at `SessionStart` | `PreCompact`/`SessionEnd` hooks run `kb extract` in the background, then `kb sync`; `SessionEnd` also imports Claude's own memory files; `SessionStart` prints rules, reviews, disputes and stale entries, and pulls the hub |
+| Codex | `~/.codex/AGENTS.md` pointer + global rules; `kb` skill | `kb add` per the pointer; nightly `kb extract --scan codex` (sessions, routed to their projects) and `kb extract --scan memories` |
+| Hermes (remote) | `kb` skill + `kb hub clone` | `kb add -p <project>`; `kb extract --scan hermes-memory`; `kb sync` on cron |
 | Cursor, Antigravity, GrokBot | pointer | `kb add` optional |
 
 `kb extract` condenses the new part of a transcript and pipes it to a cheap

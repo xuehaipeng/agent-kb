@@ -37,6 +37,11 @@ Retrieve (in a hub: current repo's project + global by default):
   kb show <id>... [--raw]
   kb status [--brief] [-p project] [--all] [--json]
 
+Rules (always-on conventions, delivered at session start):
+  kb rules [-p project] [--all]      the rules that apply here, plus proposed ones awaiting confirmation
+  kb add rule "<instruction>" -d <why> -e "user said so" [--global]
+  kb rules import [--user|--repo] [files...]   share rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md, ...)
+
 Record and evolve:
   kb add <fact|learning|decision|convention> <title> -d <one line> [-b body|-b -] [-r glob]... [-t tag]...
          [-e evidence] [--global [--for p1,p2]] [-p project] [--supersedes id] [--force]
@@ -71,6 +76,8 @@ Set up and maintain:
 Capture and integration:
   kb extract --transcript <file> [--source claude|codex|text] [--final] [--dry-run]
   kb extract --scan codex|claude [--days N]   (hub: routes each session to its project)
+  kb extract --scan memories|claude-memory|codex-memory|hermes-memory|antigravity-memory [--force]
+                              import what agents saved in their own memory (only changed files)
   kb hook claude              Claude Code hook entry point (reads hook JSON on stdin)
   kb mcp [--as actor]         stdio MCP server (kb_search, kb_show, kb_add, kb_verify, kb_review)
 
@@ -128,6 +135,8 @@ done:
 		err = a.cmdDeprecate(rest)
 	case "update", "edit":
 		err = a.cmdUpdate(rest)
+	case "rules", "rule":
+		err = a.cmdRules(rest)
 	case "project", "projects":
 		err = a.cmdProject(rest)
 	case "hub":
@@ -750,8 +759,9 @@ func (a *App) cmdExtract(args []string) error {
 	f.str(&cmdStr, "", "override extractor command (space separated)", "cmd")
 	f.boolean(&o.Final, "advance the offset even if too short", "final")
 	f.boolean(&o.DryRun, "print the prompt, do not call a model", "dry-run")
-	var thenSync bool
+	var thenSync, forceImport bool
 	f.boolean(&thenSync, "run 'kb sync' afterwards (hub mode)", "sync")
+	f.boolean(&forceImport, "memory scans: re-import unchanged files", "force")
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
@@ -769,6 +779,15 @@ func (a *App) cmdExtract(args []string) error {
 	var command []string
 	if cmdStr != "" {
 		command = strings.Fields(cmdStr)
+	}
+	if scan == "memories" || strings.HasSuffix(scan, "-memory") {
+		which := strings.TrimSuffix(scan, "-memory")
+		if scan == "memories" {
+			which = "all"
+		}
+		report := extract.ImportAll(s, extract.MemorySources(s, which), extract.ImportOptions{Command: command, DryRun: o.DryRun, Force: forceImport, Out: a.Stderr})
+		a.out("%s\n", strings.Join(report, "\n"))
+		return nil
 	}
 	if scan != "" {
 		report, err := extract.Scan(s, extract.ScanOptions{Source: scan, Days: days, Command: command, DryRun: o.DryRun, Out: a.Stderr})

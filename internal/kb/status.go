@@ -24,6 +24,8 @@ type StatusReport struct {
 	ReviewsForMe     []string       `json:"reviews_for_me"`
 	ReviewsChanges   []string       `json:"reviews_changes_requested_mine"`
 	ParseErrors      int            `json:"parse_errors"`
+	Rules            int            `json:"rules_delivered"`
+	PendingRules     []string       `json:"rules_pending"`
 	Uncommitted      int            `json:"uncommitted_files"`
 	Unpushed         int            `json:"unpushed_commits"`
 	Upstream         string         `json:"upstream,omitempty"`
@@ -88,6 +90,12 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 			}
 		}
 	}
+	if rs, err := s.Rules(o.Projects, o.AllProjects); err == nil {
+		r.Rules = len(rs.Scoped) + len(rs.Global) + rs.Omitted
+		for _, n := range rs.Pending {
+			r.PendingRules = append(r.PendingRules, n.ID)
+		}
+	}
 	open, _ := s.Reviews(ReviewFilter{Projects: o.Projects, AllProjects: o.AllProjects})
 	r.ReviewsOpen = len(open)
 	if !me.Zero() {
@@ -120,6 +128,9 @@ func (r *StatusReport) Brief() string {
 	}
 	if r.Stale > 0 {
 		lines = append(lines, fmt.Sprintf("kb: %d stale entr(ies) in %s: %s (refresh them when you touch that code)", r.Stale, r.Scope, list3(r.StaleIDs)))
+	}
+	if n := len(r.PendingRules); n > 0 {
+		lines = append(lines, fmt.Sprintf("kb: %d proposed rule(s) not applied until confirmed: %s (ask the user; kb verify <id> --confirm)", n, list3(r.PendingRules)))
 	}
 	return strings.Join(lines, "\n")
 }

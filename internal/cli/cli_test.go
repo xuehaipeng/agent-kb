@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -71,7 +72,7 @@ func TestCLIEndToEnd(t *testing.T) {
 	}
 	// Re-running install is idempotent.
 	out := must(t, "", "install", "claude", "codex")
-	if strings.Count(out, "wrote") != 0 {
+	if regexp.MustCompile(`(?m)^wrote `).MatchString(out) {
 		t.Errorf("second install rewrote files:\n%s", out)
 	}
 	git(t, dir, "add", "-A")
@@ -432,5 +433,164 @@ func TestExtractSkipsDocumentedClaims(t *testing.T) {
 	out = must(t, "claude-code", "extract", "--transcript", fresh, "--dry-run")
 	if !strings.Contains(out, "Already documented in the repository (do not restate):") || !strings.Contains(out, "- docs/ops.md § Backups") {
 		t.Fatalf("prompt lacks doc headings:\n%s", out)
+	}
+}
+
+// hubEnv isolates HOME, the hub and agent config dirs in a temp directory.
+func hubEnv(t *testing.T) (base, home string) {
+	t.Helper()
+	base = t.TempDir()
+	home = filepath.Join(base, "home")
+	os.MkdirAll(home, 0o755)
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	t.Setenv("CODEX_HOME", "")
+	t.Setenv("KB_HOME", filepath.Join(home, ".kb"))
+	t.Setenv("KB_ROOT", "")
+	t.Setenv("GIT_AUTHOR_NAME", "t")
+	t.Setenv("GIT_AUTHOR_EMAIL", "t@t")
+	t.Setenv("GIT_COMMITTER_NAME", "t")
+	t.Setenv("GIT_COMMITTER_EMAIL", "t@t")
+	wd, _ := os.Getwd()
+	t.Cleanup(func() { os.Chdir(wd) })
+	os.Chdir(base)
+	return base, home
+}
+
+func mkRemoteRepo(t *testing.T, base, name string) string {
+	t.Helper()
+	dir := filepath.Join(base, "GolandProjects", name)
+	os.MkdirAll(filepath.Join(dir, "pkg"), 0o755)
+	os.WriteFile(filepath.Join(dir, "pkg", "x.go"), []byte("package pkg\n"), 0o644)
+	git(t, dir, "init", "-q", "-b", "main")
+	git(t, dir, "remote", "add", "origin", "git@github.com:AtlasCloudTeam/"+name+".git")
+	git(t, dir, "add", "-A")
+	git(t, dir, "commit", "-qm", "init")
+	return dir
+}
+
+// fakeModel writes a script that saves the prompt and prints a fixed reply.
+func fakeModel(t *testing.T, dir, name, reply string) (cmd, promptFile string) {
+	t.Helper()
+	promptFile = filepath.Join(dir, name+".prompt")
+	replyFile := filepath.Join(dir, name+".reply")
+	os.WriteFile(replyFile, []byte(reply), 0o644)
+	script := filepath.Join(dir, name+".sh")
+	os.WriteFile(script, []byte("#!/bin/sh\ncat > '"+promptFile+"'\ncat '"+replyFile+"'\n"), 0o755)
+	return script, promptFile
+}
+
+func TestRulesAreDeliveredEverywhere(t *testing.T) {
+	base, home := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	must(t, "", "install", "claude", "codex")
+	// A block written by some other hub must never be touched.
+	other := filepath.Join(home, ".gemini", "GEMINI.md")
+	os.MkdirAll(filepath.Dir(other), 0o755)
+	foreign := "<!-- kb:begin (managed by 'kb install'; re-run it to update, edits here are overwritten) -->\nold\n<!-- kb:source /somewhere/else -->\n<!-- kb:end -->\n"
+	os.WriteFile(other, []byte(foreign), 0o644)
+
+	os.Chdir(repo)
+	out := must(t, "claude-code", "add", "rule", "Use pnpm, never npm", "-d", "lockfile is pnpm-lock.yaml", "-e", "user said so")
+	if !strings.Contains(out, "aiproxy/conventions/use-pnpm-never-npm [verified]") {
+		t.Fatal(out)
+	}
+	must(t, "claude-code", "add", "rule", "Write commit messages in English", "-d", "team convention", "-e", "user said so", "--global")
+	must(t, "claude-code", "add", "rule", "Prefer table-driven tests", "-d", "inferred from the codebase")
+
+	out = must(t, "codex", "rules")
+	if !strings.Contains(out, "Use pnpm, never npm") || !strings.Contains(out, "Write commit messages in English") || !strings.Contains(out, "Proposed rules awaiting confirmation") {
+		t.Fatalf("kb rules:\n%s", out)
+	}
+	// Claude Code: SessionStart pushes the rules into the session.
+	hook := `{"session_id":"s","hook_event_name":"SessionStart","cwd":"` + repo + `"}`
+	out, _, _ = kbRun(t, "claude-code", hook, "hook", "claude")
+	if !strings.Contains(out, "Rules from kb") || !strings.Contains(out, "Use pnpm, never npm") || strings.Contains(out, "- Prefer table-driven tests") || !strings.Contains(out, "proposed rule(s) not applied") {
+		t.Fatalf("SessionStart:\n%s", out)
+	}
+	// Codex: global rules are kept current inside ~/.codex/AGENTS.md.
+	data, _ := os.ReadFile(filepath.Join(home, ".codex", "AGENTS.md"))
+	if !strings.Contains(string(data), "Write commit messages in English") || strings.Contains(string(data), "pnpm") {
+		t.Fatalf("~/.codex/AGENTS.md:\n%s", data)
+	}
+	if got, _ := os.ReadFile(other); string(got) != foreign {
+		t.Fatalf("foreign block was modified:\n%s", got)
+	}
+}
+
+func TestImportAgentMemories(t *testing.T) {
+	base, home := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	// Claude Code auto memory for the aiproxy project, located via a transcript's cwd.
+	pdir := filepath.Join(home, ".claude", "projects", "-x-aiproxy")
+	os.MkdirAll(filepath.Join(pdir, "memory"), 0o755)
+	os.WriteFile(filepath.Join(pdir, "t.jsonl"), []byte(`{"type":"user","cwd":"`+repo+`","sessionId":"s1","message":{"role":"user","content":"hi"}}`+"\n"), 0o644)
+	os.WriteFile(filepath.Join(pdir, "memory", "MEMORY.md"), []byte("- The staging cluster rejects images without a digest pin.\n- User prefers short PR descriptions.\n"), 0o644)
+	// Codex memories are cross-project.
+	os.MkdirAll(filepath.Join(home, ".codex", "memories"), 0o755)
+	os.WriteFile(filepath.Join(home, ".codex", "memories", "MEMORY.md"), []byte("- The user wants Go errors wrapped with %w everywhere.\n"), 0o644)
+
+	claudeCmd, claudePrompt := fakeModel(t, base, "claude", `[{"type":"learning","title":"Staging rejects images without a digest pin","description":"Deploys to staging fail unless the image is pinned by digest."},{"type":"convention","project":"global","title":"Keep PR descriptions short","description":"User preference."}]`)
+	out := must(t, "", "extract", "--scan", "claude-memory", "--cmd", claudeCmd)
+	if !strings.Contains(out, "added 2") {
+		t.Fatalf("claude memory import:\n%s", out)
+	}
+	prompt, _ := os.ReadFile(claudePrompt)
+	if !strings.Contains(string(prompt), "saved in its private memory") || !strings.Contains(string(prompt), "digest pin") {
+		t.Fatalf("prompt:\n%s", prompt)
+	}
+	os.Chdir(repo)
+	show := must(t, "codex", "show", "aiproxy/learnings/staging-rejects-images-without-a-digest-pin")
+	if !strings.Contains(show, "trust: verified") || !strings.Contains(show, "generated: claude-code") || !strings.Contains(show, "saved in claude-code's memory (~/.claude/projects/-x-aiproxy/memory/MEMORY.md)") {
+		t.Fatalf("imported entry:\n%s", show)
+	}
+	if out := must(t, "codex", "rules"); !strings.Contains(out, "Keep PR descriptions short") {
+		t.Fatalf("memory preference should be a delivered global rule:\n%s", out)
+	}
+	// Unchanged files are not re-read.
+	if out := must(t, "", "extract", "--scan", "claude-memory", "--cmd", claudeCmd); !strings.Contains(out, "unchanged") {
+		t.Fatalf("second scan:\n%s", out)
+	}
+	codexCmd, _ := fakeModel(t, base, "codex", `[{"type":"convention","title":"Wrap Go errors with %w","description":"User wants it in every repo."}]`)
+	out = must(t, "", "extract", "--scan", "codex-memory", "--cmd", codexCmd)
+	if !strings.Contains(out, "added 1, duplicates 0, already documented 0 [global/conventions/wrap-go-errors-with-w]") {
+		t.Fatalf("codex memory import:\n%s", out)
+	}
+}
+
+func TestImportRuleFiles(t *testing.T) {
+	base, home := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	must(t, "", "install", "claude")
+	// The user's own Claude rules, around kb's managed block.
+	claudeMD := filepath.Join(home, ".claude", "CLAUDE.md")
+	data, _ := os.ReadFile(claudeMD)
+	os.WriteFile(claudeMD, []byte("# My rules\n- Answer in English.\n- Never run git push --force.\n\n"+string(data)), 0o644)
+	os.MkdirAll(filepath.Join(repo, ".cursor", "rules"), 0o755)
+	os.WriteFile(filepath.Join(repo, ".cursor", "rules", "go.mdc"), []byte("---\nalwaysApply: true\n---\nUse testify/require in tests.\n"), 0o644)
+
+	userCmd, userPrompt := fakeModel(t, base, "user", `[{"title":"Never run git push --force","description":"user rule"},{"title":"Answer in English","description":"user rule"}]`)
+	os.Chdir(repo)
+	out := must(t, "", "rules", "import", "--user", "--cmd", userCmd)
+	if !strings.Contains(out, "~/.claude/CLAUDE.md: added 2") {
+		t.Fatalf("user rules import:\n%s", out)
+	}
+	prompt, _ := os.ReadFile(userPrompt)
+	if strings.Contains(string(prompt), "Shared knowledge (kb)") || !strings.Contains(string(prompt), "Never run git push --force") {
+		t.Fatalf("kb's own block must be stripped from the prompt:\n%s", prompt)
+	}
+	repoCmd, _ := fakeModel(t, base, "repo", `[{"title":"Use testify/require in tests","description":"from Cursor rules"}]`)
+	out = must(t, "", "rules", "import", "--repo", "--cmd", repoCmd)
+	if !strings.Contains(out, "go.mdc: added 1, duplicates 0, already documented 0 [aiproxy/conventions/use-testify-require-in-tests]") {
+		t.Fatalf("repo rules import:\n%s", out)
+	}
+	out = must(t, "codex", "rules")
+	for _, want := range []string{"Use testify/require in tests", "Never run git push --force", "Answer in English"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("codex should now get %q:\n%s", want, out)
+		}
 	}
 }

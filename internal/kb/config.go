@@ -19,6 +19,9 @@ type TypeConfig struct {
 	TTLDays     int    `yaml:"ttl_days,omitempty"`
 	Immutable   bool   `yaml:"immutable,omitempty"`
 	Description string `yaml:"description,omitempty"`
+	// AlwaysOn entries are rules: delivered to every agent at session start
+	// instead of waiting to be searched. Defaults to true for conventions.
+	AlwaysOn *bool `yaml:"always_on,omitempty"`
 }
 
 // RetiredTerm is a phrase that must no longer appear in the bundle.
@@ -83,7 +86,8 @@ types:
     description: Architectural decisions (ADR); superseded, never edited.
   convention:
     dir: conventions
-    description: Coding and workflow conventions.
+    always_on: true
+    description: Rules, conventions and preferences every agent follows (delivered at session start).
   review:
     dir: reviews
     ttl_days: 14
@@ -211,6 +215,13 @@ func (c *Config) TypeKey(t string) (string, bool) {
 	if _, ok := c.Types[k]; ok {
 		return k, true
 	}
+	// "rule" and "preference" are what users call always-on conventions.
+	switch k {
+	case "rule", "rules", "preference", "preferences":
+		if _, ok := c.Types["convention"]; ok {
+			return "convention", true
+		}
+	}
 	for name, tc := range c.Types {
 		if tc.Dir == k {
 			return name, true
@@ -265,4 +276,16 @@ func HubConfigYAML() string {
 	s := strings.Replace(DefaultConfigYAML, "version: 1\n", "version: 1\nmode: hub\n\n# Commit every kb write to this hub's git history; 'kb sync' pushes it.\nhub:\n  autocommit: true\n", 1)
 	// In a hub, each project's code root is the repo kb runs in.
 	return strings.Replace(s, "# Git work tree whose files 'resources:' globs refer to (relative to this\n# directory). Used for path-aware search and code-change staleness.\ncode_root: ..\n\n", "", 1)
+}
+
+// AlwaysOn reports whether entries of a type are delivered as rules.
+func (c *Config) AlwaysOn(typeKey string) bool {
+	tc, ok := c.Types[typeKey]
+	if !ok {
+		return false
+	}
+	if tc.AlwaysOn != nil {
+		return *tc.AlwaysOn
+	}
+	return typeKey == "convention"
 }

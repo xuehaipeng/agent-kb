@@ -45,6 +45,12 @@ func (a *App) cmdHook(args []string) int {
 		if err != nil {
 			me = kb.Actor{Producer: "claude-code"}
 		}
+		// Rules are pushed into the session; everything else is pulled.
+		if rs, err := s.Rules(nil, false); err == nil {
+			if out := s.RenderRules(rs, false); out != "" {
+				fmt.Fprint(a.Stdout, out)
+			}
+		}
 		r, err := s.Status(me)
 		if err == nil {
 			if b := r.Brief(); b != "" {
@@ -63,6 +69,12 @@ func (a *App) cmdHook(args []string) int {
 		}
 		if err := a.spawnExtract(s, in); err != nil {
 			logLine(s, "hook: "+err.Error())
+		}
+		// Share what Claude saved in its own memory (only changed files are read).
+		if in.HookEventName == "SessionEnd" {
+			if err := a.spawn(s, in, []string{"--root", s.Dir, "extract", "--scan", "claude-memory"}, "memory"); err != nil {
+				logLine(s, "hook: "+err.Error())
+			}
 		}
 	}
 	return 0

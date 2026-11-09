@@ -85,3 +85,27 @@ func TestMCPSession(t *testing.T) {
 		t.Fatalf("parse error: %v", replies[6])
 	}
 }
+
+func TestMCPInstructionsCarryRules(t *testing.T) {
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "knowledge")
+	os.MkdirAll(bundle, 0o755)
+	os.WriteFile(filepath.Join(bundle, kb.ConfigFile), []byte(kb.DefaultConfigYAML), 0o644)
+	s, _ := kb.Open(bundle)
+	if _, err := s.Add(kb.AddInput{Type: "rule", Title: "Use pnpm, never npm", Description: "lockfile", Evidence: "user said so", Actor: kb.Actor{Producer: "claude-code"}}); err != nil {
+		t.Fatal(err)
+	}
+	pr, pw, _ := os.Pipe()
+	go func() {
+		(&Server{Store: s}).Serve(strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"cursor"}}}`+"\n"), pw)
+		pw.Close()
+	}()
+	var m map[string]any
+	if err := json.NewDecoder(pr).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	instr := m["result"].(map[string]any)["instructions"].(string)
+	if !strings.Contains(instr, "Use pnpm, never npm") {
+		t.Fatalf("instructions: %s", instr)
+	}
+}

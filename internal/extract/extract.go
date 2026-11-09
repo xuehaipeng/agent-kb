@@ -213,6 +213,7 @@ func Condense(msgs []Message, perMsg, maxChars int) string {
 
 // Claim is one proposal returned by the model.
 type Claim struct {
+	Project     string   `json:"project,omitempty"`
 	Type        string   `json:"type"`
 	Title       string   `json:"title"`
 	Description string   `json:"description"`
@@ -294,7 +295,8 @@ type Result struct {
 
 type state struct {
 	Path    string `json:"path"`
-	Offset  int64  `json:"offset"`
+	Offset  int64  `json:"offset,omitempty"` // transcripts: bytes consumed
+	Hash    string `json:"hash,omitempty"`   // memory/rule files: content imported
 	Updated string `json:"updated"`
 }
 

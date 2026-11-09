@@ -335,8 +335,50 @@ func geminiDir() string {
 	return filepath.Join(home, ".gemini")
 }
 
-// RefreshPointer rewrites POINTER.md and every managed pointer block that
-// already exists (repo AGENTS.md, user-level AGENTS.md / GEMINI.md).
+// blockContent is what goes inside a managed block: the pointer, the rules
+// (for files that cannot run commands, like ~/.codex/AGENTS.md), and a hub
+// marker so refreshes only touch blocks written for this knowledge base.
+func blockContent(s *kb.Store, withRules bool) string {
+	var b strings.Builder
+	b.WriteString(strings.TrimRight(Pointer(), "\n"))
+	b.WriteString("\n")
+	if withRules {
+		if r := s.GlobalRulesText(); r != "" {
+			b.WriteString("\n")
+			b.WriteString(r)
+		}
+	}
+	// Only user-level files (hub mode) need to know which hub wrote them; a
+	// committed repo file must not carry a machine-specific path.
+	if s.Hub {
+		b.WriteString(hubMarker(s))
+	}
+	return b.String()
+}
+
+func hubMarker(s *kb.Store) string { return "<!-- kb:source " + s.Dir + " -->\n" }
+
+// ownsBlock reports whether an existing managed block was written for this
+// store (or is a legacy unmarked block and this store is the default hub).
+func ownsBlock(s *kb.Store, data string) bool {
+	i := strings.Index(data, mdBegin)
+	if i < 0 {
+		return false
+	}
+	block := data[i:]
+	if j := strings.Index(block, mdEnd); j >= 0 {
+		block = block[:j]
+	}
+	if strings.Contains(block, "<!-- kb:source ") {
+		return strings.Contains(block, hubMarker(s))
+	}
+	home, err := os.UserHomeDir()
+	return err == nil && s.Hub && kb.RealPath(filepath.Join(home, ".kb")) == s.Dir
+}
+
+// RefreshPointer rewrites POINTER.md and every managed block this store
+// owns: user-level AGENTS.md / GEMINI.md (hub mode) or the repo's AGENTS.md
+// (repo mode), including the current rules.
 func RefreshPointer(s *kb.Store) (*Result, error) {
 	res := &Result{}
 	p := filepath.Join(s.Dir, "POINTER.md")
@@ -345,18 +387,25 @@ func RefreshPointer(s *kb.Store) (*Result, error) {
 		return nil, err
 	}
 	res.changed(p, did)
-	candidates := []string{filepath.Join(codexDir(), "AGENTS.md"), filepath.Join(geminiDir(), "GEMINI.md")}
-	if !s.Hub && repoRoot(s) != "" {
-		candidates = append(candidates, filepath.Join(repoRoot(s), "AGENTS.md"))
+	var candidates []string
+	if s.Hub {
+		candidates = []string{filepath.Join(codexDir(), "AGENTS.md"), filepath.Join(geminiDir(), "GEMINI.md")}
+	} else if repoRoot(s) != "" {
+		candidates = []string{filepath.Join(repoRoot(s), "AGENTS.md")}
 	}
 	for _, f := range candidates {
-		if data, err := os.ReadFile(f); err == nil && strings.Contains(string(data), mdBegin) {
-			did, err := upsertBlock(f, Pointer(), mdBegin, mdEnd)
-			if err != nil {
-				return nil, err
-			}
-			res.changed(f, did)
+		data, err := os.ReadFile(f)
+		if err != nil || !strings.Contains(string(data), mdBegin) {
+			continue
 		}
+		if s.Hub && !ownsBlock(s, string(data)) {
+			continue
+		}
+		did, err := upsertBlock(f, blockContent(s, true), mdBegin, mdEnd)
+		if err != nil {
+			return nil, err
+		}
+		res.changed(f, did)
 	}
 	return res, nil
 }
@@ -412,7 +461,7 @@ func Claude(s *kb.Store, global bool) (*Result, error) {
 		scope = "this repository"
 	}
 	res.Notes = append(res.Notes,
-		"Claude Code now loads the kb pointer in "+scope+". Hooks: SessionStart prints reviews/disputes/stale entries; PreCompact and SessionEnd run 'kb extract' in the background (needs the 'claude' CLI; see extract.commands in kb.yaml).",
+		"Claude Code now loads the kb pointer in "+scope+". Hooks: SessionStart delivers the rules for the session's project plus reviews/disputes/stale entries; PreCompact and SessionEnd run 'kb extract' in the background, and SessionEnd also imports Claude's own memory files (needs the 'claude' CLI; see extract.commands in kb.yaml).",
 		"Optional MCP instead of the CLI: claude mcp add kb -- kb mcp --as claude-code")
 	return res, nil
 }
@@ -478,9 +527,9 @@ func mergeClaudeSettings(path string) (bool, error) {
 	return kb.WriteFileIfChanged(path, append(out, '\n'))
 }
 
-// pointerBlock writes the pointer into an AGENTS.md-style file.
-func pointerBlock(path string, res *Result) error {
-	did, err := upsertBlock(path, Pointer(), mdBegin, mdEnd)
+// pointerBlock writes the pointer (and the rules) into an AGENTS.md-style file.
+func pointerBlock(s *kb.Store, path string, res *Result) error {
+	did, err := upsertBlock(path, blockContent(s, true), mdBegin, mdEnd)
 	if err != nil {
 		return err
 	}
@@ -497,7 +546,7 @@ func Codex(s *kb.Store, global bool) (*Result, error) {
 		agents = filepath.Join(repoRoot(s), "AGENTS.md")
 		skill = filepath.Join(repoRoot(s), ".codex", "skills", "kb", "SKILL.md")
 	}
-	if err := pointerBlock(agents, res); err != nil {
+	if err := pointerBlock(s, agents, res); err != nil {
 		return nil, err
 	}
 	did, err := kb.WriteFileIfChanged(skill, []byte(Skill()))
@@ -512,7 +561,9 @@ func Codex(s *kb.Store, global bool) (*Result, error) {
 	res.Notes = append(res.Notes,
 		"Attribute Codex writes: add to ~/.codex/config.toml\n    [shell_environment_policy]\n    set = { KB_ACTOR = \"codex\" }",
 		"Optional MCP instead of the CLI, in ~/.codex/config.toml:\n    [mcp_servers.kb]\n    command = \"kb\"\n    args = [\"mcp\", \"--as\", \"codex\"]",
-		"Capture: Codex has no session hooks, so schedule the importer (it routes each session to its project), e.g. crontab:\n    17 2 * * * cd "+scanDir+" && kb extract --scan codex >> "+s.LocalPath("extract.log")+" 2>&1",
+		"Capture: Codex has no session hooks, so schedule the importers (sessions are routed to their projects; memory files are read only when they change), e.g. crontab:\n    17 2 * * * cd "+scanDir+" && kb extract --scan codex && kb extract --scan memories >> "+s.LocalPath("extract.log")+" 2>&1",
+		"Codex gets global rules inside ~/.codex/AGENTS.md (refreshed when rules change) and project rules by running 'kb rules', as the pointer tells it.",
+		"Share rules you wrote for one agent with all of them: kb rules import",
 		"Check that your Codex version reads skills from "+filepath.Dir(filepath.Dir(skill))+".")
 	return res, nil
 }
@@ -526,7 +577,7 @@ func Cursor(s *kb.Store, global bool) (*Result, error) {
 			"Set KB_ACTOR for Cursor's terminal (e.g. KB_ACTOR=cursor/<model>).")
 		return res, nil
 	}
-	if err := pointerBlock(filepath.Join(repoRoot(s), "AGENTS.md"), res); err != nil {
+	if err := pointerBlock(s, filepath.Join(repoRoot(s), "AGENTS.md"), res); err != nil {
 		return nil, err
 	}
 	res.Notes = append(res.Notes, "Cursor reads AGENTS.md natively; set KB_ACTOR=cursor/<model> in its terminal environment.")
@@ -540,7 +591,7 @@ func Antigravity(s *kb.Store, global bool) (*Result, error) {
 	if global {
 		target = filepath.Join(geminiDir(), "GEMINI.md")
 	}
-	if err := pointerBlock(target, res); err != nil {
+	if err := pointerBlock(s, target, res); err != nil {
 		return nil, err
 	}
 	res.Notes = append(res.Notes, "Set KB_ACTOR=antigravity/<model> in Antigravity's terminal environment.")
@@ -563,7 +614,8 @@ func Hermes(s *kb.Store, skillsDir string) (*Result, error) {
 	res.Notes = append(res.Notes,
 		"On the Hermes host: install kb, run 'kb hub clone <your hub remote>', and export KB_ACTOR=hermes/<model> in Hermes' environment.",
 		"Keep it in sync with cron:\n    */15 * * * * KB_ACTOR=hermes kb sync >> ~/.kb/.kb/sync.log 2>&1",
-		"Add one line to ~/.hermes/memories/MEMORY.md: 'Use the kb skill (kb search --all / kb show / kb add -p <project>) for project questions.'",
+		"Add one line to ~/.hermes/memories/MEMORY.md: 'Use the kb skill (kb rules -p <project>, kb search --all, kb add -p <project>) for project work.'",
+		"Share Hermes' own memory with the other agents nightly: 15 3 * * * KB_ACTOR=hermes kb extract --scan hermes-memory && kb sync",
 		"Optional MCP in Hermes config: mcp_servers: {kb: {command: kb, args: [mcp, --as, hermes]}}")
 	return res, nil
 }

@@ -188,7 +188,59 @@ working, cross-repo facts, environment quirks and undocumented decisions.
 Coverage is lexical, so a heavy paraphrase can slip under the threshold; the
 guidance covers that case.
 
-### 2.10 Reviews
+### 2.10 Agents' memories, rules and conventions *(new in rev 2)*
+
+Knowledge reaches the base in three ways:
+1. **Recorded deliberately:** `kb add`.
+2. **Extracted from transcripts:** `kb extract` on transcripts.
+3. **Saved by an agent in its private memory, or written by the user for one
+   agent:** Claude Code auto memory, Codex memories, Hermes
+   `MEMORY.md`/`USER.md` and Antigravity knowledge items; or
+   `~/.claude/CLAUDE.md`, `~/.codex/AGENTS.md`, `.cursor/rules/`. These sources
+   are already distilled but stay invisible to the other agents.
+
+Rev 2 shares all three.
+
+- **Rules are pushed, not pulled.** A rule that has to be searched for is not
+  followed, so always-on types (`convention`, alias `rule`; `always_on` in
+  `kb.yaml`) are delivered:
+  - Claude Code: the `SessionStart` hook prints the rules for the session's
+    project plus global.
+  - Codex and Antigravity: global rules live inside the managed block of
+    `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md`, refreshed on every rule
+    change through a change hook. Project rules come from `kb rules`.
+  - MCP clients: the server's `instructions`.
+
+  Output is capped at 40 rules, one line each.
+- **Only evidence-backed rules are delivered.** A rule recorded with evidence
+  (the user said so, an imported rule file, a saved memory) is applied. One an
+  agent inferred on its own is listed as *proposed* in `kb rules`, `kb status`
+  and the session brief until confirmed. This is the one place stricter than
+  the general "one agent with evidence is enough" rule, because a bad rule
+  steers every session of every agent (Doc A's finding that LLM-written
+  context files lower success).
+- **Memory import:** `kb extract --scan memories` (or
+  `claude-memory|codex-memory|hermes-memory|antigravity-memory`).
+  - It reads a file only when its content hash changed.
+  - Claude Code's per-project memory is mapped to its project through a
+    transcript's `cwd` or a registered checkout. Cross-project memories go to
+    `global`, and the model may route single entries to a known project.
+  - Entries are recorded as verified by the source agent, with the memory file
+    as evidence, and pass the duplicate and doc-overlap checks.
+  - Claude Code's memory is imported automatically at `SessionEnd`.
+- **Rule-file import:** `kb rules import` splits rule files written for one
+  agent into atomic, agent-neutral rules.
+  - User-level files become global rules; a repo's `CLAUDE.md`, `GEMINI.md`,
+    `.claude/rules`, `.cursor/rules`, `.agents/rules`, `.windsurfrules` and
+    Copilot instructions become project rules.
+  - `AGENTS.md` is skipped (Codex, Cursor and Antigravity read it natively),
+    as are kb's own managed blocks (no feedback loop).
+  - Imported rules skip the doc-overlap check, because they are delivered
+    rather than searched.
+- **Ownership marker:** user-level managed blocks carry a marker naming the
+  hub that wrote them, and refreshes only touch blocks they own.
+
+### 2.11 Reviews
 
 Reviews are OKF Markdown packets (`type: Review`) bound to `base..head`. Files
 come from git, with knowledge anchored to the touched files attached. Verdicts
@@ -236,14 +288,15 @@ is a useful reviewer), keeping cross-family review as the stronger option.
 | `kb install claude / codex / cursor / antigravity / hermes / git-hooks [--global / --repo]` | pointer, skill, hooks (user-wide with a hub) |
 | `kb search [query] [-f path] [-p project] [--all]` | compact ranked headers with trust badges |
 | `kb show <id>` | entry with trust trail, revisions, resources, fenced body |
-| `kb add <type> <title> -d ... [-e evidence] [--global [--for ...]]` | record knowledge |
+| `kb add <type> <title> -d ... [-e evidence] [--global [--for ...]]` | record knowledge (`rule` = convention) |
+| `kb rules [import]` | always-on rules for this scope; share rule files written for one agent |
 | `kb update <id> -m <why> [...] [-e evidence]` | new revision of an entry |
 | `kb verify <id> --confirm / --dispute -e ...` | record a check (any agent) |
 | `kb deprecate <id> -m ...`, `kb resolve` (human) | retire or decide |
 | `kb review submit / list / show / verdict / revise / close` | optional cross-review |
 | `kb status [--all]`, `kb lint`, `kb index`, `kb maintain` | health and upkeep |
 | `kb sync` | pull/rebase, reindex, commit, push |
-| `kb extract`, `kb hook claude` | capture from transcripts |
+| `kb extract [--scan codex/claude/memories]`, `kb hook claude` | capture from transcripts and agents' memory files |
 | `kb mcp` | stdio MCP server (6 tools) |
 
 ## 5. Phasing

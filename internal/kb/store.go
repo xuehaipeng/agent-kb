@@ -508,5 +508,8 @@ func (s *Store) recordChange(op, id string, actor Actor, detail string) error {
 	if s.Hub && s.autocommit() {
 		s.commitHub(fmt.Sprintf("kb: %s %s by %s", op, id, actor))
 	}
+	if n, ok := s.byID[id]; ok && ChangeHook != nil && s.Cfg.AlwaysOn(n.TypeKey) {
+		ChangeHook(s)
+	}
 	return nil
 }

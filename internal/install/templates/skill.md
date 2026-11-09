@@ -10,6 +10,24 @@ other agents. In a hub (`~/.kb`), knowledge is grouped by project: the current
 repo's project is detected from its git remote, and `global` holds what spans
 projects. A repo with its own `knowledge/` directory uses that instead.
 
+## Rules (always on)
+
+Conventions are rules: they are pushed into every session instead of waiting
+to be searched. Claude Code receives them at session start; other agents run
+`kb rules` when starting a task. Follow them unless the user says otherwise.
+
+```bash
+kb rules                                   # rules for this project + global, and proposed ones
+kb add rule "Use pnpm, never npm" -d "lockfile is pnpm-lock.yaml" -e "user said so"
+kb add rule "Write commit messages in English" -d "team convention" -e "user said so" --global
+kb rules import                            # share rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md ...)
+```
+
+Only evidence-backed rules are delivered. A rule you inferred yourself (no
+`-e`) waits as "proposed" until the user confirms it, so one agent's guess
+does not steer every other agent. Ask the user, then
+`kb verify <id> --confirm -e "user confirmed"`.
+
 ## Retrieve (cheap, do this first)
 
 ```bash
@@ -55,7 +73,7 @@ kb add decision "Use Drizzle instead of Prisma" -d "..." --supersedes decisions/
 
 Types: `fact` (invariant or architecture fact), `learning` (gotcha, root cause),
 `decision` (ADR; changes by superseding so history stays readable),
-`convention` (team rule). One claim per entry; `-r` globs power path search and
+`convention` (a rule or preference; `rule` is an alias; always on). One claim per entry; `-r` globs power path search and
 staleness. If `kb add` reports a duplicate or a related entry, update that one.
 
 ## Keep it current
@@ -73,6 +91,13 @@ kb deprecate <id> -m "feature removed in v3"
 
 Each update is a new revision (history in git); earlier verifications stay in
 the trail for the revision they checked.
+
+## Agents' own memories
+
+What agents save in their private memory (Claude Code auto memory, Codex
+memories, Hermes MEMORY.md/USER.md, Antigravity knowledge items) is imported
+so every agent can use it: `kb extract --scan memories`. Claude Code's is
+imported automatically at session end; files are only re-read when they change.
 
 ## Projects (hub mode)
 
