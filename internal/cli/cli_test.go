@@ -1438,6 +1438,34 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 	if out := scan(); strings.Contains(out, runbookID) {
 		t.Fatalf("settled warning came back:\n%s", out)
 	}
+	// A vanished source whose name is carried by several new files with
+	// different content: which one continues it is unknown, so none is
+	// imported and nothing is reported deleted.
+	write("feedback_reviews.md", topic("feedback-reviews", "Review requests name one owner", "feedback", "Every review request names exactly one owner."))
+	if out := scan(); !strings.Contains(out, "1 imported") {
+		t.Fatalf("new feedback:\n%s", out)
+	}
+	const reviewsID = "aiproxy/conventions/review-requests-name-one-owner"
+	os.Remove(filepath.Join(mem, "feedback_reviews.md"))
+	write("feedback_reviews_v2.md", topic("feedback-reviews", "Review requests name one owner and one backup", "feedback", "Every review request names one owner and one backup."))
+	write("feedback_reviews_backup.md", topic("feedback-reviews", "Reviews are requested in the team channel", "feedback", "Ask for reviews in the team channel, not in private messages."))
+	out = scan()
+	if !strings.Contains(out, `ambiguous: 2 new file(s) carry the name "feedback-reviews" of 1 deleted source(s) of `+reviewsID) || strings.Contains(out, "1 imported") || strings.Contains(out, "2 imported") || strings.Contains(out, "no longer backs "+reviewsID) {
+		t.Fatalf("ambiguous name match must be withheld:\n%s", out)
+	}
+	os.Chdir(base)
+	if out := must(t, "codex", "search", "review requests owner backup team channel", "--all"); strings.Contains(out, "one-owner-and-one-backup") || strings.Contains(out, "team-channel") {
+		t.Fatalf("an ambiguous candidate was imported:\n%s", out)
+	}
+	// Resolved by keeping one file with that name.
+	os.Remove(filepath.Join(mem, "feedback_reviews_backup.md"))
+	if out := scan(); !strings.Contains(out, "1 renamed") || !strings.Contains(out, "1 updated") || strings.Contains(out, "ambiguous") {
+		t.Fatalf("after removing the backup:\n%s", out)
+	}
+	if r := show(reviewsID); !strings.Contains(r, "one owner and one backup") || !strings.Contains(r, "revision: 2") {
+		t.Fatalf("the surviving file should continue the entry:\n%s", r)
+	}
+
 	// A dry run reports the same rename without recording it.
 	os.Rename(filepath.Join(mem, "project_alpha_rollout.md"), filepath.Join(mem, "project_alpha_gate.md"))
 	if out := scan("--dry-run"); !strings.Contains(out, "1 renamed") || strings.Contains(out, "1 would be imported") || strings.Contains(out, "no longer backs "+alphaID) {

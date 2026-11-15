@@ -461,8 +461,23 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) have the content of %d deleted source(s) of %s; nothing was imported or flagged for them (make the files differ, or deprecate the entry)", len(cands), sameHash, e.Entry))
 			continue
 		}
-		if cands := free(newByName[e.Name]); e.Name != "" && len(cands) == 1 && sameName == 1 {
+		if e.Name == "" {
+			continue
+		}
+		switch cands := free(newByName[e.Name]); {
+		case len(cands) == 1 && sameName == 1:
 			move(key, cands[0])
+		case len(cands) > 0:
+			// Several new files carry the vanished source's name (a renamed
+			// and edited copy next to a backup), or several vanished
+			// sources share it. Which one continues the source is not
+			// knowable, so none is imported and nothing is reported deleted.
+			for _, c := range cands {
+				ambiguous[c] = true
+			}
+			ambiguous[key] = true
+			r.ambiguous++
+			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) carry the name %q of %d deleted source(s) of %s; nothing was imported or flagged for them (keep one file with that name, or deprecate the entry)", len(cands), e.Name, sameName, e.Entry))
 		}
 	}
 
