@@ -1627,3 +1627,426 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 		t.Fatalf("the dry run recorded the rename:\n%s", out)
 	}
 }
+
+// Rule files are imported the way their own agent loads them: a path-scoped
+// rule stays conditional, a condition kb cannot reproduce is not imported,
+// imports stay inside the repository and comments are dropped.
+func TestImportConditionalRuleFiles(t *testing.T) {
+	base, home := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	file := func(rel, content string) {
+		t.Helper()
+		p := filepath.Join(repo, filepath.FromSlash(rel))
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	file(".claude/rules/general.md", "Keep functions under fifty lines where it reads well.\n")
+	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+	file(".claude/rules/frontend/styles.md", "---\npaths: \"src/**/*.{ts,tsx}, /*.md\"\n---\nUse design tokens for colours, never literals.\n")
+	file(".claude/rules/broken.md", "---\npaths: [src/**\n  oops: : :\n---\nThis rule has frontmatter that does not parse.\n")
+	file(".claude/rules/badglob.md", "---\npaths:\n  - \"photos [2024/**\"\n---\nThis rule has a pattern that cannot be matched exactly.\n")
+	file(".cursor/rules/attached.mdc", "---\ndescription: only when attached\nglobs: src/**/*.go\n---\nPrefer table-driven tests in Go files.\n")
+	file(".cursor/rules/always.mdc", "---\nalwaysApply: true\n---\nReturn early instead of nesting conditions.\n")
+	file("docs/extra.md", "Run the linter before every commit.\n\n@../CLAUDE.md\n")
+	file("AGENTS.md", "Agents file content that Codex reads natively.\n")
+	file("CLAUDE.md", "# Project\n\n<!-- maintainer note: do not\n   ship this comment -->\nAlways write a changelog entry.\n\nSee @docs/extra.md and @AGENTS.md, and @types/node is a package, not a file.\n\n```html\n<!-- kept: this comment is inside a code block -->\n```\n\nSecrets: @~/outside.md\n\nMine: @CLAUDE.local.md and @notes/private.md\n")
+	// Personal files inside the repository: the local instruction file, and
+	// one git is told to ignore. An import must not pull them in.
+	file("notes/private.md", "My staging password hint lives in my head.\n")
+	file(".gitignore", "notes/\nCLAUDE.local.md\n")
+	// A four-backtick block showing Markdown with its own fences: the inner
+	// fences do not end it, so nothing inside is an import or a comment.
+	file("docs/example.md", "Example content that is only an illustration.\n")
+	// Inline code delimited by two backticks may hold single ones; a
+	// reference inside it is an example, not an import.
+	file("docs/inline.md", "Inline example content that is only an illustration.\n")
+	file(".claude/rules/spans.md", "Write imports as ``@docs/inline.md`` or `` `@docs/inline.md` `` in examples.\nAn unmatched ` backtick changes nothing here.\n")
+	file(".claude/rules/fences.md", "Document commands in fenced blocks.\n\n````markdown\n```sh\nmake test\n```\nSee @docs/example.md\n<!-- kept: a comment inside the outer block -->\n~~~\nstill inside\n````\n\n<!-- dropped: a comment after the block -->\nKeep examples short.\n")
+	file("CLAUDE.local.md", "My sandbox URL is private.\n")
+	file("packages/web/CLAUDE.md", "Web components use CSS modules.\n")
+	// A path git would quote in its default output.
+	file("packages/界面/CLAUDE.md", "Interface strings come from the message catalogue.\n")
+	os.WriteFile(filepath.Join(home, "outside.md"), []byte("Content outside the repository that must not be imported.\n"), 0o644)
+	os.WriteFile(filepath.Join(home, "shared-rule.md"), []byte("A rule that lives outside the repository.\n"), 0o644)
+	os.Symlink(filepath.Join(home, "shared-rule.md"), filepath.Join(repo, ".claude", "rules", "linked.md"))
+	// A nested instruction file that is a link to somewhere outside the
+	// repository is not the repository's content.
+	os.MkdirAll(filepath.Join(repo, "packages", "api"), 0o755)
+	os.Symlink(filepath.Join(home, "outside.md"), filepath.Join(repo, "packages", "api", "CLAUDE.md"))
+	// A link back to the rules directory itself: read once, not for ever.
+	os.Symlink(".", filepath.Join(repo, ".claude", "rules", "shared"))
+	git(t, repo, "add", "-A")
+	git(t, repo, "commit", "-qm", "rules")
+
+	// A model stand-in that names one rule after the file it was given and
+	// keeps each prompt, so what was sent can be checked per file.
+	prompts := filepath.Join(base, "prompts")
+	os.MkdirAll(prompts, 0o755)
+	script := filepath.Join(base, "model.sh")
+	os.WriteFile(script, []byte("#!/bin/sh\nP=$(cat)\nF=$(printf '%s\\n' \"$P\" | sed -n 's/^File \\(.*\\):$/\\1/p' | tail -1)\nN=$(basename \"$(dirname \"$F\")\")-$(basename \"$F\")\nprintf '%s' \"$P\" > '"+prompts+"'/\"$N\".txt\nprintf '[{\"title\":\"Rule from %s\",\"description\":\"imported for the test\"}]' \"$N\"\n"), 0o755)
+	os.Chdir(repo)
+	out := must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if n := strings.Count(out, "rules/general.md: added 1"); n != 1 {
+		t.Errorf("a rules directory linked into itself must be read once, got %d:\n%s", n, out)
+	}
+	for _, want := range []string{
+		".claude/rules/broken.md: not imported (its frontmatter does not parse",
+		".claude/rules/badglob.md: not imported (pattern \"photos [2024/**\"",
+		".cursor/rules/attached.mdc: not imported (a Cursor rule that is not `alwaysApply: true`",
+		"note: CLAUDE.local.md: not imported (personal instructions",
+		".claude/rules/linked.md: not imported (a link to a location outside",
+		"packages/api/CLAUDE.md: not imported (a link to a location outside",
+		"CLAUDE.md: @AGENTS.md was not followed (other agents read AGENTS.md natively); @~/outside.md was not followed (it is outside",
+		"@CLAUDE.local.md was not followed (personal instructions that are not committed stay private)",
+		"@notes/private.md was not followed (git ignores it: instructions that are not committed stay private)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("import report lacks %q:\n%s", want, out)
+		}
+	}
+	for _, not := range []string{"Rule from rules-broken.md", "Rule from rules-badglob.md", "Rule from rules-attached.mdc", "Rule from rules-linked.md", "Rule from api-CLAUDE.md", "CLAUDE.local.md: added"} {
+		if strings.Contains(out, not) {
+			t.Errorf("import report must not contain %q:\n%s", not, out)
+		}
+	}
+	read := func(name string) string {
+		data, err := os.ReadFile(filepath.Join(prompts, name+".txt"))
+		if err != nil {
+			t.Fatalf("no prompt for %s (%v) in:\n%s", name, err, out)
+		}
+		return string(data)
+	}
+	// What the model saw for CLAUDE.md: its text, the import inside the
+	// repository (once, despite the cycle), no comment, nothing from outside.
+	p := read("aiproxy-CLAUDE.md")
+	for _, want := range []string{"Always write a changelog entry.", "Run the linter before every commit.", "<!-- kept: this comment is inside a code block -->"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("CLAUDE.md prompt lacks %q:\n%s", want, p)
+		}
+	}
+	for _, not := range []string{"maintainer note", "must not be imported", "Codex reads natively", "sandbox URL", "password hint"} {
+		if strings.Contains(p, not) {
+			t.Errorf("CLAUDE.md prompt must not contain %q:\n%s", not, p)
+		}
+	}
+	if strings.Count(p, "Always write a changelog entry.") != 1 {
+		t.Errorf("an import cycle included the file twice:\n%s", p)
+	}
+	if spans := read("rules-spans.md"); strings.Contains(spans, "Inline example content") || !strings.Contains(spans, "``@docs/inline.md``") {
+		t.Errorf("a reference inside a multi-backtick code span was followed:\n%s", spans)
+	}
+	fences := read("rules-fences.md")
+	for _, want := range []string{"See @docs/example.md", "<!-- kept: a comment inside the outer block -->", "still inside", "Keep examples short."} {
+		if !strings.Contains(fences, want) {
+			t.Errorf("a nested fence ended the outer code block (%q missing):\n%s", want, fences)
+		}
+	}
+	for _, not := range []string{"only an illustration", "dropped: a comment after the block"} {
+		if strings.Contains(fences, not) {
+			t.Errorf("fence tracking: the prompt must not contain %q:\n%s", not, fences)
+		}
+	}
+	if api := read("rules-api.md"); strings.Contains(api, "paths:") || !strings.Contains(api, "Validate every API handler input") {
+		t.Errorf("frontmatter must not reach the model:\n%s", api)
+	}
+
+	// Always-on delivery has the unconditional rules only.
+	rules := must(t, "codex", "rules", "-q")
+	for _, want := range []string{"Rule from rules-general.md", "Rule from aiproxy-CLAUDE.md", "(+4 rule(s) apply only to particular files"} {
+		if !strings.Contains(rules, want) {
+			t.Errorf("kb rules lacks %q:\n%s", want, rules)
+		}
+	}
+	hook, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SessionStart","cwd":"`+repo+`"}`, "hook", "claude")
+	for _, text := range []string{rules, hook} {
+		for _, not := range []string{"Rule from rules-api.md", "Rule from frontend-styles.md", "Rule from web-CLAUDE.md"} {
+			if strings.Contains(text, not) {
+				t.Errorf("a conditional rule was delivered as always-on (%q):\n%s", not, text)
+			}
+		}
+	}
+	// A conditional rule appears only for a matching file.
+	forFile := func(path string) string { t.Helper(); return must(t, "codex", "rules", "-q", "-f", path) }
+	for path, want := range map[string]string{
+		"src/api/users/create.ts": "Rule from rules-api.md",
+		"src/ui/Button.tsx":       "Rule from frontend-styles.md",
+		"README.md":               "Rule from frontend-styles.md",
+		"packages/web/src/a.css":  "Rule from web-CLAUDE.md",
+		"packages/界面/src/a.css":   "Rule from 界面-CLAUDE.md",
+	} {
+		if got := forFile(path); !strings.Contains(got, want) {
+			t.Errorf("kb rules -f %s lacks %q:\n%s", path, want, got)
+		}
+	}
+	for path, not := range map[string]string{
+		"src/api/users/create.go": "Rule from rules-api.md",       // wrong extension
+		"docs/guide.md":           "Rule from frontend-styles.md", // /*.md is rooted
+		"packages/api/src/a.css":  "Rule from web-CLAUDE.md",      // another package
+		"cmd/main.go":             "Rule from",
+	} {
+		if got := forFile(path); strings.Contains(got, not) {
+			t.Errorf("kb rules -f %s must not show %q:\n%s", path, not, got)
+		}
+	}
+	if out := must(t, "codex", "search", "-f", "src/api/users/create.ts"); !strings.Contains(out, "rule for this file: Rule from rules-api.md") {
+		t.Errorf("search by file:\n%s", out)
+	}
+	// Several files at once: each rule names the files it governs, so a
+	// rule for one package is not handed over as a rule for the other.
+	multi := must(t, "codex", "rules", "-q", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts")
+	for _, want := range []string{
+		"each applies only to the files named after it",
+		"Rule from web-CLAUDE.md - imported for the test [aiproxy/conventions/rule-from-web-claude-md] (only for packages/web/src/a.css)",
+		"Rule from rules-api.md - imported for the test [aiproxy/conventions/rule-from-rules-api-md] (only for src/api/users/create.ts)",
+		"Rule from frontend-styles.md - imported for the test [aiproxy/conventions/rule-from-frontend-styles-md] (only for src/api/users/create.ts)",
+	} {
+		if !strings.Contains(multi, want) {
+			t.Errorf("kb rules for two files lacks %q:\n%s", want, multi)
+		}
+	}
+	if out := must(t, "codex", "search", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts"); !strings.Contains(out, "rule for packages/web/src/a.css only: Rule from web-CLAUDE.md") || !strings.Contains(out, "rule for src/api/users/create.ts only: Rule from rules-api.md") {
+		t.Errorf("search by two files must say which file each rule is for:\n%s", out)
+	}
+	// JSON output carries the same rules, with what they are limited to.
+	var found []struct {
+		ID        string `json:"id"`
+		Kind      string `json:"kind"`
+		AppliesTo struct {
+			Paths []string `json:"paths"`
+			Base  string   `json:"base"`
+		} `json:"applies_to"`
+		RuleFor []string `json:"rule_for"`
+	}
+	if err := json.Unmarshal([]byte(must(t, "codex", "search", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts", "--json")), &found); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]int{}
+	for i, h := range found {
+		byID[h.ID] = i + 1
+	}
+	if i := byID["aiproxy/conventions/rule-from-web-claude-md"]; i == 0 || found[i-1].Kind != "rule" || found[i-1].AppliesTo.Base != "packages/web" || len(found[i-1].RuleFor) != 1 || found[i-1].RuleFor[0] != "packages/web/src/a.css" {
+		t.Errorf("JSON search by file lacks the rule for the web package, or its scope: %+v", found)
+	}
+	if i := byID["aiproxy/conventions/rule-from-rules-api-md"]; i == 0 || len(found[i-1].AppliesTo.Paths) != 1 || found[i-1].AppliesTo.Paths[0] != "src/api/**/*.ts" || len(found[i-1].RuleFor) != 1 || found[i-1].RuleFor[0] != "src/api/users/create.ts" {
+		t.Errorf("JSON search by file lacks the API rule, or its scope: %+v", found)
+	}
+	show := must(t, "codex", "show", "aiproxy/conventions/rule-from-web-claude-md")
+	if !strings.Contains(show, "conditional rule: applies only when working on ** under packages/web/") {
+		t.Errorf("nested CLAUDE.md should be conditional on its directory:\n%s", show)
+	}
+	var st struct {
+		Rules       int `json:"rules_delivered"`
+		Conditional int `json:"rules_conditional"`
+	}
+	json.Unmarshal([]byte(must(t, "codex", "status", "--json")), &st)
+	if st.Rules != 5 || st.Conditional != 4 {
+		t.Errorf("status: %+v", st)
+	}
+	// A rule can be recorded as conditional by hand too.
+	must(t, "claude-code", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "db/migrations/**")
+	if got := forFile("db/migrations/0001_init.sql"); !strings.Contains(got, "Migrations are forward-only") {
+		t.Errorf("--when rule:\n%s", got)
+	}
+	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Migrations are forward-only") {
+		t.Errorf("--when rule delivered as always-on:\n%s", got)
+	}
+	// A comma inside {a,b} belongs to its pattern; outside, it separates.
+	must(t, "claude-code", "add", "rule", "Components export a single default", "-d", "one component per file", "-e", "user said so", "--when", "src/ui/**/*.{ts,tsx}, stories/**")
+	for _, path := range []string{"src/ui/forms/Field.tsx", "src/ui/a.ts", "stories/button.mdx"} {
+		if got := forFile(path); !strings.Contains(got, "Components export a single default") {
+			t.Errorf("--when with brace alternatives, %s:\n%s", path, got)
+		}
+	}
+	if got := forFile("src/ui/a.css"); strings.Contains(got, "Components export a single default") {
+		t.Errorf("--when with brace alternatives matched too much:\n%s", got)
+	}
+	// --when limits rules added in bulk too; it is never dropped.
+	seedFile := filepath.Join(base, "seed.json")
+	os.WriteFile(seedFile, []byte(`[{"title":"Handlers return typed errors","description":"callers switch on them"},{"type":"fact","title":"The API gateway terminates TLS","description":"services speak plain HTTP behind it"}]`), 0o644)
+	out = must(t, "claude-code", "add", "rule", "--from", seedFile, "--when", "src/api/**", "-e", "user said so")
+	if !strings.Contains(out, "only rules can be limited to matching files") {
+		t.Errorf("a seeded entry that is not a rule must be refused with --when:\n%s", out)
+	}
+	if got := forFile("src/api/users/list.ts"); !strings.Contains(got, "Handlers return typed errors") {
+		t.Errorf("a seeded rule with --when:\n%s", got)
+	}
+	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Handlers return typed errors") {
+		t.Errorf("a seeded rule lost its condition and became always-on:\n%s", got)
+	}
+
+	// The same instruction for other files is a rule of its own; it repeats
+	// an existing one only where that one is already delivered.
+	must(t, "claude-code", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "services/billing/migrations/**")
+	if got := forFile("services/billing/migrations/0001.sql"); !strings.Contains(got, "Migrations are forward-only") {
+		t.Errorf("the same rule for another directory:\n%s", got)
+	}
+	if _, errs, code := kbRun(t, "claude-code", "", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "db/migrations/**"); code == 0 || !strings.Contains(errs, "db/migrations") && !strings.Contains(errs, "migrations-are-forward-only") {
+		t.Errorf("the same rule for the same files is a duplicate: exit %d\n%s", code, errs)
+	}
+	must(t, "claude-code", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so")
+	if _, _, code := kbRun(t, "claude-code", "", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "tools/migrations/**"); code == 0 {
+		t.Error("a rule that already applies everywhere covers every narrower copy")
+	}
+
+	// Narrowing a rule file's paths changes nothing in its text, yet the
+	// rules it gave follow the new condition.
+	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/v2/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if !strings.Contains(out, "rules/api.md: its condition changed; 1 rule(s) follow it [aiproxy/conventions/rule-from-rules-api-md]") || !strings.Contains(out, "rules/api.md: added 0, duplicates 1") {
+		t.Errorf("a changed paths condition:\n%s", out)
+	}
+	if got := forFile("src/api/users/create.ts"); strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("the rule kept its old, wider condition:\n%s", got)
+	}
+	if got := forFile("src/api/v2/users/create.ts"); !strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("the rule did not take the new condition:\n%s", got)
+	}
+	if api := read("rules-api.md"); !strings.Contains(api, "The rules in this file apply only when working on src/api/v2/**/*.ts") || !strings.Contains(api, "Rule from web-CLAUDE.md (only when working on ** under packages/web/)") {
+		t.Errorf("the prompt must say which files the rules are for:\n%s", api)
+	}
+	// Dropping the condition makes the rule apply everywhere.
+	file(".claude/rules/api.md", "# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); !strings.Contains(out, "rules/api.md: its condition changed; 1 rule(s) follow it") {
+		t.Errorf("a removed paths condition:\n%s", out)
+	}
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("an unconditional rule file's rule must be always-on:\n%s", got)
+	}
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); strings.Contains(out, "condition changed") || !strings.Contains(out, "rules/api.md: skipped (unchanged since last import)") {
+		t.Errorf("nothing changed, nothing to reconcile:\n%s", out)
+	}
+	// An emptied rule file states no rules and no condition: the rules it
+	// gave keep their condition instead of becoming always-on.
+	file(".claude/rules/frontend/styles.md", "<!-- nothing here for now -->\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); strings.Contains(out, "frontend/styles.md: its condition changed") || !strings.Contains(out, "frontend/styles.md: skipped (nothing to import)") {
+		t.Errorf("an emptied conditional rule file:\n%s", out)
+	}
+	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Rule from frontend-styles.md") {
+		t.Errorf("emptying a rule file made its rule always-on:\n%s", got)
+	}
+	if got := forFile("src/ui/Button.tsx"); !strings.Contains(got, "Rule from frontend-styles.md") {
+		t.Errorf("the rule of an emptied file lost its condition or was dropped:\n%s", got)
+	}
+	// A file whose condition becomes one kb cannot reproduce is no longer
+	// imported, and what it gave before must not stay in force more widely
+	// than the file now says: an always-on Cursor rule made conditional,
+	// and a Claude rule given a pattern that cannot be matched exactly.
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from rules-always.mdc") || !strings.Contains(got, "Rule from rules-api.md") {
+		t.Fatalf("both rules should be always-on before their files change:\n%s", got)
+	}
+	file(".cursor/rules/always.mdc", "---\nalwaysApply: false\nglobs: src/**/*.go\n---\nReturn early instead of nesting conditions.\n")
+	file(".claude/rules/api.md", "---\npaths:\n  - \"photos [2024/**\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	for _, want := range []string{
+		".cursor/rules/always.mdc: not imported (a Cursor rule that is not `alwaysApply: true`",
+		"rules/always.mdc: it can no longer be imported, so 1 rule(s) it gave earlier were retired instead of staying in force more widely than the file says [aiproxy/conventions/rule-from-rules-always-mdc]",
+		"rules/api.md: it can no longer be imported, so 1 rule(s) it gave earlier were retired",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a source that became unsupported: report lacks %q:\n%s", want, out)
+		}
+	}
+	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Rule from rules-always.mdc") || strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("rules of files that became conditional are still delivered everywhere:\n%s", got)
+	}
+	if show := must(t, "codex", "show", "aiproxy/conventions/rule-from-rules-always-mdc"); !strings.Contains(show, "trust: deprecated") {
+		t.Errorf("the rule should be retired:\n%s", show)
+	}
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); strings.Contains(out, "were retired") {
+		t.Errorf("retiring happens once:\n%s", out)
+	}
+	// Putting the file back as it was imports its rule again: the earlier
+	// import is not remembered as still standing.
+	file(".cursor/rules/always.mdc", "---\nalwaysApply: true\n---\nReturn early instead of nesting conditions.\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); !strings.Contains(out, "rules/always.mdc: added 1") {
+		t.Errorf("a restored rule file must be imported again:\n%s", out)
+	}
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from rules-always.mdc") {
+		t.Errorf("the rule of a restored file is not delivered:\n%s", got)
+	}
+	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+
+	// Two files state the same rule (the stand-in names a rule after the
+	// file's directory and name, so these two give one title). The second
+	// adds nothing: the first one's rule already says it.
+	file(".claude/rules/dup/shared.md", "Name branches after the ticket they belong to.\n")
+	file(".cursor/rules/dup/shared.md", "Name branches after the ticket they belong to.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if !strings.Contains(out, ".claude/rules/dup/shared.md: added 1") || !strings.Contains(out, ".cursor/rules/dup/shared.md: added 0, duplicates 1") {
+		t.Fatalf("the same rule in two files:\n%s", out)
+	}
+	// The first file is then limited to some files. Its rule follows, and
+	// the second file, which still states the rule for everything, is read
+	// again so the rule does not vanish everywhere else.
+	file(".claude/rules/dup/shared.md", "---\npaths: \"src/dup/**\"\n---\nName branches after the ticket they belong to.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	for _, want := range []string{
+		".claude/rules/dup/shared.md: its condition changed; 1 rule(s) follow it [aiproxy/conventions/rule-from-dup-shared-md]",
+		"1 other file(s) stated the same rule(s) and are read again",
+		".cursor/rules/dup/shared.md: added 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("narrowing a rule another file also states: report lacks %q:\n%s", want, out)
+		}
+	}
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from dup-shared.md") {
+		t.Errorf("a rule still stated for everything by another file stopped being always-on:\n%s", got)
+	}
+	if got := forFile("src/dup/a.go"); !strings.Contains(got, "[aiproxy/conventions/rule-from-dup-shared-md]") {
+		t.Errorf("the narrowed copy must still be there for its files:\n%s", got)
+	}
+	// The other order: the file that relied on a rule is read before the
+	// file whose change retires that rule, and is read again in the same run.
+	file(".cursor/rules/dup2/both.md", "Squash fixup commits before review.\n")
+	must(t, "", "rules", "import", "--repo", "--cmd", script)
+	file(".claude/rules/dup2/both.md", "Squash fixup commits before review.\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); !strings.Contains(out, ".claude/rules/dup2/both.md: added 0, duplicates 1") {
+		t.Fatalf("the second file should rely on the first one's rule:\n%s", out)
+	}
+	file(".cursor/rules/dup2/both.md", "---\nalwaysApply: false\nglobs: src/**\n---\nSquash fixup commits before review.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if !strings.Contains(out, "rules/dup2/both.md: it can no longer be imported, so 1 rule(s) it gave earlier were retired") || !strings.Contains(out, ".claude/rules/dup2/both.md: added 1") {
+		t.Errorf("retiring a rule another file relied on:\n%s", out)
+	}
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from dup2-both.md") {
+		t.Errorf("a rule another file still states was lost when its first source became unsupported:\n%s", got)
+	}
+
+	// A file drops its condition and replaces what it says. The rule it
+	// no longer states keeps its condition: it does not become always-on
+	// because the file's new, unrelated text applies everywhere. (This
+	// stand-in names a rule after the file's last line.)
+	echo := filepath.Join(base, "echo-model.sh")
+	os.WriteFile(echo, []byte("#!/bin/sh\nT=$(cat | sed '/^$/d' | tail -1)\nprintf '[{\"title\":\"%s\",\"description\":\"taken from the file\"}]' \"$T\"\n"), 0o755)
+	file(".claude/rules/swap.md", "---\npaths: \"src/payments/**\"\n---\nRound payment amounts with the bankers rule.\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", echo); !strings.Contains(out, ".claude/rules/swap.md: added 1") {
+		t.Fatalf("first import of the swapped file:\n%s", out)
+	}
+	file(".claude/rules/swap.md", "Prefer small pull requests over large ones.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", echo)
+	if !strings.Contains(out, ".claude/rules/swap.md: added 1") || strings.Contains(out, "swap.md: its condition changed") {
+		t.Errorf("a file that drops its condition and replaces its text:\n%s", out)
+	}
+	always := must(t, "codex", "rules", "-q")
+	if strings.Contains(always, "Round payment amounts") || !strings.Contains(always, "Prefer small pull requests over large ones") {
+		t.Errorf("a rule the file no longer states was made always-on, or the new one is missing:\n%s", always)
+	}
+	if got := forFile("src/payments/charge.go"); !strings.Contains(got, "Round payment amounts with the bankers rule") {
+		t.Errorf("the earlier rule should keep the condition it had:\n%s", got)
+	}
+	// The same file narrowed again while still stating its rule: the rule
+	// it states follows, and the prompt asks for it by name.
+	file(".claude/rules/swap.md", "---\npaths: \"docs/**\"\n---\nPrefer small pull requests over large ones.\n")
+	must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if p := read("rules-swap.md"); !strings.Contains(p, "This file gave these rules earlier, when it applied to other files than it does now.") || !strings.Contains(p, "- Prefer small pull requests over large ones.\n") {
+		t.Errorf("the prompt must name the rules whose condition has to follow the file:\n%s", p)
+	}
+
+	// A path-scoped file named on the command line has no known base.
+	if out := must(t, "", "rules", "import", filepath.Join(repo, ".claude", "rules", "api.md"), "--cmd", script); !strings.Contains(out, "its base directory is unknown here") {
+		t.Errorf("explicit path-scoped file:\n%s", out)
+	}
+}

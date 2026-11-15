@@ -47,6 +47,17 @@ func (s *Store) RenderHits(hits []Hit, q SearchQuery) string {
 		for _, f := range q.Files {
 			files = append(files, s.RelToCode(f))
 		}
+		// Rules that apply only to these files: the moment they matter.
+		if rules, err := s.RulesForFiles(files, q.Projects, q.AllProjects); err == nil {
+			for _, n := range rules {
+				// With several files, say which ones a rule is for.
+				which := "this file"
+				if len(files) > 1 {
+					which = strings.Join(FilesGoverned(n, files), ", ") + " only"
+				}
+				fmt.Fprintf(&b, "rule for %s: %s [%s]\n", which, ruleText(n), n.ID)
+			}
+		}
 		open, _ := s.Reviews(ReviewFilter{Projects: q.Projects, AllProjects: q.AllProjects})
 		for _, it := range open {
 			if r := it.Node.Meta().Review; r != nil {
@@ -119,6 +130,9 @@ func (s *Store) RenderNode(n *Node) string {
 	}
 	if len(m.Projects) > 0 {
 		fmt.Fprintf(&b, "applies to projects: %s\n", strings.Join(m.Projects, ", "))
+	}
+	if Conditional(m) {
+		fmt.Fprintf(&b, "conditional rule: applies only %s (not delivered at session start; kb rules -f <path>)\n", appliesNote(m.AppliesTo))
 	}
 	fmt.Fprintf(&b, "generated: %s at %s", m.Generated.By, m.Generated.At)
 	if m.Generated.Commit != "" {
@@ -332,6 +346,9 @@ func RenderStatus(r *StatusReport) string {
 	}
 	if len(r.PendingRules) > 0 {
 		fmt.Fprintf(&b, " (+%d proposed, awaiting confirmation: kb rules)", len(r.PendingRules))
+	}
+	if r.RulesConditional > 0 {
+		fmt.Fprintf(&b, "; %d conditional (only for matching files: kb rules -f <path>)", r.RulesConditional)
 	}
 	b.WriteString("\n")
 	fmt.Fprintf(&b, "reviews open: %d\n", r.ReviewsOpen)

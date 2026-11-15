@@ -237,7 +237,8 @@ Rev 2 shares all three.
   - Claude Code's typed memory files are imported without a model and keep
     their identity; all imports are source-only (§2.13).
 - **Rule-file import:** `kb rules import` splits rule files written for one
-  agent into atomic, agent-neutral rules.
+  agent into atomic, agent-neutral rules. Files are read the way their own
+  agent loads them, and a path-scoped rule stays conditional (§2.14).
   - User-level files become global rules; a repo's `CLAUDE.md`, `GEMINI.md`,
     `.claude/rules`, `.cursor/rules`, `.agents/rules`, `.windsurfrules` and
     Copilot instructions become project rules.
@@ -452,6 +453,103 @@ and the revision the import last wrote.
 Importing a source that overlaps a transcript of the same session
 automatically stays out until session coverage exists (issue #1 stage 3B).
 
+### 2.14 Conditional rules and rule-file fidelity *(issue #3 item 6A)*
+
+**Applicability is not anchoring.** `resources` says which code a claim
+depends on, for search and staleness. It never limited when a rule is
+delivered, so copying a path-scoped rule's patterns into `resources` would
+have made it an always-on rule. A rule that applies only to some files now
+carries `applies_to`:
+
+```yaml
+applies_to:
+  paths: ["src/api/**/*.ts"]
+  base: packages/web        # directory the patterns are relative to
+  origin: claude-rules      # whose pattern syntax
+```
+
+- A conditional rule is trusted and in scope but is left out of every
+  always-on surface: `kb rules`, SessionStart, MCP `instructions`, the
+  user-level blocks, and `rules_delivered`. Those surfaces carry one line
+  saying how many such rules exist. `kb status` counts them separately
+  (`rules_conditional`).
+- It surfaces for a matching file: `kb rules -f <path>` and `kb search -f
+  <path>` (which the pointer already tells agents to run before touching
+  unfamiliar code). Asked about several files at once, each rule names the
+  files it governs, so a rule for one package is never presented as a rule
+  for another. `kb search -f <path> --json` lists the same rules (`kind:
+  "rule"`) with `applies_to` and, in `rule_for`, the files asked about that
+  each one governs. `kb rules --all-rules` lists them with their condition.
+  Nothing pushes them yet; a file-access hook is issue #3 item 4.
+- Only rules can be conditional (`kb add rule ... --when <glob>`). `--when`
+  repeats or takes a comma-separated list; a comma inside `{a,b}` belongs to
+  its pattern. With `--from` it limits every seeded rule, and an item that
+  is not a rule is refused instead of being added without the condition.
+- Patterns follow Claude Code's documented rule syntax: `**` crosses
+  directories; a bare name matches at any depth; a leading `/` anchors to the
+  base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work,
+  and a bracket expression, negated or not, stays within one path segment
+  (one whose range takes in `/`, such as `[.-0]`, is refused), and `\`
+  inside brackets makes the next character literal (`[a\-z]`). A
+  pattern that cannot be matched exactly is an error and matches nothing. It
+  is never widened.
+
+**Reading rule files as their agent does.** `kb rules import` now:
+
+| Found | Outcome |
+|---|---|
+| Claude rule with `paths:` | imported as conditional, base = the directory holding its `.claude` |
+| `CLAUDE.md` or rules in a subdirectory | conditional on that directory (they load only for files there) |
+| frontmatter that does not parse | not imported: Claude Code would load it unconditionally, kb must not guess |
+| a pattern kb cannot match exactly | not imported |
+| Cursor rule that is not `alwaysApply: true`, other agents' `globs`/`trigger` | not imported: kb cannot reproduce that condition |
+| `CLAUDE.local.md` | not imported: personal, uncommitted instructions stay private |
+| an `@path` import of `CLAUDE.local.md`, or of a file git ignores | not followed, for the same reason |
+| a link or `@path` import leaving the repository (or `~/.claude` for user files) | not followed |
+| a repository instruction file that is itself a link to somewhere outside it (a nested `CLAUDE.md` included) | not imported |
+| `@AGENTS.md` | not followed: other agents read it natively |
+| kb's own blocks and pointer | never re-imported |
+
+Rules directories are walked recursively, each directory once whatever leads
+to it (a link back to the directory or an ancestor ends there). `@path`
+imports are followed up to
+four hops, once each (cycles end), only to existing files, and never inside
+code spans or fences. Block-level HTML comments are dropped, except inside
+code blocks. Inline code is delimited as Markdown does it, by backtick runs
+of equal length. A fenced block ends only at a fence of the same character that
+is at least as long, so a block that shows Markdown with its own fences
+stays one block. Everything left out is listed as a `note:` line.
+
+**The condition is part of what was imported.** A file's condition lives in
+frontmatter (or in where the file is), not in the text sent to the model, so
+the import's change detection covers both. When the condition changes, the
+rules the file gave earlier (found by their `sources`) are named in the
+prompt, and each one the file still states takes the new condition as a new
+revision; a rule that was in force stays in force. A rule the file no longer
+states keeps the condition it has: a file that drops its `paths` and
+replaces its text does not make its old, narrower rule apply everywhere.
+Two cases never widen a rule. A file that was emptied states no condition,
+so the rules it gave keep theirs. A file whose condition becomes one kb
+cannot reproduce (an always-on Cursor rule given `globs`, a pattern that
+cannot be matched exactly) is no longer imported, and the rules it gave
+earlier are retired, with the reason, instead of staying in force more
+widely than the file now says. Fixing the file and importing again adds
+them back.
+
+**A rule two files state belongs to both.** When a file adds nothing because
+an existing rule already says it, the import remembers which rule it relied
+on. If that rule is later narrowed or retired for its own file's sake, the
+files that relied on it are read again (in the same run), so the rule stays
+in force wherever another file still states it.
+
+**A rule repeats another only where that one is already delivered.** The
+same instruction in `packages/web/CLAUDE.md` and `packages/api/CLAUDE.md` is
+two rules, one per directory. A proposal is a duplicate when an existing rule
+with the same text is unconditional, or has the same base and syntax and all
+of the proposal's patterns. Conditions are never merged or widened. The
+import prompt lists existing rules with their condition and says which files
+the file's own rules are for.
+
 ## 3. Doc C (ChatGPT plan) review
 
 **Adopted in rev 2** (also: §2.9, repo docs as the source of truth):
@@ -494,7 +592,7 @@ automatically stays out until session coverage exists (issue #1 stage 3B).
 | `kb search [query] [-f path] [-p project] [--all]` | compact ranked headers with trust badges |
 | `kb show <id>` | entry with trust trail, revisions, resources, fenced body |
 | `kb add <type> <title> -d ... [-e evidence] [--global [--for ...]]` | record knowledge (`rule` = convention) |
-| `kb rules [-p project / --all] [import]` | the rules that apply here (§2.11); share rule files written for one agent |
+| `kb rules [-p project / --all] [-f path] [import]` | the rules that apply here (§2.11), or only to a file (§2.14); share rule files written for one agent |
 | `kb update <id> -m <why> [...] [-e evidence]` | new revision of an entry |
 | `kb verify <id> --confirm / --dispute -e ...` | record a check (any agent) |
 | `kb deprecate <id> -m ...`, `kb resolve` (human) | retire or decide |

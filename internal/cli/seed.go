@@ -87,6 +87,9 @@ func (a *App) seed(from string, defaults kb.AddInput) error {
 			Evidence: firstNonEmpty(it.Evidence, defaults.Evidence), Project: firstNonEmpty(it.Project, defaults.Project),
 			Projects: it.Projects, Tags: append(it.Tags, defaults.Tags...), Resources: it.Resources, Supersedes: it.Supersedes,
 			Actor: defaults.Actor, Force: defaults.Force, NewProject: defaults.NewProject,
+			// --when limits every seeded rule; an item that is not a rule
+			// is refused rather than added without the condition.
+			AppliesTo: defaults.AppliesTo,
 		}
 		if it.Global {
 			in.Project = kb.GlobalProject

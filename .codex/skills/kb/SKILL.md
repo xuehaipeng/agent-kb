@@ -20,6 +20,7 @@ to be searched. Claude Code receives them at session start; other agents run
 kb rules                                   # rules for this project + global, and proposed ones
                                            # (outside a project: only the global rules that apply everywhere)
 kb rules -p aiproxy                        # a named project's rules; --all lists every project's, for inspection
+kb rules -f src/api/users.ts               # rules that apply only to this file (also shown by kb search -f)
 kb add rule "Use pnpm, never npm" -d "lockfile is pnpm-lock.yaml" -e "user said so"
 kb add rule "Write commit messages in English" -d "team convention" -e "user said so" --global
 kb rules import                            # share rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md ...)

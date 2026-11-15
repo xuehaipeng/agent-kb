@@ -26,13 +26,31 @@ func (a *App) cmdRules(args []string) error {
 	f.list(&projects, true, "project(s) (hub)", "p", "project")
 	f.boolean(&all, "every project (hub)", "all")
 	f.boolean(&quiet, "rules only, no pending list or hints", "quiet", "q")
-	f.boolean(&uncapped, "list every rule that applies, including those a delivery cap leaves out", "all-rules")
+	f.boolean(&uncapped, "list every rule that applies, including those a delivery cap leaves out and conditional ones", "all-rules")
+	var files []string
+	f.list(&files, true, "file you will work on: show the rules that apply only to it", "f", "file")
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
 	s, err := a.store()
 	if err != nil {
 		return err
+	}
+	if len(files) > 0 {
+		var rel []string
+		for _, p := range files {
+			rel = append(rel, s.RelToCode(p))
+		}
+		rules, err := s.RulesForFiles(rel, projects, all)
+		if err != nil {
+			return err
+		}
+		out := s.RenderFileRules(rules, rel)
+		if out == "" && !quiet {
+			out = "no rule applies only to " + strings.Join(rel, ", ") + " (the always-on rules still do: kb rules)\n"
+		}
+		a.out("%s", out)
+		return nil
 	}
 	get := s.Rules
 	if uncapped {
@@ -86,16 +104,29 @@ func (a *App) cmdRulesImport(args []string) error {
 	}
 	o.Out = a.Stderr
 	var srcs []extract.FileSource
+	var notes []string
 	if len(pos) > 0 {
 		// Explicit files: written for an unknown agent, scoped like the repo files.
 		for _, p := range pos {
-			srcs = append(srcs, extract.FileSource{Path: p, Kind: extract.KindRules, Agent: kb.Actor{Producer: "user"}})
+			src, note := extract.PrepareExplicitRuleFile(s, p)
+			if note != "" {
+				notes = append(notes, note)
+			}
+			if src != nil {
+				srcs = append(srcs, *src)
+			}
 		}
 	} else {
-		srcs = extract.RuleFileSources(s, !projectOnly, !userOnly)
+		srcs, notes = extract.RuleFileSources(s, !projectOnly, !userOnly)
 	}
-	for _, line := range extract.ImportAll(s, srcs, o) {
-		a.out("%s\n", line)
+	if len(srcs) > 0 || len(notes) == 0 {
+		for _, line := range extract.ImportAll(s, srcs, o) {
+			a.out("%s\n", line)
+		}
+	}
+	// What was found but deliberately left out, and why.
+	for _, n := range notes {
+		a.out("note: %s\n", n)
 	}
 	return nil
 }

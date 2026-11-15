@@ -39,6 +39,16 @@ type FileSource struct {
 	Agent   kb.Actor // whose memory, or which agent the rule file was written for
 	Project string   // default target: "" = current project, "global" = shared
 	Content string   // when set, import this part of the file instead of all of it
+	// Prepared: Content is the file as its agent loads it (frontmatter and
+	// comments removed, imports expanded), even when that leaves nothing.
+	Prepared bool
+	// Applies makes every rule from this file conditional on matching files.
+	Applies *okf.Applicability
+	// Unsupported: the file has a condition kb cannot reproduce, so nothing
+	// is imported from it. It is still a source: rules it gave earlier,
+	// when it had no such condition, must not go on applying more widely
+	// than the file now says.
+	Unsupported string
 }
 
 // ImportOptions controls an import run.
@@ -70,6 +80,27 @@ var kbBlockRe = regexp.MustCompile(`(?s)<!-- kb:begin.*?<!-- kb:end -->\n?`)
 // ImportFile turns a memory or rule file into knowledge entries.
 func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	res := &Result{}
+	if src.Unsupported != "" {
+		res.Skipped = "not imported"
+		if o.DryRun {
+			return res, nil
+		}
+		retired, err := retireFrom(s, src, o)
+		res.Retired = retired
+		if err != nil {
+			return res, err
+		}
+		if abs, aerr := filepath.Abs(src.Path); aerr == nil {
+			res.Reimport = forgetDependents(s, retired, abs)
+		}
+		// What was last imported from this file no longer stands. Forget
+		// it, so that the file is imported again when it is supported
+		// again, even with exactly the content it had before.
+		if abs, aerr := filepath.Abs(src.Path); aerr == nil && loadState(s, abs).Hash != "" {
+			return res, saveHash(s, abs, "")
+		}
+		return res, nil
+	}
 	data, err := os.ReadFile(src.Path)
 	if err != nil {
 		return nil, err
@@ -77,7 +108,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	if len(data) > maxImportBytes {
 		data = data[:maxImportBytes]
 	}
-	if src.Content != "" {
+	if src.Content != "" || src.Prepared {
 		data = []byte(src.Content)
 	}
 	// The source's own modification time, not the time of this import.
@@ -87,8 +118,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	}
 	// Never re-import kb's own managed blocks (pointer, delivered rules).
 	content := strings.TrimSpace(kbBlockRe.ReplaceAllString(string(data), ""))
-	sum := sha256.Sum256([]byte(content))
-	hash := hex.EncodeToString(sum[:])
+	hash := importHash(content, src.Applies)
 	abs, _ := filepath.Abs(src.Path)
 	st := loadState(s, abs)
 	// A project-filtered run only takes part of the file, so it neither
@@ -102,14 +132,43 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		res.Skipped = "not in the selected projects"
 		return res, nil
 	}
-	if len(content) < minImportContentLen {
+	srcID := sourceID(src)
+	minLen := minImportContentLen
+	if src.Prepared {
+		// Frontmatter and comments are already gone: a one-line rule file
+		// is a whole rule, not noise.
+		minLen = 10
+	}
+	if len(content) < minLen {
+		// An emptied file states no rules and no condition. The rules it
+		// gave earlier keep the condition they have: taking "no condition"
+		// from a file with nothing in it would make them apply everywhere.
 		res.Skipped = "nothing to import"
 		if !o.DryRun {
 			return res, saveHash(s, abs, hash)
 		}
 		return res, nil
 	}
-	prompt := importPrompt(s, src, content)
+	// Rules this file gave earlier under another condition than it has now.
+	// A changed condition applies to what the file still states, and only
+	// to that: a rule the file no longer contains keeps the condition it
+	// has, so dropping a file's condition while replacing its text cannot
+	// turn the old, narrower rule into one that applies everywhere. Which
+	// rules it still states is known once the model has read the file, so
+	// they are named in the prompt and matched against what comes back.
+	var moved []*kb.Node
+	if src.Kind == KindRules {
+		own, err := rulesFrom(s, src, o)
+		if err != nil {
+			return nil, err
+		}
+		for _, n := range own {
+			if !kb.SameApplies(n.Meta().AppliesTo, src.Applies) {
+				moved = append(moved, n)
+			}
+		}
+	}
+	prompt := importPrompt(s, src, content, moved)
 	if filtered {
 		prompt = strings.Replace(prompt, "\nFile ", fmt.Sprintf("\nOnly extract notes about these projects: %s. Ignore everything else.\n\nFile ", strings.Join(o.Projects, ", ")), 1)
 	}
@@ -143,11 +202,11 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		claims = claims[:limit]
 	}
 	known := s.ProjectFiles()
-	srcID := src.Kind + "-" + kb.Slugify(src.Agent.Producer)
 	evidence := fmt.Sprintf("saved in %s's memory (%s)", src.Agent.Producer, displayPath(src.Path))
 	if src.Kind == KindRules {
 		evidence = fmt.Sprintf("user rule written for %s in %s", src.Agent.Producer, displayPath(src.Path))
 	}
+	var reliesOn []string // entries that already say what this file says
 	for _, c := range claims {
 		project := src.Project
 		if s.Hub {
@@ -170,7 +229,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		in := kb.AddInput{
 			Type: typ, Title: c.Title, Description: c.Description, Body: strings.TrimSpace(c.Body),
 			Tags: c.Tags, Resources: c.Resources, Project: project, Actor: src.Agent,
-			Evidence: evidence, NoDocCheck: src.Kind == KindRules,
+			Evidence: evidence, NoDocCheck: src.Kind == KindRules, AppliesTo: src.Applies,
 			// The default project comes from a real repository (or is global).
 			NewProject: project == src.Project,
 			Sources: []okf.Source{{ID: srcID, Resource: displayPath(src.Path), Author: src.Agent.String(),
@@ -187,6 +246,23 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		} else {
 			in.Body = in.Description + fmt.Sprintf(" [^%s]", srcID)
 		}
+		// The file still states a rule it gave earlier: that rule takes
+		// the file's present condition, and nothing new is added for it.
+		if n := stillStated(moved, in.Title+" "+in.Description); n != nil {
+			if err := rescope(s, src, n, sourceDate); err != nil {
+				return nil, err
+			}
+			res.Dupes++
+			res.Rescoped = append(res.Rescoped, n.ID)
+			var rest []*kb.Node
+			for _, m := range moved {
+				if m != n {
+					rest = append(rest, m)
+				}
+			}
+			moved = rest
+			continue
+		}
 		if src.Kind == KindMemory {
 			if ms := s.DocCoverage(projectOr(s, project), c.Title+" "+c.Description); len(ms) > 0 && ms[0].Coverage >= kb.DocWarnCoverage {
 				res.Documented++
@@ -202,6 +278,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		switch {
 		case errors.As(err, &dup):
 			res.Dupes++
+			reliesOn = append(reliesOn, dup.Match.ID)
 		case errors.As(err, &documented):
 			res.Documented++
 		case err != nil:
@@ -212,10 +289,106 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 			res.Added = append(res.Added, r.Node.ID)
 		}
 	}
+	// Files that relied on a rule this file just re-scoped state it too,
+	// perhaps for other files: they are read again.
+	res.Reimport = forgetDependents(s, res.Rescoped, abs)
 	if filtered {
 		return res, nil
 	}
-	return res, saveHash(s, abs, hash)
+	return res, saveHash(s, abs, hash, reliesOn...)
+}
+
+// importHash identifies what an import took from a file: its content and,
+// for a conditional rule file, the condition, which lives in frontmatter the
+// content no longer has.
+func importHash(content string, applies *okf.Applicability) string {
+	if applies != nil && len(applies.Paths) > 0 {
+		content += "\x00applies_to\x00" + applies.Base + "\x00" + applies.Origin + "\x00" + strings.Join(applies.Paths, "\x00")
+	}
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// sourceID names a file's kind and agent on the entries it gives.
+func sourceID(src FileSource) string { return src.Kind + "-" + kb.Slugify(src.Agent.Producer) }
+
+// rulesFrom lists the rules in force that a file gave earlier.
+func rulesFrom(s *kb.Store, src FileSource, o ImportOptions) ([]*kb.Node, error) {
+	nodes, err := s.Nodes()
+	if err != nil {
+		return nil, err
+	}
+	id, resource := sourceID(src), displayPath(src.Path)
+	var out []*kb.Node
+	for _, n := range nodes {
+		if !s.Cfg.AlwaysOn(n.TypeKey) || s.Trust(n).State == kb.StateDeprecated {
+			continue
+		}
+		if len(o.Projects) > 0 && !o.wants(n.Project) {
+			continue
+		}
+		for _, from := range n.Meta().Sources {
+			if from.ID == id && from.Resource == resource {
+				out = append(out, n)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// retireFrom retires the rules a file gave earlier, now that the file has
+// a condition kb cannot reproduce. Keeping them would apply them where the
+// file no longer says they apply; kb cannot narrow them the same way, so
+// they stop being delivered. It returns the entries it retired.
+func retireFrom(s *kb.Store, src FileSource, o ImportOptions) ([]string, error) {
+	rules, err := rulesFrom(s, src, o)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, n := range rules {
+		reason := "its rule file (" + displayPath(src.Path) + ") now has a condition kb cannot reproduce: " + src.Unsupported
+		if _, err := s.Deprecate(n.ID, reason, src.Agent); err != nil {
+			return out, fmt.Errorf("%s: %w", n.ID, err)
+		}
+		out = append(out, n.ID)
+	}
+	return out, nil
+}
+
+// stillStated finds, among the rules a file gave earlier, the one a claim
+// from the file as it is now restates.
+func stillStated(earlier []*kb.Node, text string) *kb.Node {
+	var best *kb.Node
+	score := 0.85 // the same bar a duplicate has to pass
+	for _, n := range earlier {
+		m := n.Meta()
+		if sim := kb.Similarity(text, m.Title+" "+m.Description); sim >= score {
+			best, score = n, sim
+		}
+	}
+	return best
+}
+
+// rescope gives a rule the condition its file has now.
+func rescope(s *kb.Store, src FileSource, n *kb.Node, date time.Time) error {
+	reason := "its rule file no longer limits it to particular files"
+	if src.Applies != nil && len(src.Applies.Paths) > 0 {
+		reason = "its rule file now applies " + kb.AppliesNote(src.Applies)
+	}
+	// The condition is the user's own, like the rule: a rule in force
+	// stays in force instead of waiting for a confirmation. One that was
+	// not trusted before is not confirmed by a change of its condition.
+	evidence := ""
+	if s.Trust(n).Trusted() {
+		evidence = fmt.Sprintf("user rule written for %s in %s", src.Agent.Producer, displayPath(src.Path))
+	}
+	if _, _, err := s.Update(kb.UpdateInput{Ref: n.ID, Reason: reason, Actor: src.Agent, AppliesTo: src.Applies, SetAppliesTo: true, Evidence: evidence,
+		SourceOnly: true, SourceDate: date, SourceDateBasis: kb.BasisSourceMtime}); err != nil {
+		return fmt.Errorf("%s: %w", n.ID, err)
+	}
+	return nil
 }
 
 func projectOr(s *kb.Store, p string) string {
@@ -225,7 +398,7 @@ func projectOr(s *kb.Store, p string) string {
 	return p
 }
 
-func importPrompt(s *kb.Store, src FileSource, content string) string {
+func importPrompt(s *kb.Store, src FileSource, content string, moved []*kb.Node) string {
 	var b strings.Builder
 	agent := src.Agent.Producer
 	projectField := ""
@@ -255,6 +428,12 @@ Return ONLY a JSON array (no prose, no code fence) of at most %d objects shaped 
 - Keep the user's intent and wording; never invent rules. Skip anything that is not an instruction.
 - Do not repeat rules that already exist (listed below). Return [] if nothing qualifies.
 `, agent, displayPath(src.Path), maxRuleClaims, projectField, agent)
+		// A rule that exists for other files only does not cover this file.
+		if src.Applies != nil && len(src.Applies.Paths) > 0 {
+			fmt.Fprintf(&b, "- The rules in this file apply only %s. An existing rule marked for other files is not a repeat: return it for this file too.\n", kb.AppliesNote(src.Applies))
+		} else {
+			b.WriteString("- The rules in this file apply everywhere. An existing rule marked \"only ...\" covers those files alone and is not a repeat: return it.\n")
+		}
 	default:
 		fmt.Fprintf(&b, `These are notes a coding agent (%s) saved in its private memory. The other agents (Claude Code, Codex, Hermes, Cursor, ...) cannot see them. Turn the durable, shareable ones into entries for the knowledge base all agents share.
 
@@ -272,6 +451,14 @@ Return ONLY a JSON array (no prose, no code fence) of at most %d objects shaped 
 			b.WriteString("- " + t + "\n")
 		}
 	}
+	if len(moved) > 0 {
+		// Without this the "do not repeat" rule above would hide exactly
+		// the rules whose condition has to follow the file.
+		b.WriteString("\nThis file gave these rules earlier, when it applied to other files than it does now. Return every one of them that the file still states, with its title unchanged; leave out the ones it no longer states:\n")
+		for _, n := range moved {
+			b.WriteString("- " + n.Meta().Title + "\n")
+		}
+	}
 	fmt.Fprintf(&b, "\nFile %s:\n\n%s\n", displayPath(src.Path), content)
 	return b.String()
 }
@@ -286,7 +473,11 @@ func existingTitles(s *kb.Store, rulesOnly bool) []string {
 		if n.TypeKey == "review" || (rulesOnly && !s.Cfg.AlwaysOn(n.TypeKey)) || s.Trust(n).State == kb.StateDeprecated {
 			continue
 		}
-		out = append(out, n.Meta().Title)
+		title := n.Meta().Title
+		if rulesOnly && kb.Conditional(n.Meta()) {
+			title += " (only " + kb.AppliesNote(n.Meta().AppliesTo) + ")"
+		}
+		out = append(out, title)
 	}
 	sort.Strings(out)
 	if len(out) > 150 {
@@ -295,13 +486,50 @@ func existingTitles(s *kb.Store, rulesOnly bool) []string {
 	return out
 }
 
-func saveHash(s *kb.Store, path, hash string) error {
+func saveHash(s *kb.Store, path, hash string, reliesOn ...string) error {
 	p := statePath(s, path)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	data, _ := json.Marshal(state{Path: path, Hash: hash, Updated: time.Now().UTC().Format(time.RFC3339)})
+	data, _ := json.Marshal(state{Path: path, Hash: hash, Updated: time.Now().UTC().Format(time.RFC3339), ReliesOn: reliesOn})
 	return os.WriteFile(p, data, 0o644)
+}
+
+// forgetDependents clears the saved import of every file that added nothing
+// because one of the given entries already said it. Those entries have just
+// been narrowed or retired for their own file's sake; the other files may
+// still state the rule as before, and must be read again to keep it. It
+// returns the files it cleared.
+func forgetDependents(s *kb.Store, entries []string, self string) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	changed := map[string]bool{}
+	for _, id := range entries {
+		changed[id] = true
+	}
+	files, _ := filepath.Glob(s.LocalPath("extract", "*.json"))
+	var out []string
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		var st state
+		if json.Unmarshal(data, &st) != nil || st.Path == "" || st.Path == self || st.Hash == "" {
+			continue
+		}
+		for _, id := range st.ReliesOn {
+			if changed[id] {
+				if saveHash(s, st.Path, "") == nil {
+					out = append(out, st.Path)
+				}
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func displayPath(p string) string {
@@ -424,54 +652,49 @@ func claudeMemoryProject(s *kb.Store, projectDir string) (string, bool) {
 	return t.Project, t.Project != ""
 }
 
-// RuleFileSources finds rule files written for a single agent: user-level
-// instruction files (shared as global rules) and, inside a repository,
-// agent-specific rule files the other agents don't read. AGENTS.md is left
-// out: Codex, Cursor and Antigravity already read it natively.
-func RuleFileSources(s *kb.Store, user, project bool) []FileSource {
-	var out []FileSource
-	add := func(p string, agent string, proj string) {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			out = append(out, FileSource{Path: p, Kind: KindRules, Agent: kb.Actor{Producer: agent}, Project: proj})
-		}
-	}
-	if user {
-		g := globalOrCurrent(s)
-		add(filepath.Join(claudeDir(), "CLAUDE.md"), "claude-code", g)
-		add(filepath.Join(codexDir(), "AGENTS.md"), "codex", g)
-		add(filepath.Join(homeDir(), ".gemini", "GEMINI.md"), "antigravity", g)
-	}
-	if project && s.CodeRoot != "" {
-		root := s.CodeRoot
-		add(filepath.Join(root, "CLAUDE.md"), "claude-code", "")
-		add(filepath.Join(root, ".claude", "CLAUDE.md"), "claude-code", "")
-		add(filepath.Join(root, "GEMINI.md"), "antigravity", "")
-		add(filepath.Join(root, ".windsurfrules"), "windsurf", "")
-		add(filepath.Join(root, ".github", "copilot-instructions.md"), "copilot", "")
-		for _, g := range []struct{ glob, agent string }{
-			{".claude/rules/*.md", "claude-code"},
-			{".cursor/rules/*.mdc", "cursor"},
-			{".cursor/rules/*.md", "cursor"},
-			{".agents/rules/*.md", "antigravity"},
-		} {
-			matches, _ := filepath.Glob(filepath.Join(root, filepath.FromSlash(g.glob)))
-			for _, m := range matches {
-				add(m, g.agent, "")
-			}
-		}
-	}
-	return out
-}
-
 // ImportAll imports a list of sources and returns one report line each.
 func ImportAll(s *kb.Store, srcs []FileSource, o ImportOptions) []string {
 	var report []string
+	again := map[string]bool{}
 	for _, src := range srcs {
+		report = append(report, importOne(s, src, o, again)...)
+	}
+	// A file read earlier in this run whose rules relied on an entry that a
+	// later file narrowed or retired: read it again now, once.
+	for _, src := range srcs {
+		abs, err := filepath.Abs(src.Path)
+		if err != nil || !again[abs] || src.Unsupported != "" || loadState(s, abs).Hash != "" {
+			continue
+		}
+		delete(again, abs)
+		report = append(report, importOne(s, src, o, map[string]bool{})...)
+	}
+	if len(report) == 0 && len(srcs) == 0 {
+		report = append(report, "no files found")
+	}
+	return report
+}
+
+// importOne imports one file and reports what happened. Files whose saved
+// import it invalidated are added to again.
+func importOne(s *kb.Store, src FileSource, o ImportOptions, again map[string]bool) []string {
+	var report []string
+	{
 		label := displayPath(src.Path)
 		r, err := ImportFile(s, src, o)
+		if err == nil {
+			for _, p := range r.Reimport {
+				again[p] = true
+			}
+		}
 		switch {
 		case err != nil:
 			report = append(report, fmt.Sprintf("%s: error: %v", label, err))
+		case src.Unsupported != "":
+			// Why it is not imported is already in the notes.
+			if len(r.Retired) > 0 {
+				report = append(report, fmt.Sprintf("%s: it can no longer be imported, so %d rule(s) it gave earlier were retired instead of staying in force more widely than the file says %v", label, len(r.Retired), r.Retired))
+			}
 		case r.Skipped != "":
 			report = append(report, fmt.Sprintf("%s: skipped (%s)", label, r.Skipped))
 		case o.DryRun:
@@ -479,9 +702,16 @@ func ImportAll(s *kb.Store, srcs []FileSource, o ImportOptions) []string {
 		default:
 			report = append(report, fmt.Sprintf("%s: added %d, duplicates %d, already documented %d %v", label, len(r.Added), r.Dupes, r.Documented, r.Added))
 		}
-	}
-	if len(report) == 0 {
-		report = append(report, "no files found")
+		if err == nil && len(r.Rescoped) > 0 {
+			report = append(report, fmt.Sprintf("%s: its condition changed; %d rule(s) follow it %v", label, len(r.Rescoped), r.Rescoped))
+		}
+		if err == nil && len(r.Reimport) > 0 {
+			var names []string
+			for _, p := range r.Reimport {
+				names = append(names, displayPath(p))
+			}
+			report = append(report, fmt.Sprintf("%s: %d other file(s) stated the same rule(s) and are read again so the rule stays where they apply it: %s", label, len(names), strings.Join(names, ", ")))
+		}
 	}
 	return report
 }
