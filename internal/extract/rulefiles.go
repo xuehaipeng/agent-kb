@@ -39,6 +39,7 @@ type rulePrep struct {
 	rulesDir bool   // lives in a rules directory: frontmatter may scope it
 	base     string // repo-relative directory its patterns are relative to
 	nested   bool   // loads only for files under base (a subdirectory's rules)
+	repo     bool   // found in a repository: what it gives is shared with the team
 }
 
 // RuleFileSources finds rule files written for a single agent: user-level
@@ -65,7 +66,7 @@ func RuleFileSources(s *kb.Store, user, project bool) ([]FileSource, []string) {
 	if project && s.CodeRoot != "" {
 		root := kb.RealPath(s.CodeRoot)
 		at := func(rel, agent string) rulePrep {
-			return rulePrep{path: filepath.Join(root, filepath.FromSlash(rel)), agent: agent, boundary: root}
+			return rulePrep{path: filepath.Join(root, filepath.FromSlash(rel)), agent: agent, boundary: root, repo: true}
 		}
 		preps = append(preps, at("CLAUDE.md", "claude-code"), at(".claude/CLAUDE.md", "claude-code"), at("GEMINI.md", "antigravity"),
 			at(".windsurfrules", "windsurf"), at(".github/copilot-instructions.md", "copilot"))
@@ -73,14 +74,14 @@ func RuleFileSources(s *kb.Store, user, project bool) ([]FileSource, []string) {
 			{".claude/rules", "claude-code", ".md"}, {".cursor/rules", "cursor", ".mdc"}, {".cursor/rules", "cursor", ".md"}, {".agents/rules", "antigravity", ".md"},
 		} {
 			for _, p := range walkRules(filepath.Join(root, filepath.FromSlash(d.dir)), root, d.ext, &notes) {
-				preps = append(preps, rulePrep{path: p, agent: d.agent, boundary: root, rulesDir: true})
+				preps = append(preps, rulePrep{path: p, agent: d.agent, boundary: root, rulesDir: true, repo: true})
 			}
 		}
 		// A subdirectory's CLAUDE.md and rules load only once files there are
 		// worked on: they are conditional on that directory.
 		for _, rel := range nestedClaudeFiles(root) {
 			dir := rel[:strings.LastIndex(rel, "/")]
-			p := rulePrep{path: filepath.Join(root, filepath.FromSlash(rel)), agent: "claude-code", boundary: root, nested: true}
+			p := rulePrep{path: filepath.Join(root, filepath.FromSlash(rel)), agent: "claude-code", boundary: root, nested: true, repo: true}
 			switch {
 			case strings.Contains(rel, "/.claude/rules/"):
 				p.base, p.rulesDir = rel[:strings.Index(rel, "/.claude/rules/")], true
@@ -106,6 +107,17 @@ func RuleFileSources(s *kb.Store, user, project bool) ([]FileSource, []string) {
 		seen[p.path] = true
 		if st, err := os.Stat(p.path); err != nil || st.IsDir() {
 			continue
+		}
+		// A repository's instruction file that is a link to somewhere
+		// outside it is not the repository's content: what it says would
+		// be sent to the model and shared with everyone using the bundle.
+		// This holds wherever the file was found, not only in a rules
+		// directory.
+		if p.repo {
+			if target, err := filepath.EvalSymlinks(p.path); err != nil || !within(p.boundary, target) {
+				notes = append(notes, displayPath(p.path)+": not imported (a link to a location outside "+displayPath(p.boundary)+")")
+				continue
+			}
 		}
 		src, note := prepareRuleFile(s, p)
 		if note != "" {
@@ -306,24 +318,7 @@ func ruleCondition(agent string, fm map[string]yaml.Node) (paths []string, condi
 		var out []string
 		switch n.Kind {
 		case yaml.ScalarNode:
-			// Comma-separated, but a comma inside {a,b} belongs to the pattern.
-			depth, last := 0, 0
-			v := n.Value
-			for i := 0; i <= len(v); i++ {
-				switch {
-				case i < len(v) && v[i] == '\\':
-					i++
-				case i < len(v) && v[i] == '{':
-					depth++
-				case i < len(v) && v[i] == '}' && depth > 0:
-					depth--
-				case i == len(v) || (v[i] == ',' && depth == 0):
-					if p := strings.TrimSpace(v[last:i]); p != "" {
-						out = append(out, p)
-					}
-					last = i + 1
-				}
-			}
+			out = kb.SplitPatterns(n.Value)
 		case yaml.SequenceNode:
 			for _, c := range n.Content {
 				if c.Kind != yaml.ScalarNode {
