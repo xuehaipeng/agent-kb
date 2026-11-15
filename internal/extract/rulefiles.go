@@ -206,13 +206,14 @@ func walkRulesOnce(dir, boundary, ext string, notes *[]string, seen map[string]b
 // nestedClaudeFiles lists tracked Claude instruction files below the root
 // directory (repo-relative, slash separated).
 func nestedClaudeFiles(root string) []string {
-	out, err := kb.Git(root, "ls-files", "--", "*CLAUDE.md", "*/.claude/rules/*.md")
+	// -z: paths as they are, NUL-separated. Without it git quotes and
+	// escapes a path with non-ASCII characters, and the file is not found.
+	out, err := kb.Git(root, "ls-files", "-z", "--", "*CLAUDE.md", "*/.claude/rules/*.md")
 	if err != nil {
 		return nil
 	}
 	var files []string
-	for _, l := range strings.Split(out, "\n") {
-		l = strings.TrimSpace(l)
+	for _, l := range strings.Split(out, "\x00") {
 		switch {
 		case l == "" || l == "CLAUDE.md" || l == ".claude/CLAUDE.md" || strings.HasPrefix(l, ".claude/rules/"):
 		case strings.HasSuffix(l, "/CLAUDE.md") || strings.Contains(l, "/.claude/rules/"):
@@ -360,13 +361,47 @@ func ruleCondition(agent string, fm map[string]yaml.Node) (paths []string, condi
 	}
 }
 
-var fenceRe = regexp.MustCompile("^\\s{0,3}(```|~~~)")
+var fenceRe = regexp.MustCompile("^ {0,3}(`{3,}|~{3,})(.*)$")
+
+// fenceState follows fenced code blocks line by line, as Markdown defines
+// them: a block opened by a run of backticks or tildes is closed only by a
+// run of the same character that is at least as long and has nothing after
+// it. A shorter or different fence inside it is content of the block (a
+// four-backtick block showing Markdown that has its own fences).
+type fenceState struct {
+	char byte
+	n    int
+}
+
+func (f *fenceState) open() bool { return f.n > 0 }
+
+// line takes the next line and reports whether it opens or closes a block.
+func (f *fenceState) line(l string) bool {
+	m := fenceRe.FindStringSubmatch(l)
+	if m == nil {
+		return false
+	}
+	run, rest := m[1], m[2]
+	if f.n == 0 {
+		if run[0] == '`' && strings.Contains(rest, "`") {
+			return false // backticks after the run: inline code, not a fence
+		}
+		f.char, f.n = run[0], len(run)
+		return true
+	}
+	if run[0] == f.char && len(run) >= f.n && strings.TrimSpace(rest) == "" {
+		f.n = 0
+		return true
+	}
+	return false
+}
 
 // stripBlockComments removes block-level HTML comments, as Claude Code does
 // before loading an instruction file. Comments inside code blocks stay.
 func stripBlockComments(text string) string {
 	var out []string
-	inFence, inComment := false, false
+	var fence fenceState
+	inComment := false
 	for _, l := range strings.Split(text, "\n") {
 		if inComment {
 			if i := strings.Index(l, "-->"); i >= 0 {
@@ -377,12 +412,11 @@ func stripBlockComments(text string) string {
 			}
 			continue
 		}
-		if fenceRe.MatchString(l) {
-			inFence = !inFence
+		if fence.line(l) {
 			out = append(out, l)
 			continue
 		}
-		if !inFence && strings.HasPrefix(strings.TrimLeft(l, " "), "<!--") && len(l)-len(strings.TrimLeft(l, " ")) <= 3 {
+		if !fence.open() && strings.HasPrefix(strings.TrimLeft(l, " "), "<!--") && len(l)-len(strings.TrimLeft(l, " ")) <= 3 {
 			if i := strings.Index(l, "-->"); i >= 0 {
 				if rest := strings.TrimSpace(l[i+3:]); rest != "" {
 					out = append(out, rest)
@@ -407,13 +441,9 @@ var (
 // boundary are followed; kb's own files and AGENTS.md never are.
 func expandImports(s *kb.Store, text, dir, boundary string, seen map[string]bool, depth int, notes *[]string) string {
 	var extra []string
-	inFence := false
+	var fence fenceState
 	for _, l := range strings.Split(text, "\n") {
-		if fenceRe.MatchString(l) {
-			inFence = !inFence
-			continue
-		}
-		if inFence {
+		if fence.line(l) || fence.open() {
 			continue
 		}
 		for _, m := range importRe.FindAllStringSubmatch(codeSpanRe.ReplaceAllString(l, ""), -1) {
