@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -966,5 +967,67 @@ func TestStartupBriefAndPreferenceErrors(t *testing.T) {
 	os.Chmod(local, 0o755)
 	if out := must(t, "codex", "project", "checkout", "list", "aiproxy"); strings.Contains(out, "(preferred)") {
 		t.Fatalf("nothing should have been saved:\n%s", out)
+	}
+}
+
+// End to end: the SessionStart hook's stdout stays under Claude Code's
+// 10,000-character hook limit however many rules apply, and kb status
+// reports exactly what the hook delivered.
+func TestSessionStartOutputStaysWithinHookLimit(t *testing.T) {
+	base, _ := hubEnv(t)
+	must(t, "", "hub", "init")
+	var items []string
+	for i := 0; i < 45; i++ {
+		title := fmt.Sprintf("规则%02d：%s", i, strings.Repeat("始终优先使用文档中记录的方法而不是临时方案，", 12))
+		items = append(items, fmt.Sprintf(`{"type":"rule","global":true,"title":%q,"description":"because the team agreed on it"}`, title))
+	}
+	out, errs, code := kbRun(t, "claude-code", "["+strings.Join(items, ",")+"]", "add", "--from", "-", "-e", "user said so", "--force")
+	if code != 0 || !strings.Contains(out, "seeded 45 of 45") {
+		t.Fatalf("seed: %d\n%s\n%s", code, out, errs)
+	}
+	units := func(s string) int {
+		n := 0
+		for _, r := range s {
+			if r >= 0x10000 {
+				n++
+			}
+			n++
+		}
+		return n
+	}
+	os.Chdir(base)
+	hook, _, code := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SessionStart","cwd":"`+base+`"}`, "hook", "claude")
+	if code != 0 || units(hook) > 9000 || units(hook) < 6000 {
+		t.Fatalf("hook stdout is %d units (exit %d); it must stay under the 10,000-character hook limit and use its budget", units(hook), code)
+	}
+	rendered := strings.Count(hook, "\n- ")
+	if rendered >= 40 || rendered < 20 || !strings.Contains(hook, fmt.Sprintf("(+%d more rule(s) apply here but were left out", 45-rendered)) {
+		t.Fatalf("hook rendered %d rules:\n%s", rendered, hook[len(hook)-200:])
+	}
+	var st struct {
+		Rules    int `json:"rules_delivered"`
+		Omitted  int `json:"rules_omitted_by_cap"`
+		Delivery struct {
+			Surface, Scope, Unit     string
+			Budget, Size, Applicable int
+			Rendered                 int
+			ByCount                  int `json:"omitted_by_count"`
+			BySize                   int `json:"omitted_by_size"`
+		} `json:"rules_delivery"`
+	}
+	if err := json.Unmarshal([]byte(must(t, "claude-code", "status", "--json")), &st); err != nil {
+		t.Fatal(err)
+	}
+	d := st.Delivery
+	if st.Rules != 45 || st.Omitted != 45-rendered || d.Surface != "session-start" || d.Scope != "global only" || d.Unit != "utf16-code-units" || d.Budget != 9000 ||
+		d.Size != units(hook) || d.Applicable != 45 || d.Rendered != rendered || d.ByCount != 5 || d.BySize != 40-rendered {
+		t.Fatalf("status does not match what the hook delivered (%d rules, %d units): %+v", rendered, units(hook), st)
+	}
+	// The rules a cap left out can be listed on request.
+	if n := strings.Count(must(t, "claude-code", "rules", "-q"), "\n- "); n != 40 {
+		t.Fatalf("kb rules lists %d", n)
+	}
+	if n := strings.Count(must(t, "claude-code", "rules", "-q", "--all-rules"), "\n- "); n != 45 {
+		t.Fatalf("kb rules --all-rules lists %d", n)
 	}
 }

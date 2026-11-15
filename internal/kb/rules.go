@@ -91,8 +91,18 @@ func (s *Store) ruleScope(projects []string, all bool) (func(*Node) bool, string
 // Rules collects the rules that apply in the current scope (or to the given
 // projects). Every delivery surface goes through here: 'kb rules', the
 // SessionStart hook, MCP instructions, the user-level managed blocks and the
-// rule count in 'kb status'.
+// rule count in 'kb status'. The set is capped at maxDeliveredRules; push
+// surfaces also fit it to their size budget (see planDelivery).
 func (s *Store) Rules(projects []string, all bool) (RuleSet, error) {
+	return s.rules(projects, all, maxDeliveredRules)
+}
+
+// AllRules is Rules without the count cap, for listing what a cap left out.
+func (s *Store) AllRules(projects []string, all bool) (RuleSet, error) {
+	return s.rules(projects, all, 0)
+}
+
+func (s *Store) rules(projects []string, all bool, limit int) (RuleSet, error) {
 	nodes, err := s.Nodes()
 	if err != nil {
 		return RuleSet{}, err
@@ -146,7 +156,7 @@ func (s *Store) Rules(projects []string, all bool) (RuleSet, error) {
 	}
 	rs.Scoped, rs.Global = order(scoped), order(global)
 	// Project rules first; cap the total so always-on context stays small.
-	if over := len(rs.Scoped) + len(rs.Global) - maxDeliveredRules; over > 0 {
+	if over := len(rs.Scoped) + len(rs.Global) - limit; limit > 0 && over > 0 {
 		rs.Omitted = over
 		if len(rs.Global) >= over {
 			rs.Global = rs.Global[:len(rs.Global)-over]
@@ -196,7 +206,7 @@ func (s *Store) RenderRules(rs RuleSet, withPending bool) string {
 		}
 	}
 	if rs.Omitted > 0 {
-		fmt.Fprintf(&b, "(+%d more rules: kb rules --all-rules)\n", rs.Omitted)
+		fmt.Fprintf(&b, "(+%d more rule(s) apply here but were left out to keep this short: kb rules --all-rules)\n", rs.Omitted)
 	}
 	if withPending && len(rs.Pending) > 0 {
 		b.WriteString("Proposed rules awaiting confirmation (not applied; confirm with 'kb verify <id> --confirm -e \"<why>\"' or retire with 'kb deprecate'):\n")

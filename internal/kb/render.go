@@ -306,8 +306,12 @@ func RenderStatus(r *StatusReport) string {
 		fmt.Fprintf(&b, "claims by producer: %s\n", strings.Join(prod, ", "))
 	}
 	fmt.Fprintf(&b, "rules that apply (%s): %d", r.RulesScope, r.Rules)
-	if r.RulesOmitted > 0 {
-		fmt.Fprintf(&b, " (%d beyond the delivery cap of %d)", r.RulesOmitted, maxDeliveredRules)
+	if d := r.Delivery; d != nil && d.Omitted() > 0 {
+		fmt.Fprintf(&b, "; session start delivers %d and leaves out %d (%d over the %d-rule cap, %d to fit the %d-unit budget; kb rules --all-rules lists them)",
+			d.Rendered, d.Omitted(), d.OmittedByCount, maxDeliveredRules, d.OmittedBySize, d.Budget)
+	}
+	if d := r.Delivery; d != nil && d.BriefOmitted > 0 {
+		fmt.Fprintf(&b, "; %d health line(s) left out of session start to fit the budget", d.BriefOmitted)
 	}
 	if len(r.PendingRules) > 0 {
 		fmt.Fprintf(&b, " (+%d proposed, awaiting confirmation: kb rules)", len(r.PendingRules))

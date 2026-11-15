@@ -96,15 +96,12 @@ func (s *Server) handle(req request) {
 		if version < "2024-11-05" {
 			version = "2025-06-18"
 		}
-		instructions := baseInstructions
 		// The rules that apply where the server runs: the project of its
 		// working directory plus global, or outside a project only the
-		// global rules that apply everywhere.
-		if rs, err := s.Store.Rules(nil, false); err == nil {
-			if r := s.Store.RenderRules(rs, false); r != "" {
-				instructions += "\n\n" + r
-			}
-		}
+		// global rules that apply everywhere, fitted to the declared budget
+		// for this field (the fixed guidance is always kept).
+		d, _ := s.Store.MCPInstructionsDelivery(baseInstructions)
+		instructions := d.Text
 		reply(map[string]any{
 			"protocolVersion": version,
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
