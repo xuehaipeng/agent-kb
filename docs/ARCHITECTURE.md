@@ -509,7 +509,9 @@ to it (a link back to the directory or an ancestor ends there). `@path`
 imports are followed up to
 four hops, once each (cycles end), only to existing files, and never inside
 code spans or fences. Block-level HTML comments are dropped, except inside
-code blocks. Everything left out is listed as a `note:` line.
+code blocks. A fenced block ends only at a fence of the same character that
+is at least as long, so a block that shows Markdown with its own fences
+stays one block. Everything left out is listed as a `note:` line.
 
 **The condition is part of what was imported.** A file's condition lives in
 frontmatter (or in where the file is), not in the text sent to the model, so

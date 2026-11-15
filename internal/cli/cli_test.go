@@ -1652,6 +1652,10 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	file("docs/extra.md", "Run the linter before every commit.\n\n@../CLAUDE.md\n")
 	file("AGENTS.md", "Agents file content that Codex reads natively.\n")
 	file("CLAUDE.md", "# Project\n\n<!-- maintainer note: do not\n   ship this comment -->\nAlways write a changelog entry.\n\nSee @docs/extra.md and @AGENTS.md, and @types/node is a package, not a file.\n\n```html\n<!-- kept: this comment is inside a code block -->\n```\n\nSecrets: @~/outside.md\n")
+	// A four-backtick block showing Markdown with its own fences: the inner
+	// fences do not end it, so nothing inside is an import or a comment.
+	file("docs/example.md", "Example content that is only an illustration.\n")
+	file(".claude/rules/fences.md", "Document commands in fenced blocks.\n\n````markdown\n```sh\nmake test\n```\nSee @docs/example.md\n<!-- kept: a comment inside the outer block -->\n~~~\nstill inside\n````\n\n<!-- dropped: a comment after the block -->\nKeep examples short.\n")
 	file("CLAUDE.local.md", "My sandbox URL is private.\n")
 	file("packages/web/CLAUDE.md", "Web components use CSS modules.\n")
 	os.WriteFile(filepath.Join(home, "outside.md"), []byte("Content outside the repository that must not be imported.\n"), 0o644)
@@ -1717,6 +1721,17 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	}
 	if strings.Count(p, "Always write a changelog entry.") != 1 {
 		t.Errorf("an import cycle included the file twice:\n%s", p)
+	}
+	fences := read("rules-fences.md")
+	for _, want := range []string{"See @docs/example.md", "<!-- kept: a comment inside the outer block -->", "still inside", "Keep examples short."} {
+		if !strings.Contains(fences, want) {
+			t.Errorf("a nested fence ended the outer code block (%q missing):\n%s", want, fences)
+		}
+	}
+	for _, not := range []string{"only an illustration", "dropped: a comment after the block"} {
+		if strings.Contains(fences, not) {
+			t.Errorf("fence tracking: the prompt must not contain %q:\n%s", not, fences)
+		}
 	}
 	if api := read("rules-api.md"); strings.Contains(api, "paths:") || !strings.Contains(api, "Validate every API handler input") {
 		t.Errorf("frontmatter must not reach the model:\n%s", api)
@@ -1787,7 +1802,7 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 		Conditional int `json:"rules_conditional"`
 	}
 	json.Unmarshal([]byte(must(t, "codex", "status", "--json")), &st)
-	if st.Rules != 2 || st.Conditional != 3 {
+	if st.Rules != 3 || st.Conditional != 3 {
 		t.Errorf("status: %+v", st)
 	}
 	// A rule can be recorded as conditional by hand too.
