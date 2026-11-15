@@ -1322,11 +1322,23 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 	if out := must(t, "codex", "status", "--all"); !strings.Contains(out, "knowledge: 4 active") {
 		t.Fatalf("a second entry was created:\n%s", out)
 	}
+	// Merged by hand, then accepted: the merged revision is the new baseline.
+	os.Chdir(repo)
+	must(t, "codex", "update", ruleID, "-b", "Use structured fields for logs, and count every retry.", "-m", "merged the memory's new sections")
 	if out := scan("--accept-conflicts"); strings.Contains(out, "conflict") {
 		t.Fatalf("accepting:\n%s", out)
 	}
 	if out := scan(); strings.Contains(out, "conflict") || strings.Contains(out, "fallback") {
 		t.Fatalf("after accepting, the unchanged mixed file is settled:\n%s", out)
+	}
+	// The source becomes a single note again and is edited: it updates the
+	// merged entry instead of conflicting with the pre-merge revision.
+	write("feedback_logging.md", topic("feedback-logging", "Log with structured fields only", "feedback", "Use structured fields; retries are counted by the metrics library."))
+	if out := scan(); !strings.Contains(out, "1 updated") || strings.Contains(out, "conflict") {
+		t.Fatalf("an edit after an accepted merge:\n%s", out)
+	}
+	if rule := show(ruleID); !strings.Contains(rule, "revision: 3") || !strings.Contains(rule, "metrics library") {
+		t.Fatalf("entry after an accepted merge and a new edit:\n%s", rule)
 	}
 	// The same holds when a tracked memory turns private.
 	write("feedback_logging.md", topic("feedback-logging", "Log with structured fields only", "user", "The user prefers structured logs."))

@@ -512,6 +512,12 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			switch {
 			case tracked.Conflict != "" && o.AcceptConflicts:
 				if !o.DryRun {
+					// The entry as merged by hand is the new baseline, so
+					// that a later edit of a source that is a single note
+					// again updates it instead of conflicting forever.
+					if n, err := s.Get(tracked.Entry); err == nil {
+						tracked.Revision = n.Meta().Rev()
+					}
 					tracked.Hash, tracked.Conflict, tracked.Missing, tracked.Updated = f.hash, "", "", now.Format(time.RFC3339)
 				}
 				r.unchanged++
