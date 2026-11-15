@@ -1222,6 +1222,15 @@ func TestClaudeMemoryDeterministicImport(t *testing.T) {
 	if p, _ := os.ReadFile(prompt); !strings.Contains(string(p), "pinned digest") || strings.Contains(string(p), "feedback_testing.md") {
 		t.Fatalf("index fallback prompt should hold only the index's own notes:\n%s", p)
 	}
+	// A link that leads somewhere else is content of the index, not a
+	// pointer to a topic file: no topic file preserves it.
+	write("MEMORY.md", "# Memory index\n\n- [Testing](feedback_testing.md) — integration tests hit a real database\n- [Production runbook](https://example.com/runbook) — follow this during incidents, it is the only current copy\n- [Old notes](notes_that_do_not_exist.md) — a pointer to a file that is not there\n")
+	if out := scan(cmd); !strings.Contains(out, "fallback: MEMORY.md holds notes besides its 1 link(s)") || strings.Contains(out, "1 index skipped") {
+		t.Fatalf("an index holding external references:\n%s", out)
+	}
+	if p, _ := os.ReadFile(prompt); !strings.Contains(string(p), "Production runbook") || !strings.Contains(string(p), "notes_that_do_not_exist.md") || strings.Contains(string(p), "feedback_testing.md") {
+		t.Fatalf("external references must reach the fallback, topic pointers must not:\n%s", p)
+	}
 
 	// A typed file the earlier model-based import already took is not
 	// imported a second time: unchanged it is done, changed it stays on the
@@ -1472,6 +1481,27 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 	if r := show(reviewsID); !strings.Contains(r, "one owner and one backup") || !strings.Contains(r, "revision: 2") {
 		t.Fatalf("the surviving file should continue the entry:\n%s", r)
 	}
+
+	// Two tracked sources share a name. The one that sorts first is
+	// deleted, the other is renamed without an edit: its exact content
+	// settles it, whatever the order the sources are looked at in.
+	write("project_a_first.md", topic("pair", "First of a pair is about caching", "project", "Responses are cached for five minutes."))
+	write("project_b_second.md", topic("pair", "Second of a pair is about paging", "project", "List endpoints page by cursor."))
+	if out := scan(); !strings.Contains(out, "2 imported") {
+		t.Fatalf("pair:\n%s", out)
+	}
+	const firstID, secondID = "aiproxy/facts/first-of-a-pair-is-about-caching", "aiproxy/facts/second-of-a-pair-is-about-paging"
+	os.Remove(filepath.Join(mem, "project_a_first.md"))
+	os.Rename(filepath.Join(mem, "project_b_second.md"), filepath.Join(mem, "project_paging.md"))
+	out = scan()
+	if strings.Contains(out, "ambiguous") || !strings.Contains(out, "1 renamed") || !strings.Contains(out, "no longer backs "+firstID) || strings.Contains(out, "no longer backs "+secondID) {
+		t.Fatalf("an exact-content rename must be settled before names are considered:\n%s", out)
+	}
+	if sec := show(secondID); !strings.Contains(sec, "memory/project_paging.md by") {
+		t.Fatalf("the renamed source:\n%s", sec)
+	}
+	os.Chdir(repo)
+	must(t, "codex", "deprecate", firstID, "-m", "caching was removed")
 
 	// The way out an ambiguous rename advertises: deprecate the old entry,
 	// and the files carrying its name are imported as new sources.
