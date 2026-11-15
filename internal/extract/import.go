@@ -393,10 +393,13 @@ func claudeMemoryProject(s *kb.Store, projectDir string) (string, bool) {
 	name := filepath.Base(projectDir)
 	if cwd == "" {
 		if s.Hub {
-			for id, pf := range s.ProjectFiles() {
-				_ = pf
-				if co := s.CheckoutFor(id); co != "" && claudeProjectDirName(co) == name {
-					return id, true
+			// Any registered checkout of a project (a worktree has its own
+			// Claude project directory), not just the baseline one.
+			for id := range s.ProjectFiles() {
+				for _, c := range s.Checkouts(id) {
+					if claudeProjectDirName(c.Path) == name {
+						return id, true
+					}
 				}
 			}
 		} else if s.CodeRoot != "" && claudeProjectDirName(s.CodeRoot) == name {

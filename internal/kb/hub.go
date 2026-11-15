@@ -23,10 +23,71 @@ type ProjectFile struct {
 
 const projectFileName = "project.yaml"
 
-// registry maps projects to local checkouts on this machine (gitignored),
-// so staleness can be checked even when kb runs outside the repo.
+// registry records the local checkouts of each project on this machine
+// (gitignored), so code freshness can be checked even when kb runs outside
+// the repo. Projects is the original project -> paths list; Checkouts adds
+// each path's repository identity (a project can span several repositories,
+// and a repository can have several worktrees and clones), and Preferred
+// holds the user's baseline choice per project and repository.
+//
+// On disk it is two files. registry.json keeps exactly the original format
+// (projects only), and checkouts.json holds the rest: an older kb on the
+// same machine rewrites registry.json with only the fields it knows, which
+// would otherwise drop the user's preferences.
 type registry struct {
-	Projects map[string][]string `json:"projects"`
+	Projects  map[string][]string          `json:"projects"`
+	Checkouts map[string]checkoutInfo      `json:"checkouts,omitempty"`
+	Preferred map[string]map[string]string `json:"preferred,omitempty"`
+}
+
+const (
+	registryFile  = "registry.json"
+	checkoutsFile = "checkouts.json"
+)
+
+func (r *registry) init() {
+	if r.Projects == nil {
+		r.Projects = map[string][]string{}
+	}
+	if r.Checkouts == nil {
+		r.Checkouts = map[string]checkoutInfo{}
+	}
+	if r.Preferred == nil {
+		r.Preferred = map[string]map[string]string{}
+	}
+}
+
+// adopt records path as a checkout of project (and of no other project) and
+// reports whether anything changed.
+func (r *registry) adopt(project, path string, info checkoutInfo) bool {
+	changed := false
+	for other, paths := range r.Projects {
+		if other == project || !containsStr(paths, path) {
+			continue
+		}
+		kept := make([]string, 0, len(paths))
+		for _, p := range paths {
+			if p != path {
+				kept = append(kept, p)
+			}
+		}
+		r.Projects[other] = kept
+		for repo, pref := range r.Preferred[other] {
+			if pref == path {
+				delete(r.Preferred[other], repo)
+			}
+		}
+		changed = true
+	}
+	if !containsStr(r.Projects[project], path) {
+		r.Projects[project] = append([]string{path}, r.Projects[project]...)
+		changed = true
+	}
+	if info.Repo != "" && r.Checkouts[path] != info {
+		r.Checkouts[path] = info
+		changed = true
+	}
+	return changed
 }
 
 // NormalizeRemote turns a git remote URL into a stable key:
@@ -77,21 +138,28 @@ func (s *Store) attachProject(cwd string) {
 	if hubTop, err := Git(s.Dir, "rev-parse", "--show-toplevel"); err == nil && realPath(hubTop) == top {
 		return // inside the hub repo itself
 	}
-	key := ""
-	if url, err := Git(top, "remote", "get-url", "origin"); err == nil {
-		key = NormalizeRemote(url)
-	} else if remotes, err := Git(top, "remote"); err == nil && remotes != "" {
-		if url, err := Git(top, "remote", "get-url", strings.Fields(remotes)[0]); err == nil {
-			key = NormalizeRemote(url)
-		}
-	}
-	if key == "" {
+	key := remoteKey(top)
+	remote := key != ""
+	if !remote {
 		key = "path:" + top
 	}
 	s.CodeRoot = top
 	s.RepoKey = key
 	s.Project = s.projectForRepo(key, top)
-	s.registerCheckout(s.Project, top)
+	// The identity used for baseline selection. It is cached in the registry
+	// so a normal run costs no extra git call.
+	info := s.loadRegistry().Checkouts[top]
+	if remote {
+		info.Repo = key
+	}
+	if info.Repo == "" || info.CommonDir == "" {
+		info.CommonDir = commonDirOf(top)
+		if !remote {
+			info.Repo = localRepoID(top, info.CommonDir)
+		}
+	}
+	s.repoID = info.Repo
+	s.registerCheckout(s.Project, top, info)
 }
 
 // projectForRepo finds the project whose project.yaml lists the repo, or
@@ -250,7 +318,7 @@ func (s *Store) LinkProject(id string) error {
 		return err
 	}
 	s.Project = id
-	s.registerCheckout(id, s.CodeRoot)
+	s.registerCheckout(id, s.CodeRoot, s.loadRegistry().Checkouts[s.CodeRoot])
 	s.Invalidate()
 	return s.recordChange("project-link", id, Actor{Producer: "kb"}, s.RepoKey)
 }
@@ -259,55 +327,87 @@ func (s *Store) loadRegistry() *registry {
 	if s.registry != nil {
 		return s.registry
 	}
-	r := &registry{Projects: map[string][]string{}}
-	if data, err := os.ReadFile(s.LocalPath("registry.json")); err == nil {
-		_ = json.Unmarshal(data, r)
-		if r.Projects == nil {
-			r.Projects = map[string][]string{}
-		}
+	s.registry = s.readRegistry()
+	return s.registry
+}
+
+func (s *Store) readRegistry() *registry {
+	legacy := &registry{}
+	if data, err := os.ReadFile(s.LocalPath(registryFile)); err == nil {
+		_ = json.Unmarshal(data, legacy)
 	}
-	s.registry = r
+	r := &registry{}
+	if data, err := os.ReadFile(s.LocalPath(checkoutsFile)); err == nil {
+		_ = json.Unmarshal(data, r)
+	}
+	r.Projects = legacy.Projects
+	r.init()
 	return r
 }
 
-func (s *Store) registerCheckout(project, path string) {
+// registryLock serializes registry updates across kb processes. It is a
+// lock of its own, not the bundle's write lock: registration happens while
+// a store is being opened, including under that write lock.
+const registryLock = "registry.lock"
+
+// updateRegistry applies fn to the registry as it is on disk now and saves
+// it when fn reports a change. The reread, the change and both file writes
+// happen under one cross-process lock, so concurrent kb processes (a
+// session-start hook registering a worktree while the user sets a
+// preference) cannot overwrite each other's update. A failure to lock or
+// write is returned; the change still applies to this process's copy, so
+// callers for whom saving is best effort can ignore the error.
+func (s *Store) updateRegistry(fn func(*registry) bool) error {
+	s.coCache, s.selCache, s.repoCache = nil, nil, nil
+	unlock, err := s.lockFile(registryLock)
+	if err != nil {
+		fn(s.loadRegistry())
+		return err
+	}
+	defer unlock()
+	r := s.readRegistry()
+	changed := fn(r)
+	s.registry = r
+	if !changed {
+		return nil
+	}
+	data, err := json.MarshalIndent(registry{Projects: r.Projects}, "", "  ")
+	if err != nil {
+		return err
+	}
+	if _, err := WriteFileIfChanged(s.LocalPath(registryFile), data); err != nil {
+		return err
+	}
+	data, err = json.MarshalIndent(struct {
+		Checkouts map[string]checkoutInfo      `json:"checkouts"`
+		Preferred map[string]map[string]string `json:"preferred,omitempty"`
+	}{r.Checkouts, r.Preferred}, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = WriteFileIfChanged(s.LocalPath(checkoutsFile), data)
+	return err
+}
+
+func (s *Store) registerCheckout(project, path string, info checkoutInfo) {
 	if project == "" || path == "" {
 		return
 	}
-	r := s.loadRegistry()
-	if containsStr(r.Projects[project], path) {
-		return
-	}
-	r.Projects[project] = append([]string{path}, r.Projects[project]...)
-	if err := os.MkdirAll(s.LocalPath(), 0o755); err != nil {
-		return
-	}
-	data, _ := json.MarshalIndent(r, "", "  ")
-	_, _ = WriteFileIfChanged(s.LocalPath("registry.json"), data)
-}
-
-// CheckoutFor returns a local work tree for project on this machine, or "".
-func (s *Store) CheckoutFor(project string) string {
-	if !s.Hub {
-		return s.CodeRoot
-	}
-	if project == s.Project && s.CodeRoot != "" {
-		return s.CodeRoot
-	}
-	for _, p := range s.loadRegistry().Projects[project] {
-		if fileExists(filepath.Join(p, ".git")) {
-			return p
+	// Nothing to write in the common case: decide on the loaded copy first.
+	if probe := s.loadRegistry(); containsStr(probe.Projects[project], path) && (info.Repo == "" || probe.Checkouts[path] == info) {
+		foreign := false
+		for other, paths := range probe.Projects {
+			if other != project && containsStr(paths, path) {
+				foreign = true
+			}
+		}
+		if !foreign {
+			return
 		}
 	}
-	return ""
-}
-
-// codeRootFor returns the work tree a node's resources refer to.
-func (s *Store) codeRootFor(n *Node) string {
-	if n.Project == GlobalProject {
-		return ""
-	}
-	return s.CheckoutFor(n.Project)
+	// Best effort: a hub that cannot be written (read-only mount) still works
+	// for this run, and the checkout is registered again next time.
+	_ = s.updateRegistry(func(r *registry) bool { return r.adopt(project, path, info) })
 }
 
 func (s *Store) autocommit() bool {
@@ -373,7 +473,7 @@ func (s *Store) RecordChange(op, id string, actor Actor, detail string) error {
 
 // ForDir returns a store on the same hub with the project of dir attached.
 func (s *Store) ForDir(dir string) *Store {
-	c := &Store{Dir: s.Dir, Hub: s.Hub, Cfg: s.Cfg, Now: s.Now, gits: map[string]*gitCache{}}
+	c := &Store{Dir: s.Dir, Hub: s.Hub, Cfg: s.Cfg, Now: s.Now, gits: map[string]*gitCache{}, baselinePath: s.baselinePath, baselineRepo: s.baselineRepo, baselineRef: s.baselineRef}
 	if !s.Hub {
 		c.CodeRoot = s.CodeRoot
 		return c

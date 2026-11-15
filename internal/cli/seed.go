@@ -114,7 +114,7 @@ func (a *App) seed(from string, defaults kb.AddInput) error {
 			a.out("skipped    %q: %v\n", label, err)
 		default:
 			added++
-			a.out("added      %s [%s]\n", res.Node.ID, res.Trust.Badge())
+			a.out("added      %s [%s]\n", res.Node.ID, res.Trust.Ack())
 			for _, d := range res.DocOverlap {
 				a.out("           overlaps %s (coverage %.2f): keep only what the doc doesn't say\n", d.Section.Ref(), d.Coverage)
 			}

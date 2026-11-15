@@ -77,6 +77,14 @@ type Store struct {
 	gits     map[string]*gitCache
 	registry *registry
 
+	repoID       string                // identity of the current repo for baseline selection
+	baselinePath string                // explicit --checkout (work tree top)
+	baselineRepo string                // repository identity of baselinePath
+	baselineRef  string                // explicit --ref compared against instead of HEAD
+	coCache      map[string][]Checkout // project -> registered checkouts
+	selCache     map[string]Selection  // project+repo -> selected baseline
+	repoCache    map[string][]string   // project -> repository identities
+
 	lastTruncated int
 	docCache      map[string]*docCorpus
 }
@@ -274,7 +282,10 @@ func (s *Store) Load() error {
 }
 
 // Invalidate forces the next Load to re-read the files.
-func (s *Store) Invalidate() { s.loaded = false }
+func (s *Store) Invalidate() {
+	s.loaded = false
+	s.coCache, s.selCache, s.repoCache = nil, nil, nil
+}
 
 func (s *Store) idFor(b Bundle, path string) string {
 	rel, err := filepath.Rel(b.Dir, path)
@@ -493,6 +504,8 @@ func (s *Store) Refresh() {
 	s.loaded = false
 	s.gits = map[string]*gitCache{}
 	s.docCache = nil
+	s.registry = nil
+	s.coCache, s.selCache, s.repoCache = nil, nil, nil
 }
 
 // recordChange runs after every mutation: append to log.md, regenerate the

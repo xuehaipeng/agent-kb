@@ -2,7 +2,9 @@
 
 This document reviews the input designs, records the architecture that was
 built, and explains every deviation. Revision 2 (2026-11-08) folds in the
-user's clarified priorities; the decisions it changed are marked.
+user's clarified priorities; the decisions it changed are marked. Revision 3
+(2026-11-15) adds §2.11: rule scope per delivery surface, baseline checkout
+selection and explicit unknown code freshness.
 
 Inputs:
 
@@ -106,11 +108,13 @@ Rev 2 makes a hub the default:
 - **Scope:** default search, status and review lists cover the current
   project plus global entries whose `projects:` list is empty or includes it.
   Outside any repo (e.g. on Hermes) the default is every project. `-p` and
-  `--all` widen it.
+  `--all` widen it. This is the *discovery* scope. Rules use a narrower
+  *applicable* scope (§2.11).
 - **Staleness across projects:** a gitignored registry (`.kb/registry.json`)
   records local checkouts as `kb` runs in them, so an entry from another
   project is still checked against its own repo when that repo is on this
-  machine.
+  machine. Which checkout is used, and what happens when none can be, is in
+  §2.11.
 - **Sharing:** every write autocommits to the hub. `kb sync` does pull,
   rebase, reindex and push. Claude Code hooks pull at session start and push
   after extraction at session end, both in the background.
@@ -211,7 +215,8 @@ Rev 2 shares all three.
     change through a change hook. Project rules come from `kb rules`.
   - MCP clients: the server's `instructions`.
 
-  Output is capped at 40 rules, one line each.
+  Output is capped at 40 rules, one line each. Every surface selects rules
+  through one function with the applicable-rule scope of §2.11.
 - **Only evidence-backed rules are delivered.** A rule recorded with evidence
   (the user said so, an imported rule file, a saved memory) is applied. One an
   agent inferred on its own is listed as *proposed* in `kb rules`, `kb status`
@@ -259,6 +264,87 @@ are events scoped to the head; `kb review revise` moves the head and reopens
 the review. Rev 2 allows same-family reviews but labels them (a fresh session
 is a useful reviewer), keeping cross-family review as the stronger option.
 
+### 2.11 Rule scope, baselines and code freshness *(rev 3, issue #1 items 1 and 2A)*
+
+**Two scopes.** §2.4's all-project default is right for discovery: Hermes
+must be able to find anything. It is wrong for rules, because a rule is an
+instruction and one project's rule must not steer a session elsewhere. Rules
+therefore have their own selection (`Store.Rules`), used by every surface:
+
+| Surface | No recognized project | Recognized project |
+|---|---|---|
+| `SessionStart` rules, MCP `instructions`, plain `kb rules` | global rules with no `projects:` restriction | the project's rules + global rules that apply to it |
+| User-level Codex/Antigravity blocks | global rules with no `projects:` restriction | the same (the files are user-wide) |
+| `kb rules -p <project>` | that project's rules + global rules that apply to it | the same |
+| `kb rules --all` | every project's rules, labelled as inspection | the same |
+| search / status / review lists | every project (§2.4, unchanged) | project + applicable global (unchanged) |
+
+- A global rule restricted with `--for` is delivered only where it applies.
+  It used to leak into the user-level blocks.
+- `kb status` mixes the scopes on purpose and says so: entry counts follow
+  `scope`, `rules_delivered` follows `rules_scope`. `rules_delivered` still
+  counts applicable rules before the 40-rule cap; `rules_omitted_by_cap` is
+  separate.
+- The health brief injected at session start follows the session: project
+  plus the global entries that apply to it, or outside a project only global
+  entries with no `projects:` restriction (not the whole global bundle,
+  which discovery would select). It is at most three lines,
+  in priority order (reviews, disputes, proposed rules, stale entries, one
+  aggregate unknown-freshness line). Interactive `kb status` keeps its
+  default.
+
+**Code freshness is separate from trust and from the deadline.** Derived
+trust gains a live `code_freshness`: `unchanged`, `changed`, `unknown` or
+`not_applicable`. Before, a comparison that could not be made (anchor commit
+missing, no checkout) left `stale: false`, which read as fresh.
+
+- `stale` keeps its meaning (code changed, or past `stale_after`) and its
+  JSON name and type. `unknown` alone does not set it. Both can hold at once.
+- Ranking: one multiplier on the existing score: 0.80 when stale, 0.90 when
+  unknown, else 1.00; never both. These are initial values to revise against
+  a benchmark.
+- Unknown entries stay searchable and eligible for `--trusted`; nothing is
+  demoted or re-verified automatically.
+- It is live output only. Indexes stay deterministic (static trust).
+
+**Baseline selection.** The registry now records each checkout's repository
+identity (normalized remote) and git common directory. These and the
+preferences live in `.kb/checkouts.json`; `.kb/registry.json` keeps its
+original project-to-paths format, so an older binary on the same machine
+keeps working and cannot drop a preference when it rewrites the file. Paths
+recorded by older versions are inspected once. Updates reread, change and
+write both files under a dedicated cross-process lock (`.kb/registry.lock`);
+`checkout set`/`clear` fail when the change cannot be saved, while automatic
+registration stays best effort. For the repository an entry belongs to, the baseline is,
+in order:
+
+1. an explicit `--checkout` (and `--ref` instead of HEAD);
+2. the current checkout, when it is that repository;
+3. the checkout set with `kb project checkout set` (local, validated);
+4. the primary worktree from git's metadata, when the repository has a single
+   clone here.
+
+Anything else is `unknown` with a reason. Registration order never decides.
+The selected repository, path, commit and rule are exposed in `kb show` and
+`--json`.
+
+**Owning repository (legacy entries).** Entries don't record their repository
+yet (structured anchors are stage 2B). In a multi-repository project it is
+inferred from the anchor commit when exactly one repository contains it and
+every repository of the project could be looked in. Containment is a hint,
+not proof: forks share commits, a missing object proves nothing, a
+repository that is not checked out here may contain the commit too, and a
+commit stamped by a memory or rule import (a source id `memory-*`/`rules-*`
+whose anchor is the import event) is not used. Several matches, or a match
+with candidates that could not be checked, are settled only by `--checkout`
+or the repository kb runs in; otherwise the entry is unknown. A write from outside a multi-repository
+project records no commit.
+
+**Not done here:** structured multi-repository anchors and branch
+applicability (2B), source-only import anchors and deadlines (4A). Until 4A,
+an import into a single-repository project still records the checkout's HEAD.
+Global entries are `not_applicable`: nothing ties them to one repository.
+
 ## 3. Doc C (ChatGPT plan) review
 
 **Adopted in rev 2** (also: §2.9, repo docs as the source of truth):
@@ -296,11 +382,12 @@ is a useful reviewer), keeping cross-family review as the stronger option.
 |---|---|
 | `kb hub init / clone / import` | create, copy, or migrate into the multi-project hub |
 | `kb project [list / link <id>]` | show/list projects; map a repo to a project |
+| `kb project checkout [list / set / clear]` | this machine's checkouts; choose the baseline code is compared with |
 | `kb install claude / codex / cursor / antigravity / hermes / git-hooks [--global / --repo]` | pointer, skill, hooks (user-wide with a hub) |
 | `kb search [query] [-f path] [-p project] [--all]` | compact ranked headers with trust badges |
 | `kb show <id>` | entry with trust trail, revisions, resources, fenced body |
 | `kb add <type> <title> -d ... [-e evidence] [--global [--for ...]]` | record knowledge (`rule` = convention) |
-| `kb rules [import]` | always-on rules for this scope; share rule files written for one agent |
+| `kb rules [-p project / --all] [import]` | the rules that apply here (§2.11); share rule files written for one agent |
 | `kb update <id> -m <why> [...] [-e evidence]` | new revision of an entry |
 | `kb verify <id> --confirm / --dispute -e ...` | record a check (any agent) |
 | `kb deprecate <id> -m ...`, `kb resolve` (human) | retire or decide |

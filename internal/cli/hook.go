@@ -45,17 +45,16 @@ func (a *App) cmdHook(args []string) int {
 		if err != nil {
 			me = kb.Actor{Producer: "claude-code"}
 		}
-		// Rules are pushed into the session; everything else is pulled.
+		// Rules are pushed into the session; everything else is pulled. Both
+		// the rules and the brief follow the session's project: outside any
+		// project that is the global scope only, never every project.
 		if rs, err := s.Rules(nil, false); err == nil {
 			if out := s.RenderRules(rs, false); out != "" {
 				fmt.Fprint(a.Stdout, out)
 			}
 		}
-		r, err := s.Status(me)
-		if err == nil {
-			if b := r.Brief(); b != "" {
-				fmt.Fprintln(a.Stdout, b)
-			}
+		if b := s.SessionBrief(me); b != "" {
+			fmt.Fprintln(a.Stdout, b)
 		}
 		// Hub: pull what other machines (e.g. Hermes) recorded, in the background.
 		if s.Hub && hasOrigin(s) && os.Getenv(extract.GuardEnv) == "" {

@@ -18,7 +18,7 @@ import (
 // Version is reported in serverInfo.
 var Version = "dev"
 
-const baseInstructions = "Shared knowledge across agents and projects. Follow the rules below. Call kb_search before working on unfamiliar code; unverified/disputed/stale entries are leads to check. Record durable lessons with kb_add (pass evidence when you have it; type convention for rules the user states); fix stale or wrong entries with kb_update."
+const baseInstructions = "Shared knowledge across agents and projects. Follow the rules below. Call kb_search before working on unfamiliar code; unverified/disputed/stale entries are leads to check, and unknown-freshness means the code could not be compared on this machine (not a pass). Record durable lessons with kb_add (pass evidence when you have it; type convention for rules the user states); fix stale or wrong entries with kb_update."
 
 // Server handles one stdio session.
 type Server struct {
@@ -97,6 +97,9 @@ func (s *Server) handle(req request) {
 			version = "2025-06-18"
 		}
 		instructions := baseInstructions
+		// The rules that apply where the server runs: the project of its
+		// working directory plus global, or outside a project only the
+		// global rules that apply everywhere.
 		if rs, err := s.Store.Rules(nil, false); err == nil {
 			if r := s.Store.RenderRules(rs, false); r != "" {
 				instructions += "\n\n" + r
@@ -304,7 +307,7 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%s updated to revision %d [%s]\n", n.ID, t.Revision, t.Badge()), nil
+		return fmt.Sprintf("%s updated to revision %d [%s]\n", n.ID, t.Revision, t.Ack()), nil
 	case "kb_verify":
 		var a struct{ ID, Result, Evidence string }
 		if err := json.Unmarshal(orEmpty(raw), &a); err != nil {
@@ -318,7 +321,7 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
-		return fmt.Sprintf("%s is now %s\n", n.ID, t.Badge()), nil
+		return fmt.Sprintf("%s is now %s\n", n.ID, t.Ack()), nil
 	case "kb_review":
 		return s.review(raw)
 	}
@@ -383,7 +386,7 @@ func (s *Server) review(raw json.RawMessage) (string, error) {
 // AddSummary renders the result of an add for agents.
 func AddSummary(res *kb.AddResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "added %s [%s]\n", res.Node.ID, res.Trust.Badge())
+	fmt.Fprintf(&b, "added %s [%s]\n", res.Node.ID, res.Trust.Ack())
 	if !res.Trust.Trusted() {
 		fmt.Fprintf(&b, "recorded as a lead: add -e \"<how you know>\" when you have evidence, or another agent can 'kb verify' it\n")
 	}

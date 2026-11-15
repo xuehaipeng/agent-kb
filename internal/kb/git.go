@@ -41,8 +41,9 @@ type gitCache struct {
 	ok      bool
 	top     string
 	head    string
-	changed map[string][]string // commit -> files changed between commit and HEAD
-	bad     map[string]bool     // commits that cannot be resolved
+	changed map[string][]string // "commit..target" -> files changed between them
+	bad     map[string]bool     // comparisons that cannot be made
+	revs    map[string]string   // rev -> short commit ("" when it does not resolve)
 	files   []string            // tracked files (lazy)
 }
 
@@ -55,7 +56,7 @@ func (s *Store) gitFor(root string) *gitCache {
 	if g, ok := s.gits[root]; ok {
 		return g
 	}
-	g := &gitCache{changed: map[string][]string{}, bad: map[string]bool{}}
+	g := &gitCache{changed: map[string][]string{}, bad: map[string]bool{}, revs: map[string]string{}}
 	if root != "" {
 		if top, err := Git(root, "rev-parse", "--show-toplevel"); err == nil {
 			g.ok = true
@@ -74,12 +75,36 @@ func (s *Store) gitc() *gitCache { return s.gitFor(s.CodeRoot) }
 // HeadCommit returns the short HEAD commit of the current work tree, or "".
 func (s *Store) HeadCommit() string { return s.gitc().head }
 
-// headFor returns the HEAD of the work tree a project's resources refer to.
+// headFor returns the commit recorded with a write to project: the HEAD of
+// the work tree its resources refer to, or "" when that is not established.
 func (s *Store) headFor(project string) string {
 	if s.Hub && project == GlobalProject {
 		return ""
 	}
-	return s.gitFor(s.CheckoutFor(project)).head
+	return s.gitFor(s.anchorCheckoutFor(project)).head
+}
+
+// resolveIn resolves a ref or commit to a short commit in a work tree.
+func (s *Store) resolveIn(root, rev string) (string, bool) {
+	g := s.gitFor(root)
+	if !g.ok || rev == "" {
+		return "", false
+	}
+	if c, hit := g.revs[rev]; hit {
+		return c, c != ""
+	}
+	c, err := Git(root, "rev-parse", "--verify", "--quiet", "--short=12", rev+"^{commit}")
+	if err != nil {
+		c = ""
+	}
+	g.revs[rev] = c
+	return c, c != ""
+}
+
+// commitIn reports whether a work tree's repository contains commit.
+func (s *Store) commitIn(root, commit string) bool {
+	_, ok := s.resolveIn(root, commit)
+	return ok
 }
 
 // InGit reports whether the current work tree is a git repository.
@@ -91,25 +116,25 @@ func (s *Store) GitTop() string { return s.gitc().top }
 // ChangedSince lists files that differ between commit and HEAD in the
 // current work tree. ok is false when the commit is unknown.
 func (s *Store) ChangedSince(commit string) ([]string, bool) {
-	return s.changedIn(s.CodeRoot, commit)
+	return s.changedIn(s.CodeRoot, commit, "HEAD")
 }
 
-// changedSinceFor is ChangedSince in the work tree of a node's project.
-func (s *Store) changedSinceFor(n *Node, commit string) ([]string, bool) {
-	return s.changedIn(s.codeRootFor(n), commit)
-}
-
-func (s *Store) changedIn(root, commit string) ([]string, bool) {
+// changedIn lists files that differ between commit and target in a work
+// tree. ok is false when the comparison cannot be made (no repository, or
+// either side does not resolve there): the answer is unknown, not "nothing
+// changed".
+func (s *Store) changedIn(root, commit, target string) ([]string, bool) {
 	g := s.gitFor(root)
-	if !g.ok || g.head == "" || commit == "" || g.bad[commit] {
+	key := commit + ".." + target
+	if !g.ok || g.head == "" || commit == "" || g.bad[key] {
 		return nil, false
 	}
-	if f, hit := g.changed[commit]; hit {
+	if f, hit := g.changed[key]; hit {
 		return f, true
 	}
-	out, err := Git(root, "diff", "--name-only", commit, "HEAD", "--")
+	out, err := Git(root, "diff", "--name-only", commit, target, "--")
 	if err != nil {
-		g.bad[commit] = true
+		g.bad[key] = true
 		return nil, false
 	}
 	var list []string
@@ -118,7 +143,7 @@ func (s *Store) changedIn(root, commit string) ([]string, bool) {
 			list = append(list, l)
 		}
 	}
-	g.changed[commit] = list
+	g.changed[key] = list
 	return list, true
 }
 

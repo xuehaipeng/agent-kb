@@ -50,11 +50,48 @@ type Trust struct {
 	Disputers    []string
 	SupersededBy string
 	Anchor       string // commit the current revision was last confirmed (or written) at
+
+	// Live output only (empty in static trust, e.g. for index.md). Stale
+	// stays the legacy "needs a look" flag: past its deadline or code changed.
+	Overdue         bool      // past stale_after
+	CodeFreshness   string    // Fresh*: unchanged | changed | unknown | not_applicable
+	FreshnessCode   string    // Unknown* code when CodeFreshness is unknown
+	FreshnessReason string    // why it is changed or unknown
+	Baseline        *Baseline // what the code was compared against
+
+	importAnchor bool // the anchor was stamped by a memory/rule import
 }
 
-// Badge renders the compact trust label used in search results.
+// Badge renders the compact label used in search results: evidence state,
+// then code freshness, then "stale" when the entry needs a look (code
+// changed or past its deadline). "unknown-freshness" means the code could
+// not be compared on this machine; it is not a pass.
 func (t Trust) Badge() string {
 	b := t.State
+	switch t.CodeFreshness {
+	case FreshUnchanged:
+		b += ",code-unchanged"
+	case FreshChanged:
+		b += ",code-changed"
+	case FreshUnknown:
+		b += ",unknown-freshness"
+	case FreshNotApplicable:
+		b += ",code-not-applicable"
+	}
+	if t.Stale {
+		b += ",stale"
+	}
+	return b
+}
+
+// Ack is the label in a write acknowledgement ("added X [verified]"): what
+// the write established. Code freshness is named only when it is unknown,
+// because then no commit could be recorded or compared for the entry.
+func (t Trust) Ack() string {
+	b := t.State
+	if t.CodeFreshness == FreshUnknown {
+		b += ",unknown-freshness"
+	}
 	if t.Stale {
 		b += ",stale"
 	}
@@ -107,6 +144,11 @@ func (s *Store) trust(n *Node, sup map[string]string, dynamic bool) Trust {
 	rev := m.Rev()
 	author := ContentAuthor(m)
 	t := Trust{State: StateUnverified, Revision: rev, Anchor: author.Commit}
+	// Whether the anchor still comes from the write that created the entry
+	// (its generation event, or the confirmation 'kb add -e' records with it)
+	// rather than from a later check or update.
+	fromAdd := func(e okf.Event) bool { return e.By == m.Generated.By && e.At == m.Generated.At }
+	anchorFromAdd := rev == 1 && fromAdd(author)
 	authorFam := s.Cfg.FamilyOf(author.By)
 
 	// Events on the current revision, in order. The latest dispute (if any)
@@ -127,7 +169,7 @@ func (s *Store) trust(n *Node, sup map[string]string, dynamic bool) Trust {
 	}
 	confirmers := map[string]bool{}
 	human, cross := false, false
-	for _, e := range events[lastDispute+1:] {
+	for i, e := range events[lastDispute+1:] {
 		if e.Result != "" && e.Result != ResultConfirmed {
 			continue
 		}
@@ -141,8 +183,16 @@ func (s *Store) trust(n *Node, sup map[string]string, dynamic bool) Trust {
 		}
 		if e.Commit != "" {
 			t.Anchor = e.Commit
+			// Only the first event of revision 1 can be the one Add wrote. A
+			// later confirmation is a real check even by the same actor, at
+			// the same commit, in the same second.
+			anchorFromAdd = rev == 1 && lastDispute+1+i == 0 && fromAdd(e)
 		}
 	}
+	// An import stamps whatever HEAD the chosen checkout had at import time:
+	// that commit says nothing about where the claim was checked. A later
+	// check by anyone (or an update) replaces it with a real anchor.
+	t.importAnchor = importedSource(m) && anchorFromAdd
 	t.Confirmers = sortedKeys(confirmers)
 	t.Disputers = sortedKeys(disputers)
 	lastIsDispute := len(events) > 0 && events[len(events)-1].Result == ResultDisputed
@@ -166,23 +216,33 @@ func (s *Store) trust(n *Node, sup map[string]string, dynamic bool) Trust {
 	if dynamic && t.State != StateDeprecated {
 		if m.StaleAfter != "" {
 			if ts, err := parseTime(m.StaleAfter); err == nil && s.Now().After(ts) {
+				t.Overdue = true
 				t.Stale = true
 				t.StaleReason = "past stale_after " + ts.Format("2006-01-02")
 			}
 		}
-		if !t.Stale && len(m.Resources) > 0 && t.Anchor != "" {
-			if files, ok := s.changedSinceFor(n, t.Anchor); ok {
-				for _, f := range files {
-					if MatchAny(m.Resources, f) {
-						t.Stale = true
-						t.StaleReason = fmt.Sprintf("code changed since %s: %s", short(t.Anchor), f)
-						break
-					}
-				}
+		// The deadline and the code check are independent: an overdue entry
+		// can also have changed or uncheckable code, and both are reported.
+		t.CodeFreshness, t.FreshnessCode, t.FreshnessReason, t.Baseline = s.codeFreshness(n, t.Anchor, t.importAnchor)
+		if t.CodeFreshness == FreshChanged {
+			if !t.Stale {
+				t.StaleReason = t.FreshnessReason
 			}
+			t.Stale = true
 		}
 	}
 	return t
+}
+
+// importedSource reports whether an entry came from a memory or rule-file
+// import (kb extract --scan memories, kb rules import).
+func importedSource(m *okf.Meta) bool {
+	for _, src := range m.Sources {
+		if strings.HasPrefix(src.ID, "memory-") || strings.HasPrefix(src.ID, "rules-") {
+			return true
+		}
+	}
+	return false
 }
 
 // ReviewState derives the state of a review packet: the latest verdict on

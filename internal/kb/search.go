@@ -211,10 +211,21 @@ func trustWeight(t Trust) float64 {
 	case StateDeprecated:
 		w = 0.3
 	}
-	if t.Stale {
-		w *= 0.8
+	return w * freshnessWeight(t)
+}
+
+// freshnessWeight is applied once on top of the trust weight. These are
+// initial policy values, not measured optima: an entry that needs a look
+// (code changed or past its deadline) ranks below one whose code could not
+// be compared, which ranks below one that was compared and holds.
+func freshnessWeight(t Trust) float64 {
+	switch {
+	case t.Stale:
+		return 0.8
+	case t.CodeFreshness == FreshUnknown:
+		return 0.9
 	}
-	return w
+	return 1
 }
 
 var stopwords = map[string]bool{
