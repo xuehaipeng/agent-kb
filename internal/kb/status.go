@@ -193,7 +193,7 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 			native.native = s.nativeRuleIDs()
 		}
 		d := s.planDelivery(SurfaceSessionStart, SessionStartBudget, "", *planRules, brief, native)
-		d.Text, d.IDs = "", nil
+		d.Text, d.IDs, d.NativeIDs = "", nil, nil
 		r.Delivery, r.RulesOmitted = &d, d.Omitted()
 	}
 	return r, nil

@@ -1655,8 +1655,14 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	file("docs/extra.md", "Run the linter before every commit.\n\n@../CLAUDE.md\n")
 	file("AGENTS.md", "Agents file content that Codex reads natively.\n")
 	file("CLAUDE.md", "# Project\n\n<!-- maintainer note: do not\n   ship this comment -->\nAlways write a changelog entry.\n\nSee @docs/extra.md and @AGENTS.md, and @types/node is a package, not a file.\n\n```html\n<!-- kept: this comment is inside a code block -->\n```\n\nSecrets: @~/outside.md\n")
+	// A four-backtick block showing Markdown with its own fences: the inner
+	// fences do not end it, so nothing inside is an import or a comment.
+	file("docs/example.md", "Example content that is only an illustration.\n")
+	file(".claude/rules/fences.md", "Document commands in fenced blocks.\n\n````markdown\n```sh\nmake test\n```\nSee @docs/example.md\n<!-- kept: a comment inside the outer block -->\n~~~\nstill inside\n````\n\n<!-- dropped: a comment after the block -->\nKeep examples short.\n")
 	file("CLAUDE.local.md", "My sandbox URL is private.\n")
 	file("packages/web/CLAUDE.md", "Web components use CSS modules.\n")
+	// A path git would quote in its default output.
+	file("packages/界面/CLAUDE.md", "Interface strings come from the message catalogue.\n")
 	os.WriteFile(filepath.Join(home, "outside.md"), []byte("Content outside the repository that must not be imported.\n"), 0o644)
 	os.WriteFile(filepath.Join(home, "shared-rule.md"), []byte("A rule that lives outside the repository.\n"), 0o644)
 	os.Symlink(filepath.Join(home, "shared-rule.md"), filepath.Join(repo, ".claude", "rules", "linked.md"))
@@ -1721,13 +1727,24 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if strings.Count(p, "Always write a changelog entry.") != 1 {
 		t.Errorf("an import cycle included the file twice:\n%s", p)
 	}
+	fences := read("rules-fences.md")
+	for _, want := range []string{"See @docs/example.md", "<!-- kept: a comment inside the outer block -->", "still inside", "Keep examples short."} {
+		if !strings.Contains(fences, want) {
+			t.Errorf("a nested fence ended the outer code block (%q missing):\n%s", want, fences)
+		}
+	}
+	for _, not := range []string{"only an illustration", "dropped: a comment after the block"} {
+		if strings.Contains(fences, not) {
+			t.Errorf("fence tracking: the prompt must not contain %q:\n%s", not, fences)
+		}
+	}
 	if api := read("rules-api.md"); strings.Contains(api, "paths:") || !strings.Contains(api, "Validate every API handler input") {
 		t.Errorf("frontmatter must not reach the model:\n%s", api)
 	}
 
 	// Always-on delivery has the unconditional rules only.
 	rules := must(t, "codex", "rules", "-q")
-	for _, want := range []string{"Rule from rules-general.md", "Rule from aiproxy-CLAUDE.md", "(+3 rule(s) apply only to particular files"} {
+	for _, want := range []string{"Rule from rules-general.md", "Rule from aiproxy-CLAUDE.md", "(+4 rule(s) apply only to particular files"} {
 		if !strings.Contains(rules, want) {
 			t.Errorf("kb rules lacks %q:\n%s", want, rules)
 		}
@@ -1747,6 +1764,7 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 		"src/ui/Button.tsx":       "Rule from frontend-styles.md",
 		"README.md":               "Rule from frontend-styles.md",
 		"packages/web/src/a.css":  "Rule from web-CLAUDE.md",
+		"packages/界面/src/a.css":   "Rule from 界面-CLAUDE.md",
 	} {
 		if got := forFile(path); !strings.Contains(got, want) {
 			t.Errorf("kb rules -f %s lacks %q:\n%s", path, want, got)
@@ -1781,6 +1799,29 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if out := must(t, "codex", "search", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts"); !strings.Contains(out, "rule for packages/web/src/a.css only: Rule from web-CLAUDE.md") || !strings.Contains(out, "rule for src/api/users/create.ts only: Rule from rules-api.md") {
 		t.Errorf("search by two files must say which file each rule is for:\n%s", out)
 	}
+	// JSON output carries the same rules, with what they are limited to.
+	var found []struct {
+		ID        string `json:"id"`
+		Kind      string `json:"kind"`
+		AppliesTo struct {
+			Paths []string `json:"paths"`
+			Base  string   `json:"base"`
+		} `json:"applies_to"`
+		RuleFor []string `json:"rule_for"`
+	}
+	if err := json.Unmarshal([]byte(must(t, "codex", "search", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts", "--json")), &found); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]int{}
+	for i, h := range found {
+		byID[h.ID] = i + 1
+	}
+	if i := byID["aiproxy/conventions/rule-from-web-claude-md"]; i == 0 || found[i-1].Kind != "rule" || found[i-1].AppliesTo.Base != "packages/web" || len(found[i-1].RuleFor) != 1 || found[i-1].RuleFor[0] != "packages/web/src/a.css" {
+		t.Errorf("JSON search by file lacks the rule for the web package, or its scope: %+v", found)
+	}
+	if i := byID["aiproxy/conventions/rule-from-rules-api-md"]; i == 0 || len(found[i-1].AppliesTo.Paths) != 1 || found[i-1].AppliesTo.Paths[0] != "src/api/**/*.ts" || len(found[i-1].RuleFor) != 1 || found[i-1].RuleFor[0] != "src/api/users/create.ts" {
+		t.Errorf("JSON search by file lacks the API rule, or its scope: %+v", found)
+	}
 	show := must(t, "codex", "show", "aiproxy/conventions/rule-from-web-claude-md")
 	if !strings.Contains(show, "conditional rule: applies only when working on ** under packages/web/") {
 		t.Errorf("nested CLAUDE.md should be conditional on its directory:\n%s", show)
@@ -1790,7 +1831,7 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 		Conditional int `json:"rules_conditional"`
 	}
 	json.Unmarshal([]byte(must(t, "codex", "status", "--json")), &st)
-	if st.Rules != 2 || st.Conditional != 3 {
+	if st.Rules != 3 || st.Conditional != 4 {
 		t.Errorf("status: %+v", st)
 	}
 	// A rule can be recorded as conditional by hand too.
@@ -2581,6 +2622,17 @@ func TestAccessStatisticsAreOnlyASignal(t *testing.T) {
 	must(t, "codex", "rules", "-q", "--all") // every project at once is an inspection
 	if n := delivered(pnpmRule); n != 3 {
 		t.Errorf("listing every project's rules is not a delivery: delivered %d, want 3", n)
+	}
+	// With the managed rules file in use, SessionStart leaves the universal
+	// rules to it. The agent still receives them, and they are counted.
+	const englishRule = "global/conventions/write-commit-messages-in-english"
+	englishBefore := delivered(englishRule)
+	hook, _, _ := kbRun(t, "claude-code", `{"session_id":"acc2","hook_event_name":"SessionStart","cwd":"`+aiproxy+`"}`, "hook", "claude")
+	if strings.Contains(hook, "Write commit messages in English") {
+		t.Fatalf("the test needs the universal rule to come from the managed file, not the hook:\n%s", hook)
+	}
+	if n := delivered(englishRule); n != englishBefore+1 {
+		t.Errorf("a rule the managed rules file delivers is delivered: %d, want %d", n, englishBefore+1)
 	}
 	out := must(t, "codex", "status", "--access")
 	for _, want := range []string{"a maintenance signal for this machine only", "never retrieved on this machine", learning + ": last ", "listed 2, shown 1, delivered 0"} {

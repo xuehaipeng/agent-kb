@@ -286,8 +286,10 @@ func globRegexp(p string) (*regexp.Regexp, error) {
 			if strings.Contains(class, "/") {
 				return nil, fmt.Errorf("bracket expression contains '/'")
 			}
-			if strings.HasPrefix(class, "!") {
-				class = "^" + class[1:]
+			// A bracket expression stays within one path segment, like
+			// "*" and "?": a negated one must not match "/" either.
+			if strings.HasPrefix(class, "!") || strings.HasPrefix(class, "^") {
+				class = "^/" + class[1:]
 			}
 			b.WriteString("[" + strings.ReplaceAll(class, `\`, `\\`) + "]")
 			i = end
