@@ -488,7 +488,9 @@ applies_to:
 - Patterns follow Claude Code's documented rule syntax: `**` crosses
   directories; a bare name matches at any depth; a leading `/` anchors to the
   base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work,
-  and a bracket expression, negated or not, stays within one path segment. A
+  and a bracket expression, negated or not, stays within one path segment
+  (one whose range takes in `/`, such as `[.-0]`, is refused), and `\`
+  inside brackets makes the next character literal (`[a\-z]`). A
   pattern that cannot be matched exactly is an error and matches nothing. It
   is never widened.
 
@@ -502,6 +504,7 @@ applies_to:
 | a pattern kb cannot match exactly | not imported |
 | Cursor rule that is not `alwaysApply: true`, other agents' `globs`/`trigger` | not imported: kb cannot reproduce that condition |
 | `CLAUDE.local.md` | not imported: personal, uncommitted instructions stay private |
+| an `@path` import of `CLAUDE.local.md`, or of a file git ignores | not followed, for the same reason |
 | a link or `@path` import leaving the repository (or `~/.claude` for user files) | not followed |
 | a repository instruction file that is itself a link to somewhere outside it (a nested `CLAUDE.md` included) | not imported |
 | `@AGENTS.md` | not followed: other agents read it natively |
@@ -512,15 +515,32 @@ to it (a link back to the directory or an ancestor ends there). `@path`
 imports are followed up to
 four hops, once each (cycles end), only to existing files, and never inside
 code spans or fences. Block-level HTML comments are dropped, except inside
-code blocks. A fenced block ends only at a fence of the same character that
+code blocks. Inline code is delimited as Markdown does it, by backtick runs
+of equal length. A fenced block ends only at a fence of the same character that
 is at least as long, so a block that shows Markdown with its own fences
 stays one block. Everything left out is listed as a `note:` line.
 
 **The condition is part of what was imported.** A file's condition lives in
 frontmatter (or in where the file is), not in the text sent to the model, so
-the import's change detection covers both. When only the condition changes,
-the rules the file gave earlier (found by their `sources`) take the new
-condition as a new revision; a rule that was in force stays in force.
+the import's change detection covers both. When the condition changes, the
+rules the file gave earlier (found by their `sources`) are named in the
+prompt, and each one the file still states takes the new condition as a new
+revision; a rule that was in force stays in force. A rule the file no longer
+states keeps the condition it has: a file that drops its `paths` and
+replaces its text does not make its old, narrower rule apply everywhere.
+Two cases never widen a rule. A file that was emptied states no condition,
+so the rules it gave keep theirs. A file whose condition becomes one kb
+cannot reproduce (an always-on Cursor rule given `globs`, a pattern that
+cannot be matched exactly) is no longer imported, and the rules it gave
+earlier are retired, with the reason, instead of staying in force more
+widely than the file now says. Fixing the file and importing again adds
+them back.
+
+**A rule two files state belongs to both.** When a file adds nothing because
+an existing rule already says it, the import remembers which rule it relied
+on. If that rule is later narrowed or retired for its own file's sake, the
+files that relied on it are read again (in the same run), so the rule stays
+in force wherever another file still states it.
 
 **A rule repeats another only where that one is already delivered.** The
 same instruction in `packages/web/CLAUDE.md` and `packages/api/CLAUDE.md` is

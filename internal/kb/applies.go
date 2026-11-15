@@ -288,10 +288,49 @@ func globRegexp(p string) (*regexp.Regexp, error) {
 			}
 			// A bracket expression stays within one path segment, like
 			// "*" and "?": a negated one must not match "/" either.
-			if strings.HasPrefix(class, "!") || strings.HasPrefix(class, "^") {
-				class = "^/" + class[1:]
+			negated := strings.HasPrefix(class, "!") || strings.HasPrefix(class, "^")
+			if negated {
+				class = class[1:]
 			}
-			b.WriteString("[" + strings.ReplaceAll(class, `\`, `\\`) + "]")
+			// Inside brackets "\" makes the next character literal ("\-" is
+			// a hyphen, not a range), and the characters that mean something
+			// to the regular expression but not to a glob are literal too.
+			var set strings.Builder
+			cr := []rune(class)
+			for k := 0; k < len(cr); k++ {
+				ch := cr[k]
+				lit := false
+				if ch == '\\' && k+1 < len(cr) {
+					k++
+					ch, lit = cr[k], true
+				} else if ch == '\\' {
+					lit = true
+				}
+				switch {
+				case lit && (ch == '-' || ch == ']' || ch == '[' || ch == '^' || ch == '\\'):
+					set.WriteString(`\` + string(ch))
+				case !lit && (ch == '[' || ch == '^' || ch == ']'):
+					set.WriteString(`\` + string(ch))
+				default:
+					set.WriteRune(ch)
+				}
+			}
+			expr := "[" + set.String() + "]"
+			if negated {
+				expr = "[^/" + set.String() + "]"
+			}
+			// A range can take in "/" without naming it ("[.-0]"). Such an
+			// expression cannot stay within a segment, so it is refused.
+			if !negated {
+				one, err := regexp.Compile("^" + expr + "$")
+				if err != nil {
+					return nil, fmt.Errorf("unsupported bracket expression: %v", err)
+				}
+				if one.MatchString("/") {
+					return nil, fmt.Errorf("bracket expression [%s] includes '/' in a range", class)
+				}
+			}
+			b.WriteString(expr)
 			i = end
 		default:
 			b.WriteString(regexp.QuoteMeta(string(c)))
