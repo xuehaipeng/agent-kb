@@ -522,6 +522,13 @@ frontmatter (or in where the file is), not in the text sent to the model, so
 the import's change detection covers both. When only the condition changes,
 the rules the file gave earlier (found by their `sources`) take the new
 condition as a new revision; a rule that was in force stays in force.
+Two cases never widen a rule. A file that was emptied states no condition,
+so the rules it gave keep theirs. A file whose condition becomes one kb
+cannot reproduce (an always-on Cursor rule given `globs`, a pattern that
+cannot be matched exactly) is no longer imported, and the rules it gave
+earlier are retired, with the reason, instead of staying in force more
+widely than the file now says. Fixing the file and importing again adds
+them back.
 
 **A rule repeats another only where that one is already delivered.** The
 same instruction in `packages/web/CLAUDE.md` and `packages/api/CLAUDE.md` is

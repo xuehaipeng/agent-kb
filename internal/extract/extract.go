@@ -294,6 +294,8 @@ type Result struct {
 	// Rescoped: rules from a file whose condition changed, now limited the
 	// way the file says.
 	Rescoped []string
+	// Retired: rules from a file that can no longer be imported.
+	Retired []string
 }
 
 type state struct {

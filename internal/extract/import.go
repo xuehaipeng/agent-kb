@@ -44,6 +44,11 @@ type FileSource struct {
 	Prepared bool
 	// Applies makes every rule from this file conditional on matching files.
 	Applies *okf.Applicability
+	// Unsupported: the file has a condition kb cannot reproduce, so nothing
+	// is imported from it. It is still a source: rules it gave earlier,
+	// when it had no such condition, must not go on applying more widely
+	// than the file now says.
+	Unsupported string
 }
 
 // ImportOptions controls an import run.
@@ -75,6 +80,15 @@ var kbBlockRe = regexp.MustCompile(`(?s)<!-- kb:begin.*?<!-- kb:end -->\n?`)
 // ImportFile turns a memory or rule file into knowledge entries.
 func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	res := &Result{}
+	if src.Unsupported != "" {
+		res.Skipped = "not imported"
+		if o.DryRun {
+			return res, nil
+		}
+		retired, err := retireFrom(s, src, o)
+		res.Retired = retired
+		return res, err
+	}
 	data, err := os.ReadFile(src.Path)
 	if err != nil {
 		return nil, err
@@ -106,7 +120,23 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		res.Skipped = "not in the selected projects"
 		return res, nil
 	}
-	srcID := src.Kind + "-" + kb.Slugify(src.Agent.Producer)
+	srcID := sourceID(src)
+	minLen := minImportContentLen
+	if src.Prepared {
+		// Frontmatter and comments are already gone: a one-line rule file
+		// is a whole rule, not noise.
+		minLen = 10
+	}
+	if len(content) < minLen {
+		// An emptied file states no rules and no condition. The rules it
+		// gave earlier keep the condition they have: taking "no condition"
+		// from a file with nothing in it would make them apply everywhere.
+		res.Skipped = "nothing to import"
+		if !o.DryRun {
+			return res, saveHash(s, abs, hash)
+		}
+		return res, nil
+	}
 	if src.Kind == KindRules && !o.DryRun {
 		// The file says which files its rules are for. Rules it gave
 		// earlier follow a changed condition before anything is added.
@@ -115,19 +145,6 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 			return nil, err
 		}
 		res.Rescoped = rescoped
-	}
-	minLen := minImportContentLen
-	if src.Prepared {
-		// Frontmatter and comments are already gone: a one-line rule file
-		// is a whole rule, not noise.
-		minLen = 10
-	}
-	if len(content) < minLen {
-		res.Skipped = "nothing to import"
-		if !o.DryRun {
-			return res, saveHash(s, abs, hash)
-		}
-		return res, nil
 	}
 	prompt := importPrompt(s, src, content)
 	if filtered {
@@ -248,27 +265,66 @@ func importHash(content string, applies *okf.Applicability) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// reconcileApplies gives the rules a file produced earlier the condition
-// the file has now. It returns the entries it changed.
-func reconcileApplies(s *kb.Store, src FileSource, srcID string, o ImportOptions) ([]string, error) {
+// sourceID names a file's kind and agent on the entries it gives.
+func sourceID(src FileSource) string { return src.Kind + "-" + kb.Slugify(src.Agent.Producer) }
+
+// rulesFrom lists the rules in force that a file gave earlier.
+func rulesFrom(s *kb.Store, src FileSource, o ImportOptions) ([]*kb.Node, error) {
 	nodes, err := s.Nodes()
 	if err != nil {
 		return nil, err
 	}
-	resource := displayPath(src.Path)
-	var stale []*kb.Node
+	id, resource := sourceID(src), displayPath(src.Path)
+	var out []*kb.Node
 	for _, n := range nodes {
-		if !s.Cfg.AlwaysOn(n.TypeKey) || s.Trust(n).State == kb.StateDeprecated || kb.SameApplies(n.Meta().AppliesTo, src.Applies) {
+		if !s.Cfg.AlwaysOn(n.TypeKey) || s.Trust(n).State == kb.StateDeprecated {
 			continue
 		}
 		if len(o.Projects) > 0 && !o.wants(n.Project) {
 			continue
 		}
 		for _, from := range n.Meta().Sources {
-			if from.ID == srcID && from.Resource == resource {
-				stale = append(stale, n)
+			if from.ID == id && from.Resource == resource {
+				out = append(out, n)
 				break
 			}
+		}
+	}
+	return out, nil
+}
+
+// retireFrom retires the rules a file gave earlier, now that the file has
+// a condition kb cannot reproduce. Keeping them would apply them where the
+// file no longer says they apply; kb cannot narrow them the same way, so
+// they stop being delivered. It returns the entries it retired.
+func retireFrom(s *kb.Store, src FileSource, o ImportOptions) ([]string, error) {
+	rules, err := rulesFrom(s, src, o)
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, n := range rules {
+		reason := "its rule file (" + displayPath(src.Path) + ") now has a condition kb cannot reproduce: " + src.Unsupported
+		if _, err := s.Deprecate(n.ID, reason, src.Agent); err != nil {
+			return out, fmt.Errorf("%s: %w", n.ID, err)
+		}
+		out = append(out, n.ID)
+	}
+	return out, nil
+}
+
+// reconcileApplies gives the rules a file produced earlier the condition
+// the file has now. It returns the entries it changed.
+func reconcileApplies(s *kb.Store, src FileSource, srcID string, o ImportOptions) ([]string, error) {
+	rules, err := rulesFrom(s, src, o)
+	if err != nil {
+		return nil, err
+	}
+	resource := displayPath(src.Path)
+	var stale []*kb.Node
+	for _, n := range rules {
+		if !kb.SameApplies(n.Meta().AppliesTo, src.Applies) {
+			stale = append(stale, n)
 		}
 	}
 	var date time.Time
@@ -522,6 +578,11 @@ func ImportAll(s *kb.Store, srcs []FileSource, o ImportOptions) []string {
 		switch {
 		case err != nil:
 			report = append(report, fmt.Sprintf("%s: error: %v", label, err))
+		case src.Unsupported != "":
+			// Why it is not imported is already in the notes.
+			if len(r.Retired) > 0 {
+				report = append(report, fmt.Sprintf("%s: it can no longer be imported, so %d rule(s) it gave earlier were retired instead of staying in force more widely than the file says %v", label, len(r.Retired), r.Retired))
+			}
 		case r.Skipped != "":
 			report = append(report, fmt.Sprintf("%s: skipped (%s)", label, r.Skipped))
 		case o.DryRun:
@@ -533,7 +594,7 @@ func ImportAll(s *kb.Store, srcs []FileSource, o ImportOptions) []string {
 			report = append(report, fmt.Sprintf("%s: its condition changed; %d rule(s) follow it %v", label, len(r.Rescoped), r.Rescoped))
 		}
 	}
-	if len(report) == 0 {
+	if len(report) == 0 && len(srcs) == 0 {
 		report = append(report, "no files found")
 	}
 	return report

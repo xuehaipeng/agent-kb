@@ -1649,6 +1649,7 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	file(".claude/rules/broken.md", "---\npaths: [src/**\n  oops: : :\n---\nThis rule has frontmatter that does not parse.\n")
 	file(".claude/rules/badglob.md", "---\npaths:\n  - \"photos [2024/**\"\n---\nThis rule has a pattern that cannot be matched exactly.\n")
 	file(".cursor/rules/attached.mdc", "---\ndescription: only when attached\nglobs: src/**/*.go\n---\nPrefer table-driven tests in Go files.\n")
+	file(".cursor/rules/always.mdc", "---\nalwaysApply: true\n---\nReturn early instead of nesting conditions.\n")
 	file("docs/extra.md", "Run the linter before every commit.\n\n@../CLAUDE.md\n")
 	file("AGENTS.md", "Agents file content that Codex reads natively.\n")
 	file("CLAUDE.md", "# Project\n\n<!-- maintainer note: do not\n   ship this comment -->\nAlways write a changelog entry.\n\nSee @docs/extra.md and @AGENTS.md, and @types/node is a package, not a file.\n\n```html\n<!-- kept: this comment is inside a code block -->\n```\n\nSecrets: @~/outside.md\n\nMine: @CLAUDE.local.md and @notes/private.md\n")
@@ -1834,7 +1835,7 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 		Conditional int `json:"rules_conditional"`
 	}
 	json.Unmarshal([]byte(must(t, "codex", "status", "--json")), &st)
-	if st.Rules != 3 || st.Conditional != 4 {
+	if st.Rules != 4 || st.Conditional != 4 {
 		t.Errorf("status: %+v", st)
 	}
 	// A rule can be recorded as conditional by hand too.
@@ -1909,6 +1910,46 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	}
 	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); strings.Contains(out, "condition changed") || !strings.Contains(out, "rules/api.md: skipped (unchanged since last import)") {
 		t.Errorf("nothing changed, nothing to reconcile:\n%s", out)
+	}
+	// An emptied rule file states no rules and no condition: the rules it
+	// gave keep their condition instead of becoming always-on.
+	file(".claude/rules/frontend/styles.md", "<!-- nothing here for now -->\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); strings.Contains(out, "frontend/styles.md: its condition changed") || !strings.Contains(out, "frontend/styles.md: skipped (nothing to import)") {
+		t.Errorf("an emptied conditional rule file:\n%s", out)
+	}
+	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Rule from frontend-styles.md") {
+		t.Errorf("emptying a rule file made its rule always-on:\n%s", got)
+	}
+	if got := forFile("src/ui/Button.tsx"); !strings.Contains(got, "Rule from frontend-styles.md") {
+		t.Errorf("the rule of an emptied file lost its condition or was dropped:\n%s", got)
+	}
+	// A file whose condition becomes one kb cannot reproduce is no longer
+	// imported, and what it gave before must not stay in force more widely
+	// than the file now says: an always-on Cursor rule made conditional,
+	// and a Claude rule given a pattern that cannot be matched exactly.
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from rules-always.mdc") || !strings.Contains(got, "Rule from rules-api.md") {
+		t.Fatalf("both rules should be always-on before their files change:\n%s", got)
+	}
+	file(".cursor/rules/always.mdc", "---\nalwaysApply: false\nglobs: src/**/*.go\n---\nReturn early instead of nesting conditions.\n")
+	file(".claude/rules/api.md", "---\npaths:\n  - \"photos [2024/**\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	for _, want := range []string{
+		".cursor/rules/always.mdc: not imported (a Cursor rule that is not `alwaysApply: true`",
+		"rules/always.mdc: it can no longer be imported, so 1 rule(s) it gave earlier were retired instead of staying in force more widely than the file says [aiproxy/conventions/rule-from-rules-always-mdc]",
+		"rules/api.md: it can no longer be imported, so 1 rule(s) it gave earlier were retired",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("a source that became unsupported: report lacks %q:\n%s", want, out)
+		}
+	}
+	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Rule from rules-always.mdc") || strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("rules of files that became conditional are still delivered everywhere:\n%s", got)
+	}
+	if show := must(t, "codex", "show", "aiproxy/conventions/rule-from-rules-always-mdc"); !strings.Contains(show, "trust: deprecated") {
+		t.Errorf("the rule should be retired:\n%s", show)
+	}
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); strings.Contains(out, "were retired") {
+		t.Errorf("retiring happens once:\n%s", out)
 	}
 	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
 

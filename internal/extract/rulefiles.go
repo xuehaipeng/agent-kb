@@ -257,13 +257,13 @@ func prepareRuleFile(s *kb.Store, p rulePrep) (*FileSource, string) {
 			paths, cond, why := ruleCondition(p.agent, fm)
 			switch {
 			case why != "":
-				return nil, label + ": not imported (" + why + ")"
+				return unsupported(p, why), label + ": not imported (" + why + ")"
 			case cond && p.base == "\x00unknown":
 				return nil, label + ": not imported (it is path-scoped, and its base directory is unknown here: import it from its repository with 'kb rules import --repo')"
 			case cond:
 				applies = &okf.Applicability{Paths: paths, Base: p.base, Origin: kb.OriginClaudeRules}
 				if err := kb.ValidateApplies(applies); err != nil {
-					return nil, fmt.Sprintf("%s: not imported (%v; importing it without the condition would widen it)", label, err)
+					return unsupported(p, err.Error()), fmt.Sprintf("%s: not imported (%v; importing it without the condition would widen it)", label, err)
 				}
 			}
 			text = body
@@ -280,6 +280,13 @@ func prepareRuleFile(s *kb.Store, p rulePrep) (*FileSource, string) {
 		note = label + ": " + strings.Join(uniqueStrings(notes), "; ")
 	}
 	return src, note
+}
+
+// unsupported is a rule file that is not imported because of a condition kb
+// cannot reproduce. It stays a source so that what it gave before can be
+// retired (see ImportFile).
+func unsupported(p rulePrep, why string) *FileSource {
+	return &FileSource{Path: p.path, Kind: KindRules, Agent: kb.Actor{Producer: p.agent}, Project: p.project, Unsupported: why}
 }
 
 // splitFrontmatter separates YAML frontmatter from the body.
