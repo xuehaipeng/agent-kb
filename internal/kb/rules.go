@@ -201,17 +201,40 @@ func (s *Store) RulesForFiles(files []string, projects []string, all bool) ([]*N
 	return out, nil
 }
 
-// RenderFileRules prints the conditional rules that apply to files.
+// RenderFileRules prints the conditional rules that apply to files. With
+// several files, a rule may govern only some of them: each line then names
+// the files it is for, so asking about two files at once never stretches a
+// rule over both.
 func (s *Store) RenderFileRules(rules []*Node, files []string) string {
 	if len(rules) == 0 {
 		return ""
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Rules from kb that apply to %s (follow them for this work unless the user says otherwise):\n", strings.Join(files, ", "))
+	if len(files) > 1 {
+		b.WriteString("Rules from kb for these files; each applies only to the files named after it (follow them for work on those files unless the user says otherwise):\n")
+	} else {
+		fmt.Fprintf(&b, "Rules from kb that apply to %s (follow them for this work unless the user says otherwise):\n", strings.Join(files, ", "))
+	}
 	for _, n := range rules {
-		fmt.Fprintf(&b, "- %s [%s]\n", ruleText(n), n.ID)
+		fmt.Fprintf(&b, "- %s [%s]", ruleText(n), n.ID)
+		if len(files) > 1 {
+			fmt.Fprintf(&b, " (only for %s)", strings.Join(FilesGoverned(n, files), ", "))
+		}
+		b.WriteString("\n")
 	}
 	return b.String()
+}
+
+// FilesGoverned returns the files, of those given, a conditional rule
+// applies to.
+func FilesGoverned(n *Node, files []string) []string {
+	var out []string
+	for _, f := range files {
+		if AppliesToFile(n.Meta().AppliesTo, f) {
+			out = append(out, f)
+		}
+	}
+	return out
 }
 
 func ruleText(n *Node) string {

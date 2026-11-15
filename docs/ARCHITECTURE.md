@@ -475,7 +475,9 @@ applies_to:
   (`rules_conditional`).
 - It surfaces for a matching file: `kb rules -f <path>` and `kb search -f
   <path>` (which the pointer already tells agents to run before touching
-  unfamiliar code). `kb rules --all-rules` lists them with their condition.
+  unfamiliar code). Asked about several files at once, each rule names the
+  files it governs, so a rule for one package is never presented as a rule
+  for another. `kb rules --all-rules` lists them with their condition.
   Nothing pushes them yet; a file-access hook is issue #3 item 4.
 - Only rules can be conditional (`kb add rule ... --when <glob>`). `--when`
   repeats or takes a comma-separated list; a comma inside `{a,b}` belongs to

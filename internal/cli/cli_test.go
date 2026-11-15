@@ -1765,6 +1765,22 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if out := must(t, "codex", "search", "-f", "src/api/users/create.ts"); !strings.Contains(out, "rule for this file: Rule from rules-api.md") {
 		t.Errorf("search by file:\n%s", out)
 	}
+	// Several files at once: each rule names the files it governs, so a
+	// rule for one package is not handed over as a rule for the other.
+	multi := must(t, "codex", "rules", "-q", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts")
+	for _, want := range []string{
+		"each applies only to the files named after it",
+		"Rule from web-CLAUDE.md - imported for the test [aiproxy/conventions/rule-from-web-claude-md] (only for packages/web/src/a.css)",
+		"Rule from rules-api.md - imported for the test [aiproxy/conventions/rule-from-rules-api-md] (only for src/api/users/create.ts)",
+		"Rule from frontend-styles.md - imported for the test [aiproxy/conventions/rule-from-frontend-styles-md] (only for src/api/users/create.ts)",
+	} {
+		if !strings.Contains(multi, want) {
+			t.Errorf("kb rules for two files lacks %q:\n%s", want, multi)
+		}
+	}
+	if out := must(t, "codex", "search", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts"); !strings.Contains(out, "rule for packages/web/src/a.css only: Rule from web-CLAUDE.md") || !strings.Contains(out, "rule for src/api/users/create.ts only: Rule from rules-api.md") {
+		t.Errorf("search by two files must say which file each rule is for:\n%s", out)
+	}
 	show := must(t, "codex", "show", "aiproxy/conventions/rule-from-web-claude-md")
 	if !strings.Contains(show, "conditional rule: applies only when working on ** under packages/web/") {
 		t.Errorf("nested CLAUDE.md should be conditional on its directory:\n%s", show)
