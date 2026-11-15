@@ -369,7 +369,7 @@ func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 	// is not a deletion.
 	found := map[string]bool{}
 	for _, root := range roots {
-		found[root.Dir] = true
+		found[kb.RealPath(root.Dir)] = true
 	}
 	for _, dir := range trackedRoots(l) {
 		if found[dir] {
@@ -385,7 +385,10 @@ func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 		if len(o.Projects) > 0 && !o.wants(projectOr(s, root.Project)) {
 			continue
 		}
-		gone, why := directoryGone(dir)
+		gone, exists, why := directoryGone(dir)
+		if exists {
+			continue // still there, just not part of what this scan looks at
+		}
 		if !gone {
 			report = append(report, fmt.Sprintf("%s: imported before, and not checked now (%s); nothing was compared with earlier imports", displayPath(dir), why))
 			continue
@@ -425,22 +428,22 @@ func trackedRoots(l *ledger) []string {
 // can be read (for a memory directory, its project directory or the
 // projects directory). Anything else (a permission error, a missing config
 // directory, an unmounted home) is not evidence that it was deleted.
-func directoryGone(dir string) (bool, string) {
+func directoryGone(dir string) (gone, exists bool, why string) {
 	if _, err := os.Stat(dir); err == nil {
-		return false, "it exists, but no longer counts as a memory directory of a known project"
+		return false, true, ""
 	} else if !errors.Is(err, os.ErrNotExist) {
-		return false, "it cannot be read: " + err.Error()
+		return false, false, "it cannot be read: " + err.Error()
 	}
 	up := dir
 	for i := 0; i < 2; i++ {
 		up = filepath.Dir(up)
 		if _, err := os.ReadDir(up); err == nil {
-			return true, ""
+			return true, false, ""
 		} else if !errors.Is(err, os.ErrNotExist) {
-			return false, "its parent cannot be read: " + err.Error()
+			return false, false, "its parent cannot be read: " + err.Error()
 		}
 	}
-	return false, "the location it was in is not there either"
+	return false, false, "the location it was in is not there either"
 }
 
 // importMemoryRoot processes one directory against the ledger. With removed
@@ -458,7 +461,13 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, 
 		r.details = append(r.details, "error: "+err.Error()+" (nothing was compared with earlier imports)")
 		return r, nil
 	}
+	// The ledger knows a directory and its files by their resolved paths, so
+	// one directory reached two ways (a symlinked home, a mapping recorded
+	// by its real path) is one directory. Paths shown to people and
+	// recorded on entries stay as they were found.
+	keyDir := kb.RealPath(root.Dir)
 	type file struct {
+		key        string // resolved path: the ledger's name for the file
 		path, hash string
 		data       []byte
 		mtime      time.Time
@@ -466,6 +475,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, 
 	complete := true
 	var files []file
 	present := map[string]bool{}
+	shown := map[string]string{} // key -> path as found
 	for _, e := range entries {
 		if e.IsDir() || !strings.HasSuffix(e.Name(), ".md") {
 			continue
@@ -477,20 +487,22 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, 
 			complete = false
 			r.errors++
 			r.details = append(r.details, fmt.Sprintf("error: %s could not be read", e.Name()))
-			present[p] = true // unreadable is not deleted
+			present[filepath.Join(keyDir, e.Name())] = true // unreadable is not deleted
 			continue
 		}
 		if len(data) > maxImportBytes {
 			data = data[:maxImportBytes]
 		}
-		present[p] = true
-		files = append(files, file{path: p, hash: contentHash(data), data: data, mtime: st.ModTime().UTC()})
+		key := filepath.Join(keyDir, e.Name())
+		present[key] = true
+		shown[key] = p
+		files = append(files, file{key: key, path: p, hash: contentHash(data), data: data, mtime: st.ModTime().UTC()})
 	}
 
 	// Sources this ledger knows in this directory that are no longer there.
 	gone := map[string]*ledgerEntry{}
 	for p, e := range l.Sources {
-		if e.Adapter == AdapterClaudeMemory && e.Root == root.Dir && !present[p] {
+		if e.Adapter == AdapterClaudeMemory && e.Root == keyDir && !present[p] {
 			gone[p] = e
 		}
 	}
@@ -512,13 +524,13 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, 
 	newByHash, newByName := map[string][]string{}, map[string][]string{}
 	names := map[string]string{}
 	for _, f := range files {
-		if _, known := l.Sources[f.path]; known || filepath.Base(f.path) == "MEMORY.md" {
+		if _, known := l.Sources[f.key]; known || filepath.Base(f.path) == "MEMORY.md" {
 			continue
 		}
-		newByHash[f.hash] = append(newByHash[f.hash], f.path)
+		newByHash[f.hash] = append(newByHash[f.hash], f.key)
 		if t, err := parseTopic(f.data); err == nil && t.Name != "" {
-			names[f.path] = t.Name
-			newByName[t.Name] = append(newByName[t.Name], f.path)
+			names[f.key] = t.Name
+			newByName[t.Name] = append(newByName[t.Name], f.key)
 		}
 	}
 	ambiguous := map[string]bool{}
@@ -545,7 +557,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, 
 		// follows; one whose content did not change would otherwise keep
 		// naming a file that no longer exists.
 		if e.Entry != "" {
-			if err := s.RelocateSource(e.Entry, KindMemory+"-"+kb.Slugify(root.Agent.Producer), displayPath(to), root.Agent); err != nil {
+			if err := s.RelocateSource(e.Entry, KindMemory+"-"+kb.Slugify(root.Agent.Producer), displayPath(shown[to]), root.Agent); err != nil {
 				r.details = append(r.details, fmt.Sprintf("renamed: %s still names %s as its source (%v)", e.Entry, filepath.Base(from), err))
 			}
 		}
@@ -639,7 +651,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, 
 
 	for _, f := range files {
 		base := filepath.Base(f.path)
-		if ambiguous[f.path] || (o.DryRun && taken[f.path]) {
+		if ambiguous[f.key] || (o.DryRun && taken[f.key]) {
 			continue
 		}
 		if base == "MEMORY.md" {
@@ -678,7 +690,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, 
 		// take it: that path only adds entries, so the old one (a delivered
 		// rule, say) would stay as it was beside a new one. It is flagged
 		// for a merge by hand instead.
-		if tracked := l.Sources[f.path]; tracked != nil && entryAlive(s, tracked.Entry) && (reason != "" || skip != "") {
+		if tracked := l.Sources[f.key]; tracked != nil && entryAlive(s, tracked.Entry) && (reason != "" || skip != "") {
 			why := reason
 			if why == "" {
 				why = skip
@@ -744,7 +756,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, 
 		body := t.Body + fmt.Sprintf(" [^%s]", srcID)
 		evidence := fmt.Sprintf("saved in %s's memory (%s)", root.Agent.Producer, displayPath(f.path))
 
-		e := l.Sources[f.path]
+		e := l.Sources[f.key]
 		if e != nil && e.Missing != "" && !o.DryRun {
 			e.Missing, e.MissingChecks, e.MissingRevision = "", 0, 0 // the file is back
 		}
@@ -795,12 +807,12 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, 
 			if o.DryRun {
 				return
 			}
-			ne := &ledgerEntry{Adapter: AdapterClaudeMemory, Root: root.Dir, Path: f.path, Project: root.Project, Name: t.Name, Type: recType,
+			ne := &ledgerEntry{Adapter: AdapterClaudeMemory, Root: keyDir, Path: f.key, Project: root.Project, Name: t.Name, Type: recType,
 				Hash: f.hash, Outcome: outcome, Entry: entry, Revision: rev, Conflict: conflict, Updated: now.Format(time.RFC3339)}
 			if e != nil {
 				ne.Aliases = e.Aliases
 			}
-			l.Sources[f.path] = ne
+			l.Sources[f.key] = ne
 		}
 
 		// A source whose entry was retired is free to become a new one: that
