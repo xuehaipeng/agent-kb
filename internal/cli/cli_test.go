@@ -2670,6 +2670,139 @@ func TestAccessStatisticsAreOnlyASignal(t *testing.T) {
 	}
 }
 
+// TestFileContextHookRepoMode covers file context for a repository bundle
+// (<repo>/knowledge): a repo-local installation, unprefixed entry ids, the
+// delivery state under the bundle's local directory, and the benchmark.
+func TestFileContextHookRepoMode(t *testing.T) {
+	repo := setupRepo(t)
+	must(t, "", "init", "--install", "claude")
+	settings := filepath.Join(repo, ".claude", "settings.json")
+	hooksIn := func() map[string]any {
+		var m map[string]any
+		data, _ := os.ReadFile(settings)
+		json.Unmarshal(data, &m)
+		h, _ := m["hooks"].(map[string]any)
+		return h
+	}
+	file := filepath.Join(repo, "src", "app.go")
+	tool := func(cwd, event, toolName, path, session, agent string) string {
+		t.Helper()
+		os.Chdir(cwd)
+		in := `{"session_id":"` + session + `","hook_event_name":"` + event + `","tool_name":"` + toolName + `","tool_input":{"file_path":"` + path + `"},"cwd":"` + cwd + `"`
+		if agent != "" {
+			in += `,"agent_id":"` + agent + `","agent_type":"Explore"`
+		}
+		out, _, code := kbRun(t, "claude-code", in+"}", "hook", "claude", "file")
+		if code != 0 {
+			t.Fatalf("hook exit %d", code)
+		}
+		if strings.TrimSpace(out) == "" {
+			return ""
+		}
+		var m struct {
+			Out struct {
+				Event   string `json:"hookEventName"`
+				Context string `json:"additionalContext"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("not hook JSON: %v\n%s", err, out)
+		}
+		return m.Out.Event + "|" + m.Out.Context
+	}
+	read := func(session, agent string) string { return tool(repo, "PostToolUse", "Read", file, session, agent) }
+
+	must(t, "claude-code", "add", "learning", "The app package starts the metrics server", "-d", "It binds the port before the handlers are ready.", "-r", "src/app.go", "-e", "read src/app.go")
+	must(t, "claude-code", "add", "rule", "Keep src free of init functions", "-d", "start-up order must be explicit", "-e", "user said so", "--when", "src/**")
+	must(t, "claude-code", "add", "learning", "The docs are generated", "-d", "Do not edit them by hand.", "-r", "docs/**", "-e", "read the Makefile")
+	const learning, rule = "learnings/the-app-package-starts-the-metrics-server", "conventions/keep-src-free-of-init-functions"
+
+	// Off by default, in a bundle as in a hub.
+	if h := hooksIn(); h["PostToolUse"] != nil || h["PreToolUse"] != nil {
+		t.Fatalf("file context must be opt-in: %v", h)
+	}
+	if out := read("off", ""); out != "" {
+		t.Fatalf("off must inject nothing:\n%s", out)
+	}
+	// Turned on for this repository: the hooks go into the repository's own
+	// settings, and the choice is recorded locally, not in the bundle.
+	if out := must(t, "", "install", "claude", "--file-context", "post"); !strings.Contains(out, "File context is on (post)") {
+		t.Errorf("install notes:\n%s", out)
+	}
+	if h := hooksIn(); h["PostToolUse"] == nil || h["PreToolUse"] != nil {
+		t.Fatalf("post mode hooks in the repository's settings: %v", h)
+	}
+	// The rule for the file, then the anchored entry, by their unprefixed
+	// ids; nothing about other files.
+	out := read("s1", "")
+	for _, want := range []string{"PostToolUse|kb: recorded about src/app.go, for the work that follows", "- rule for this file: Keep src free of init functions - start-up order must be explicit [" + rule + "]", "- " + learning + " [verified,"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("repo-mode context lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "The docs are generated") || strings.Index(out, rule) > strings.Index(out, learning) {
+		t.Errorf("only what is recorded about the file, rules first:\n%s", out)
+	}
+	// Once per agent; a subagent has its own context; a compaction of that
+	// agent starts it over. The state lives in the bundle's local directory.
+	if again := read("s1", "") + tool(repo, "PostToolUse", "Edit", file, "s1", ""); again != "" {
+		t.Errorf("the same agent got the same entries twice:\n%s", again)
+	}
+	if sub := read("s1", "agent-1"); !strings.Contains(sub, learning) {
+		t.Errorf("a subagent must get it regardless of its parent:\n%s", sub)
+	}
+	state, err := os.ReadFile(filepath.Join(repo, "knowledge", ".kb", "sessions", "s1.json"))
+	if err != nil || !strings.Contains(string(state), `"`+learning+`"`) || !strings.Contains(string(state), `"agent-1"`) {
+		t.Fatalf("delivery state under the bundle's local directory: %v\n%s", err, state)
+	}
+	os.Chdir(repo)
+	kbRun(t, "claude-code", `{"session_id":"s1","hook_event_name":"SessionStart","source":"compact","agent_id":"agent-1","agent_type":"Explore","cwd":"`+repo+`"}`, "hook", "claude")
+	if sub := read("s1", "agent-1"); !strings.Contains(sub, learning) {
+		t.Errorf("after its compaction the subagent should get the entry again:\n%s", sub)
+	}
+	// A rewritten entry is given again.
+	must(t, "codex", "update", learning, "-d", "It binds the port before the handlers are registered.", "-m", "clearer", "-e", "src/app.go")
+	if out := read("s1", ""); !strings.Contains(out, "before the handlers are registered") || strings.Contains(out, rule) {
+		t.Errorf("after an update, the new revision only:\n%s", out)
+	}
+	// From a subdirectory, and for files the hook does not cover.
+	if out := tool(filepath.Join(repo, "src"), "PostToolUse", "Read", file, "s2", ""); !strings.Contains(out, "kb: recorded about src/app.go") || !strings.Contains(out, learning) {
+		t.Errorf("from a subdirectory:\n%s", out)
+	}
+	if out := tool(repo, "PostToolUse", "Read", filepath.Join(filepath.Dir(repo), "elsewhere.go"), "s3", ""); out != "" {
+		t.Errorf("a file outside the repository:\n%s", out)
+	}
+	if out := tool(repo, "PreToolUse", "Edit", file, "s4", ""); out != "" {
+		t.Errorf("post mode must not inject before an edit:\n%s", out)
+	}
+	// Pre mode, then the benchmark with unprefixed ids.
+	must(t, "", "install", "claude", "--file-context", "pre")
+	if out := tool(repo, "PreToolUse", "Edit", file, "s5", ""); !strings.Contains(out, "PreToolUse|kb: recorded about src/app.go, before you change it") || !strings.Contains(out, learning) {
+		t.Errorf("pre-edit context:\n%s", out)
+	}
+	cases := filepath.Join(t.TempDir(), "cases.json")
+	os.WriteFile(cases, []byte(`[{"file":"src/app.go","relevant":["`+learning+`","`+rule+`"]},{"file":"docs/guide.md","relevant":["learnings/the-docs-are-generated"]},{"file":"README.md","relevant":[]}]`), 0o644)
+	os.Chdir(repo)
+	bench := must(t, "codex", "bench", "file-context", "--cases", cases)
+	for _, want := range []string{"src/app.go: injected 2, relevant 2 of 2", "docs/guide.md: injected 1, relevant 1 of 1", "README.md: injected 0", "cases 3, injections 2: precision 1.00 (3 of 3 injected were judged relevant), recall 1.00 (3 of 3 judged relevant were injected)"} {
+		if !strings.Contains(bench, want) {
+			t.Errorf("repo-mode benchmark lacks %q:\n%s", want, bench)
+		}
+	}
+	// The local state is not part of the bundle that gets committed.
+	if st := git(t, repo, "status", "--porcelain", "--", "knowledge"); strings.Contains(st, ".kb/") {
+		t.Errorf("local state shows up as a change to the bundle:\n%s", st)
+	}
+	// Off again: the hooks go from the repository's settings.
+	must(t, "", "install", "claude", "--file-context", "off")
+	if h := hooksIn(); h["PostToolUse"] != nil || h["PreToolUse"] != nil || h["SessionStart"] == nil {
+		t.Fatalf("after turning file context off: %v", h)
+	}
+	if out := read("s6", ""); out != "" {
+		t.Errorf("off must inject nothing:\n%s", out)
+	}
+}
+
 // Item 4: file context is off by default; when turned on it hands an agent
 // what is recorded about a file it reads or edits, once per agent, entry
 // revision and compaction, within a budget and within the project.
