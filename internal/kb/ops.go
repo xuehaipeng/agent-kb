@@ -826,6 +826,23 @@ func (s *Store) similarAll(text, typeKey, project string) []Similar {
 	return out
 }
 
+// Similarity is how much two texts say the same thing, from 0 to 1: the
+// overlap of their words (Jaccard), as the duplicate check measures it.
+func Similarity(a, b string) float64 {
+	q, c := tokenSet(a), tokenSet(b)
+	inter := 0
+	for t := range q {
+		if c[t] {
+			inter++
+		}
+	}
+	union := len(q) + len(c) - inter
+	if union == 0 {
+		return 0
+	}
+	return float64(inter) / float64(union)
+}
+
 func sortSimilar(xs []Similar) {
 	for i := 1; i < len(xs); i++ {
 		for j := i; j > 0 && xs[j].Score > xs[j-1].Score; j-- {
