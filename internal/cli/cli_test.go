@@ -1368,6 +1368,35 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 	if out := scan(); strings.Contains(out, "conflict: reference_runbook.md") {
 		t.Fatalf("back to its own type:\n%s", out)
 	}
+	// The way out the conflict advertises: deprecate the entry, and the
+	// memory imports as a new entry of its new type, without another edit.
+	write("project_beta_plan.md", topic("beta-plan", "Beta plan is reviewed monthly", "project", "The beta plan is reviewed on the first Monday of each month."))
+	if out := scan(); !strings.Contains(out, "1 imported") {
+		t.Fatalf("new memory:\n%s", out)
+	}
+	const planFact = "aiproxy/facts/beta-plan-is-reviewed-monthly"
+	write("project_beta_plan.md", topic("beta-plan", "Beta plan is reviewed monthly", "feedback", "Review the beta plan before changing its scope."))
+	if out := scan(); !strings.Contains(out, "the memory is now a feedback, but its entry is a fact; "+planFact) {
+		t.Fatalf("type change of the new memory:\n%s", out)
+	}
+	os.Chdir(repo)
+	must(t, "codex", "deprecate", planFact, "-m", "it is a working rule now, not a fact")
+	out = scan()
+	if strings.Contains(out, "conflict: project_beta_plan.md") || !strings.Contains(out, "1 imported") {
+		t.Fatalf("deprecating the entry must settle the conflict and let the memory import:\n%s", out)
+	}
+	if r := show("aiproxy/conventions/beta-plan-is-reviewed-monthly"); !strings.Contains(r, "Review the beta plan before changing its scope") || !strings.Contains(r, "trust: verified") {
+		t.Fatalf("the memory's new entry:\n%s", r)
+	}
+	if out := scan(); strings.Contains(out, "conflict: project_beta_plan.md") || strings.Contains(out, "1 imported") {
+		t.Fatalf("rescan after the takeover:\n%s", out)
+	}
+	// A retired entry whose source did not conflict is not resurrected.
+	os.Chdir(repo)
+	must(t, "codex", "deprecate", "aiproxy/conventions/beta-plan-is-reviewed-monthly", "-m", "dropped")
+	if out := scan(); strings.Contains(out, "1 imported") {
+		t.Fatalf("an unchanged source must not bring back an entry the user retired:\n%s", out)
+	}
 
 	// 2. Two sources share a name. One is renamed (same content), the other
 	// deleted: the new path stands for the renamed one only.

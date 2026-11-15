@@ -504,7 +504,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		// take it: that path only adds entries, so the old one (a delivered
 		// rule, say) would stay as it was beside a new one. It is flagged
 		// for a merge by hand instead.
-		if tracked := l.Sources[f.path]; tracked != nil && tracked.Entry != "" && (reason != "" || skip != "") {
+		if tracked := l.Sources[f.path]; tracked != nil && entryAlive(s, tracked.Entry) && (reason != "" || skip != "") {
 			why := reason
 			if why == "" {
 				why = skip
@@ -577,6 +577,14 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		// A conflict stands until someone settles it: it is reported on
 		// every scan, not once. --accept-conflicts records the entry as it
 		// is now (after a merge by hand) as the new baseline.
+		// Retiring the entry settles a conflict: there is nothing left to
+		// protect, and the source is free to be imported again (that is the
+		// way out a type conflict advertises). Checked before a standing
+		// conflict is reported or accepted, so it also works when the
+		// source has not changed since.
+		if e != nil && e.Conflict != "" && !entryAlive(s, e.Entry) {
+			e = nil
+		}
 		if e != nil && e.Conflict != "" {
 			if o.AcceptConflicts {
 				// The entry as it is now is the baseline. Its imported type
@@ -764,6 +772,16 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		r.details = append(r.details, fmt.Sprintf("source deleted: %s no longer backs %s; the entry is kept. If it still holds: kb verify %s --confirm -e \"...\"; if not: kb deprecate %s -m \"...\"", filepath.Base(key), e.Entry, e.Entry, e.Entry))
 	}
 	return r, fallbacks
+}
+
+// entryAlive reports whether a tracked entry still exists and is not
+// deprecated.
+func entryAlive(s *kb.Store, id string) bool {
+	if id == "" {
+		return false
+	}
+	n, err := s.Get(id)
+	return err == nil && s.Trust(n).State != kb.StateDeprecated
 }
 
 // reviewedSince reports whether an entry was confirmed or rewritten after
