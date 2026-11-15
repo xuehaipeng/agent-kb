@@ -1576,6 +1576,39 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 		t.Fatalf("--force changed the entries:\n%s\n%s", active, again)
 	}
 
+	// A whole memory directory that was imported and is then removed: its
+	// sources are reconciled like deleted files, but only when the
+	// directory is known to be gone.
+	pdir2 := filepath.Join(home, ".claude", "projects", "-x-aiproxy-wt")
+	mem2 := filepath.Join(pdir2, "memory")
+	os.MkdirAll(mem2, 0o755)
+	os.WriteFile(filepath.Join(pdir2, "t.jsonl"), []byte(`{"type":"user","cwd":"`+repo+`","sessionId":"s2","message":{"role":"user","content":"hi"}}`+"\n"), 0o644)
+	os.WriteFile(filepath.Join(mem2, "feedback_worktree.md"), []byte(topic("feedback-worktree", "Worktrees are removed after merge", "feedback", "Delete a worktree once its branch is merged.")), 0o644)
+	if out := scan(); !strings.Contains(out, "-x-aiproxy-wt/memory [aiproxy]: 1 imported") {
+		t.Fatalf("second directory:\n%s", out)
+	}
+	const wtID = "aiproxy/conventions/worktrees-are-removed-after-merge"
+	if os.Geteuid() != 0 {
+		os.Chmod(pdir2, 0o000) // unreachable is not deleted
+		if out := scan(); strings.Contains(out, "no longer backs "+wtID) || !strings.Contains(out, "-x-aiproxy-wt/memory: imported before, and not checked now") {
+			t.Fatalf("an unreadable directory must not count as deleted:\n%s", out)
+		}
+		os.Chmod(pdir2, 0o755)
+	}
+	os.RemoveAll(mem2)
+	out = scan()
+	if !strings.Contains(out, "-x-aiproxy-wt/memory [aiproxy]: 0 imported, 0 updated, 0 unchanged, 1 sources deleted") || !strings.Contains(out, "no longer backs "+wtID) || !strings.Contains(out, "the directory itself no longer exists") {
+		t.Fatalf("a removed directory must be reconciled:\n%s", out)
+	}
+	if r := show(wtID); !strings.Contains(r, "trust: verified") {
+		t.Fatalf("the entry of a removed directory must be kept:\n%s", r)
+	}
+	os.Chdir(repo)
+	must(t, "codex", "deprecate", wtID, "-m", "no longer how we work")
+	if out := scan(); strings.Contains(out, "-x-aiproxy-wt") {
+		t.Fatalf("a reconciled directory needs no further report:\n%s", out)
+	}
+
 	// A dry run reports the same rename without recording it.
 	os.Rename(filepath.Join(mem, "project_alpha_rollout.md"), filepath.Join(mem, "project_alpha_gate.md"))
 	if out := scan("--dry-run"); !strings.Contains(out, "1 renamed") || strings.Contains(out, "1 would be imported") || strings.Contains(out, "no longer backs "+alphaID) {
