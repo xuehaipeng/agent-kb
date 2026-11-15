@@ -296,6 +296,9 @@ type Result struct {
 	Rescoped []string
 	// Retired: rules from a file that can no longer be imported.
 	Retired []string
+	// Reimport: files whose rules relied on an entry this import narrowed
+	// or retired; their saved import no longer stands.
+	Reimport []string
 }
 
 type state struct {
@@ -303,6 +306,10 @@ type state struct {
 	Offset  int64  `json:"offset,omitempty"` // transcripts: bytes consumed
 	Hash    string `json:"hash,omitempty"`   // memory/rule files: content imported
 	Updated string `json:"updated"`
+	// ReliesOn: entries that already said what this file says, so nothing
+	// was added for it. When one of them is narrowed or retired because
+	// its own file changed, this file has to be imported again.
+	ReliesOn []string `json:"relies_on,omitempty"`
 }
 
 func statePath(s *kb.Store, path string) string {

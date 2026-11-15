@@ -488,7 +488,8 @@ applies_to:
 - Patterns follow Claude Code's documented rule syntax: `**` crosses
   directories; a bare name matches at any depth; a leading `/` anchors to the
   base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work,
-  and a bracket expression, negated or not, stays within one path segment. A
+  and a bracket expression, negated or not, stays within one path segment
+  (one whose range takes in `/`, such as `[.-0]`, is refused). A
   pattern that cannot be matched exactly is an error and matches nothing. It
   is never widened.
 
@@ -529,6 +530,12 @@ cannot be matched exactly) is no longer imported, and the rules it gave
 earlier are retired, with the reason, instead of staying in force more
 widely than the file now says. Fixing the file and importing again adds
 them back.
+
+**A rule two files state belongs to both.** When a file adds nothing because
+an existing rule already says it, the import remembers which rule it relied
+on. If that rule is later narrowed or retired for its own file's sake, the
+files that relied on it are read again (in the same run), so the rule stays
+in force wherever another file still states it.
 
 **A rule repeats another only where that one is already delivered.** The
 same instruction in `packages/web/CLAUDE.md` and `packages/api/CLAUDE.md` is

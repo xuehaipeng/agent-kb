@@ -288,10 +288,23 @@ func globRegexp(p string) (*regexp.Regexp, error) {
 			}
 			// A bracket expression stays within one path segment, like
 			// "*" and "?": a negated one must not match "/" either.
-			if strings.HasPrefix(class, "!") || strings.HasPrefix(class, "^") {
+			negated := strings.HasPrefix(class, "!") || strings.HasPrefix(class, "^")
+			if negated {
 				class = "^/" + class[1:]
 			}
-			b.WriteString("[" + strings.ReplaceAll(class, `\`, `\\`) + "]")
+			expr := "[" + strings.ReplaceAll(class, `\`, `\\`) + "]"
+			// A range can take in "/" without naming it ("[.-0]"). Such an
+			// expression cannot stay within a segment, so it is refused.
+			if !negated {
+				one, err := regexp.Compile("^" + expr + "$")
+				if err != nil {
+					return nil, fmt.Errorf("unsupported bracket expression: %v", err)
+				}
+				if one.MatchString("/") {
+					return nil, fmt.Errorf("bracket expression [%s] includes '/' in a range", class)
+				}
+			}
+			b.WriteString(expr)
 			i = end
 		default:
 			b.WriteString(regexp.QuoteMeta(string(c)))

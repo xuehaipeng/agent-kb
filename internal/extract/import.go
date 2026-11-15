@@ -90,6 +90,9 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		if err != nil {
 			return res, err
 		}
+		if abs, aerr := filepath.Abs(src.Path); aerr == nil {
+			res.Reimport = forgetDependents(s, retired, abs)
+		}
 		// What was last imported from this file no longer stands. Forget
 		// it, so that the file is imported again when it is supported
 		// again, even with exactly the content it had before.
@@ -154,6 +157,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 			return nil, err
 		}
 		res.Rescoped = rescoped
+		res.Reimport = forgetDependents(s, rescoped, abs)
 	}
 	prompt := importPrompt(s, src, content)
 	if filtered {
@@ -193,6 +197,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	if src.Kind == KindRules {
 		evidence = fmt.Sprintf("user rule written for %s in %s", src.Agent.Producer, displayPath(src.Path))
 	}
+	var reliesOn []string // entries that already say what this file says
 	for _, c := range claims {
 		project := src.Project
 		if s.Hub {
@@ -247,6 +252,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		switch {
 		case errors.As(err, &dup):
 			res.Dupes++
+			reliesOn = append(reliesOn, dup.Match.ID)
 		case errors.As(err, &documented):
 			res.Documented++
 		case err != nil:
@@ -260,7 +266,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	if filtered {
 		return res, nil
 	}
-	return res, saveHash(s, abs, hash)
+	return res, saveHash(s, abs, hash, reliesOn...)
 }
 
 // importHash identifies what an import took from a file: its content and,
@@ -449,13 +455,50 @@ func existingTitles(s *kb.Store, rulesOnly bool) []string {
 	return out
 }
 
-func saveHash(s *kb.Store, path, hash string) error {
+func saveHash(s *kb.Store, path, hash string, reliesOn ...string) error {
 	p := statePath(s, path)
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	data, _ := json.Marshal(state{Path: path, Hash: hash, Updated: time.Now().UTC().Format(time.RFC3339)})
+	data, _ := json.Marshal(state{Path: path, Hash: hash, Updated: time.Now().UTC().Format(time.RFC3339), ReliesOn: reliesOn})
 	return os.WriteFile(p, data, 0o644)
+}
+
+// forgetDependents clears the saved import of every file that added nothing
+// because one of the given entries already said it. Those entries have just
+// been narrowed or retired for their own file's sake; the other files may
+// still state the rule as before, and must be read again to keep it. It
+// returns the files it cleared.
+func forgetDependents(s *kb.Store, entries []string, self string) []string {
+	if len(entries) == 0 {
+		return nil
+	}
+	changed := map[string]bool{}
+	for _, id := range entries {
+		changed[id] = true
+	}
+	files, _ := filepath.Glob(s.LocalPath("extract", "*.json"))
+	var out []string
+	for _, f := range files {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		var st state
+		if json.Unmarshal(data, &st) != nil || st.Path == "" || st.Path == self || st.Hash == "" {
+			continue
+		}
+		for _, id := range st.ReliesOn {
+			if changed[id] {
+				if saveHash(s, st.Path, "") == nil {
+					out = append(out, st.Path)
+				}
+				break
+			}
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 func displayPath(p string) string {
@@ -581,9 +624,38 @@ func claudeMemoryProject(s *kb.Store, projectDir string) (string, bool) {
 // ImportAll imports a list of sources and returns one report line each.
 func ImportAll(s *kb.Store, srcs []FileSource, o ImportOptions) []string {
 	var report []string
+	again := map[string]bool{}
 	for _, src := range srcs {
+		report = append(report, importOne(s, src, o, again)...)
+	}
+	// A file read earlier in this run whose rules relied on an entry that a
+	// later file narrowed or retired: read it again now, once.
+	for _, src := range srcs {
+		abs, err := filepath.Abs(src.Path)
+		if err != nil || !again[abs] || src.Unsupported != "" || loadState(s, abs).Hash != "" {
+			continue
+		}
+		delete(again, abs)
+		report = append(report, importOne(s, src, o, map[string]bool{})...)
+	}
+	if len(report) == 0 && len(srcs) == 0 {
+		report = append(report, "no files found")
+	}
+	return report
+}
+
+// importOne imports one file and reports what happened. Files whose saved
+// import it invalidated are added to again.
+func importOne(s *kb.Store, src FileSource, o ImportOptions, again map[string]bool) []string {
+	var report []string
+	{
 		label := displayPath(src.Path)
 		r, err := ImportFile(s, src, o)
+		if err == nil {
+			for _, p := range r.Reimport {
+				again[p] = true
+			}
+		}
 		switch {
 		case err != nil:
 			report = append(report, fmt.Sprintf("%s: error: %v", label, err))
@@ -602,9 +674,13 @@ func ImportAll(s *kb.Store, srcs []FileSource, o ImportOptions) []string {
 		if err == nil && len(r.Rescoped) > 0 {
 			report = append(report, fmt.Sprintf("%s: its condition changed; %d rule(s) follow it %v", label, len(r.Rescoped), r.Rescoped))
 		}
-	}
-	if len(report) == 0 && len(srcs) == 0 {
-		report = append(report, "no files found")
+		if err == nil && len(r.Reimport) > 0 {
+			var names []string
+			for _, p := range r.Reimport {
+				names = append(names, displayPath(p))
+			}
+			report = append(report, fmt.Sprintf("%s: %d other file(s) stated the same rule(s) and are read again so the rule stays where they apply it: %s", label, len(names), strings.Join(names, ", ")))
+		}
 	}
 	return report
 }

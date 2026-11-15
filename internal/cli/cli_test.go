@@ -1962,6 +1962,52 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	}
 	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
 
+	// Two files state the same rule (the stand-in names a rule after the
+	// file's directory and name, so these two give one title). The second
+	// adds nothing: the first one's rule already says it.
+	file(".claude/rules/dup/shared.md", "Name branches after the ticket they belong to.\n")
+	file(".cursor/rules/dup/shared.md", "Name branches after the ticket they belong to.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if !strings.Contains(out, ".claude/rules/dup/shared.md: added 1") || !strings.Contains(out, ".cursor/rules/dup/shared.md: added 0, duplicates 1") {
+		t.Fatalf("the same rule in two files:\n%s", out)
+	}
+	// The first file is then limited to some files. Its rule follows, and
+	// the second file, which still states the rule for everything, is read
+	// again so the rule does not vanish everywhere else.
+	file(".claude/rules/dup/shared.md", "---\npaths: \"src/dup/**\"\n---\nName branches after the ticket they belong to.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	for _, want := range []string{
+		".claude/rules/dup/shared.md: its condition changed; 1 rule(s) follow it [aiproxy/conventions/rule-from-dup-shared-md]",
+		"1 other file(s) stated the same rule(s) and are read again",
+		".cursor/rules/dup/shared.md: added 1",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("narrowing a rule another file also states: report lacks %q:\n%s", want, out)
+		}
+	}
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from dup-shared.md") {
+		t.Errorf("a rule still stated for everything by another file stopped being always-on:\n%s", got)
+	}
+	if got := forFile("src/dup/a.go"); !strings.Contains(got, "[aiproxy/conventions/rule-from-dup-shared-md]") {
+		t.Errorf("the narrowed copy must still be there for its files:\n%s", got)
+	}
+	// The other order: the file that relied on a rule is read before the
+	// file whose change retires that rule, and is read again in the same run.
+	file(".cursor/rules/dup2/both.md", "Squash fixup commits before review.\n")
+	must(t, "", "rules", "import", "--repo", "--cmd", script)
+	file(".claude/rules/dup2/both.md", "Squash fixup commits before review.\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); !strings.Contains(out, ".claude/rules/dup2/both.md: added 0, duplicates 1") {
+		t.Fatalf("the second file should rely on the first one's rule:\n%s", out)
+	}
+	file(".cursor/rules/dup2/both.md", "---\nalwaysApply: false\nglobs: src/**\n---\nSquash fixup commits before review.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if !strings.Contains(out, "rules/dup2/both.md: it can no longer be imported, so 1 rule(s) it gave earlier were retired") || !strings.Contains(out, ".claude/rules/dup2/both.md: added 1") {
+		t.Errorf("retiring a rule another file relied on:\n%s", out)
+	}
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from dup2-both.md") {
+		t.Errorf("a rule another file still states was lost when its first source became unsupported:\n%s", got)
+	}
+
 	// A path-scoped file named on the command line has no known base.
 	if out := must(t, "", "rules", "import", filepath.Join(repo, ".claude", "rules", "api.md"), "--cmd", script); !strings.Contains(out, "its base directory is unknown here") {
 		t.Errorf("explicit path-scoped file:\n%s", out)
