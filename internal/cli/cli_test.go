@@ -1660,6 +1660,10 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(home, "outside.md"), []byte("Content outside the repository that must not be imported.\n"), 0o644)
 	os.WriteFile(filepath.Join(home, "shared-rule.md"), []byte("A rule that lives outside the repository.\n"), 0o644)
 	os.Symlink(filepath.Join(home, "shared-rule.md"), filepath.Join(repo, ".claude", "rules", "linked.md"))
+	// A nested instruction file that is a link to somewhere outside the
+	// repository is not the repository's content.
+	os.MkdirAll(filepath.Join(repo, "packages", "api"), 0o755)
+	os.Symlink(filepath.Join(home, "outside.md"), filepath.Join(repo, "packages", "api", "CLAUDE.md"))
 	// A link back to the rules directory itself: read once, not for ever.
 	os.Symlink(".", filepath.Join(repo, ".claude", "rules", "shared"))
 	git(t, repo, "add", "-A")
@@ -1682,13 +1686,14 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 		".cursor/rules/attached.mdc: not imported (a Cursor rule that is not `alwaysApply: true`",
 		"note: CLAUDE.local.md: not imported (personal instructions",
 		".claude/rules/linked.md: not imported (a link to a location outside",
+		"packages/api/CLAUDE.md: not imported (a link to a location outside",
 		"CLAUDE.md: @AGENTS.md was not followed (other agents read AGENTS.md natively); @~/outside.md was not followed (it is outside",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("import report lacks %q:\n%s", want, out)
 		}
 	}
-	for _, not := range []string{"Rule from rules-broken.md", "Rule from rules-badglob.md", "Rule from rules-attached.mdc", "Rule from rules-linked.md", "CLAUDE.local.md: added"} {
+	for _, not := range []string{"Rule from rules-broken.md", "Rule from rules-badglob.md", "Rule from rules-attached.mdc", "Rule from rules-linked.md", "Rule from api-CLAUDE.md", "CLAUDE.local.md: added"} {
 		if strings.Contains(out, not) {
 			t.Errorf("import report must not contain %q:\n%s", not, out)
 		}
@@ -1760,6 +1765,22 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if out := must(t, "codex", "search", "-f", "src/api/users/create.ts"); !strings.Contains(out, "rule for this file: Rule from rules-api.md") {
 		t.Errorf("search by file:\n%s", out)
 	}
+	// Several files at once: each rule names the files it governs, so a
+	// rule for one package is not handed over as a rule for the other.
+	multi := must(t, "codex", "rules", "-q", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts")
+	for _, want := range []string{
+		"each applies only to the files named after it",
+		"Rule from web-CLAUDE.md - imported for the test [aiproxy/conventions/rule-from-web-claude-md] (only for packages/web/src/a.css)",
+		"Rule from rules-api.md - imported for the test [aiproxy/conventions/rule-from-rules-api-md] (only for src/api/users/create.ts)",
+		"Rule from frontend-styles.md - imported for the test [aiproxy/conventions/rule-from-frontend-styles-md] (only for src/api/users/create.ts)",
+	} {
+		if !strings.Contains(multi, want) {
+			t.Errorf("kb rules for two files lacks %q:\n%s", want, multi)
+		}
+	}
+	if out := must(t, "codex", "search", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts"); !strings.Contains(out, "rule for packages/web/src/a.css only: Rule from web-CLAUDE.md") || !strings.Contains(out, "rule for src/api/users/create.ts only: Rule from rules-api.md") {
+		t.Errorf("search by two files must say which file each rule is for:\n%s", out)
+	}
 	show := must(t, "codex", "show", "aiproxy/conventions/rule-from-web-claude-md")
 	if !strings.Contains(show, "conditional rule: applies only when working on ** under packages/web/") {
 		t.Errorf("nested CLAUDE.md should be conditional on its directory:\n%s", show)
@@ -1780,6 +1801,30 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Migrations are forward-only") {
 		t.Errorf("--when rule delivered as always-on:\n%s", got)
 	}
+	// A comma inside {a,b} belongs to its pattern; outside, it separates.
+	must(t, "claude-code", "add", "rule", "Components export a single default", "-d", "one component per file", "-e", "user said so", "--when", "src/ui/**/*.{ts,tsx}, stories/**")
+	for _, path := range []string{"src/ui/forms/Field.tsx", "src/ui/a.ts", "stories/button.mdx"} {
+		if got := forFile(path); !strings.Contains(got, "Components export a single default") {
+			t.Errorf("--when with brace alternatives, %s:\n%s", path, got)
+		}
+	}
+	if got := forFile("src/ui/a.css"); strings.Contains(got, "Components export a single default") {
+		t.Errorf("--when with brace alternatives matched too much:\n%s", got)
+	}
+	// --when limits rules added in bulk too; it is never dropped.
+	seedFile := filepath.Join(base, "seed.json")
+	os.WriteFile(seedFile, []byte(`[{"title":"Handlers return typed errors","description":"callers switch on them"},{"type":"fact","title":"The API gateway terminates TLS","description":"services speak plain HTTP behind it"}]`), 0o644)
+	out = must(t, "claude-code", "add", "rule", "--from", seedFile, "--when", "src/api/**", "-e", "user said so")
+	if !strings.Contains(out, "only rules can be limited to matching files") {
+		t.Errorf("a seeded entry that is not a rule must be refused with --when:\n%s", out)
+	}
+	if got := forFile("src/api/users/list.ts"); !strings.Contains(got, "Handlers return typed errors") {
+		t.Errorf("a seeded rule with --when:\n%s", got)
+	}
+	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Handlers return typed errors") {
+		t.Errorf("a seeded rule lost its condition and became always-on:\n%s", got)
+	}
+
 	// The same instruction for other files is a rule of its own; it repeats
 	// an existing one only where that one is already delivered.
 	must(t, "claude-code", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "services/billing/migrations/**")
@@ -2053,6 +2098,100 @@ func TestNativeRulesAndSubagentDelivery(t *testing.T) {
 	has("main under the new configuration directory", start(kubedl, "moved", "resume"), []string{volcano}, []string{english})
 	os.Unsetenv("CLAUDE_CONFIG_DIR")
 	has("main under the old configuration directory", start(kubedl, "moved", "resume"), []string{volcano, english}, nil)
+}
+
+// TestManagedFileOverflowAndHookEnvelope: a rule cut from the managed rules
+// file to fit its budget is still delivered by SessionStart, and what a
+// context hook prints stays within the hook limit once it is JSON.
+func TestManagedFileOverflowAndHookEnvelope(t *testing.T) {
+	base, home := hubEnv(t)
+	must(t, "", "hub", "init")
+	var items, titles []string
+	for i := 0; i < 30; i++ {
+		// Markup, quotes and backslashes: characters JSON has to escape.
+		title := fmt.Sprintf("Rule %02d: wrap <T> & \"quoted\" paths like C:\\tmp in <code> tags, %s", i, strings.Repeat("never the raw <b>value</b> & nothing else, ", 7))
+		titles = append(titles, fmt.Sprintf("Rule %02d:", i))
+		items = append(items, fmt.Sprintf(`{"type":"rule","global":true,"title":%q,"description":"because the team agreed on it"}`, title))
+	}
+	out, errs, code := kbRun(t, "claude-code", "["+strings.Join(items, ",")+"]", "add", "--from", "-", "-e", "user said so", "--force")
+	if code != 0 || !strings.Contains(out, "seeded 30 of 30") {
+		t.Fatalf("seed: %d\n%s\n%s", code, out, errs)
+	}
+	must(t, "", "install", "claude")
+	data, _ := os.ReadFile(filepath.Join(home, ".claude", "rules", "kb.md"))
+	file := string(data)
+	os.Chdir(base)
+	hook, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SessionStart","source":"startup","cwd":"`+base+`"}`, "hook", "claude")
+	inFile, inHook := 0, 0
+	for _, title := range titles {
+		f, h := strings.Contains(file, title), strings.Contains(hook, title)
+		if f {
+			inFile++
+		}
+		if h {
+			inHook++
+		}
+		if f && h {
+			t.Errorf("%s is in the managed file and delivered again by the hook", title)
+		}
+		if !f && !h {
+			t.Errorf("%s was cut from the managed file and not delivered by the hook either", title)
+		}
+	}
+	if inFile == 0 || inHook == 0 {
+		t.Fatalf("the test needs rules on both sides: %d in the file, %d in the hook", inFile, inHook)
+	}
+	var st struct {
+		Delivery struct {
+			Rendered int `json:"rendered"`
+			Native   int `json:"native"`
+		} `json:"rules_delivery"`
+	}
+	json.Unmarshal([]byte(must(t, "claude-code", "status", "--json")), &st)
+	if st.Delivery.Native != inFile || st.Delivery.Rendered != inHook {
+		t.Errorf("status reports %d from the file and %d from the hook, want %d and %d", st.Delivery.Native, st.Delivery.Rendered, inFile, inHook)
+	}
+
+	// What a context hook prints is JSON. The limit is on the output, so
+	// the envelope and the escaping count, and so does a refresh's notice.
+	units := func(s string) int {
+		n := 0
+		for _, r := range s {
+			if r >= 0x10000 {
+				n++
+			}
+			n++
+		}
+		return n
+	}
+	check := func(name, out string) {
+		t.Helper()
+		var m struct {
+			Out struct {
+				Context string `json:"additionalContext"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("%s: not JSON: %v", name, err)
+		}
+		if n := units(out); n > 9000 || n < 6000 {
+			t.Errorf("%s prints %d units: it must stay under the hook limit and use its budget", name, n)
+		}
+		if !strings.Contains(m.Out.Context, "wrap <T> & \"quoted\" paths like C:\\tmp") || strings.Contains(out, `\u003c`) {
+			t.Errorf("%s: the rule text must arrive as written, without HTML escapes:\n%.300s", name, out)
+		}
+		if !strings.Contains(m.Out.Context, "more rule(s)") && !strings.Contains(m.Out.Context, "left out") && !strings.Contains(m.Out.Context, "omitted") {
+			t.Errorf("%s: rules were cut to fit, and the payload must say so:\n%.300s", name, m.Out.Context[len(m.Out.Context)-300:])
+		}
+	}
+	sub, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore","cwd":"`+base+`"}`, "hook", "claude")
+	check("SubagentStart", sub)
+	must(t, "claude-code", "add", "rule", "One more rule to change the digest", "-d", "so a refresh is due", "-e", "user said so", "--global")
+	refresh, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Read","agent_id":"a1","agent_type":"Explore","cwd":"`+base+`"}`, "hook", "claude")
+	check("rule refresh", refresh)
+	if !strings.Contains(refresh, "changed since you last received them") {
+		t.Errorf("the refresh notice is part of the payload:\n%.200s", refresh)
+	}
 }
 
 // TestRuleRefreshWhenNoRulesRemain: when the last rule an agent holds is

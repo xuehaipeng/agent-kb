@@ -29,10 +29,7 @@ type hookInput struct {
 // hookContext prints additionalContext for events that take context only
 // as JSON (SubagentStart, PreToolUse). It sets no decision.
 func (a *App) hookContext(event, text string) {
-	out, err := json.Marshal(map[string]any{"hookSpecificOutput": map[string]any{"hookEventName": event, "additionalContext": text}})
-	if err == nil {
-		fmt.Fprintln(a.Stdout, string(out))
-	}
+	fmt.Fprint(a.Stdout, kb.HookContext(event, text))
 }
 
 // cmdHook never fails the agent: errors go to the local log, exit code is 0.
@@ -111,7 +108,7 @@ func (a *App) cmdHook(args []string) int {
 		}
 		switch {
 		case d.Text != "":
-			a.hookContext("PreToolUse", "kb: the rules that apply here changed since you last received them. They are now:\n"+d.Text)
+			a.hookContext("PreToolUse", kb.RuleRefreshNotice+d.Text)
 		case last != nil && last.Rules > 0:
 			// The last rule it holds was retired or no longer applies here:
 			// say so, or it goes on following an instruction that is gone.

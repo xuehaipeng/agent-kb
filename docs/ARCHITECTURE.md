@@ -475,9 +475,14 @@ applies_to:
   (`rules_conditional`).
 - It surfaces for a matching file: `kb rules -f <path>` and `kb search -f
   <path>` (which the pointer already tells agents to run before touching
-  unfamiliar code). `kb rules --all-rules` lists them with their condition.
+  unfamiliar code). Asked about several files at once, each rule names the
+  files it governs, so a rule for one package is never presented as a rule
+  for another. `kb rules --all-rules` lists them with their condition.
   Nothing pushes them yet; a file-access hook is issue #3 item 4.
-- Only rules can be conditional (`kb add rule ... --when <glob>`).
+- Only rules can be conditional (`kb add rule ... --when <glob>`). `--when`
+  repeats or takes a comma-separated list; a comma inside `{a,b}` belongs to
+  its pattern. With `--from` it limits every seeded rule, and an item that
+  is not a rule is refused instead of being added without the condition.
 - Patterns follow Claude Code's documented rule syntax: `**` crosses
   directories; a bare name matches at any depth; a leading `/` anchors to the
   base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work. A
@@ -495,6 +500,7 @@ applies_to:
 | Cursor rule that is not `alwaysApply: true`, other agents' `globs`/`trigger` | not imported: kb cannot reproduce that condition |
 | `CLAUDE.local.md` | not imported: personal, uncommitted instructions stay private |
 | a link or `@path` import leaving the repository (or `~/.claude` for user files) | not followed |
+| a repository instruction file that is itself a link to somewhere outside it (a nested `CLAUDE.md` included) | not imported |
 | `@AGENTS.md` | not followed: other agents read it natively |
 | kb's own blocks and pointer | never re-imported |
 
@@ -541,12 +547,19 @@ can be trusted with.
   installation, in the Claude configuration directory the session reads
   (`CLAUDE_CONFIG_DIR`), present, and holding exactly what would be written
   now. If not, SessionStart delivers the universal rules itself.
+- **Only what the file holds is left to it.** The file has its own budget.
+  A rule cut from it to fit stays SessionStart's to deliver, and the
+  diagnostics count as "from the managed file" only the rules that are in it.
 - **One place.** The record keeps the choice to use the file, not a path to
   reuse: an install under another configuration directory writes the file
   there and removes the one it wrote before.
 - **Nothing is suppressed by session.** SessionStart delivers on every
   startup, resume, clear, compaction and fork: a session seen before may
   hold rules that have since changed.
+- **The hook limit is on what a hook prints.** `SubagentStart` and the rule
+  refresh hand over context as JSON, so their budget covers the serialized
+  output: the envelope, the escaping of the text, and the refresh's opening
+  notice. HTML characters are not escaped.
 - **Subagents get the complete set** through `SubagentStart`, whatever the
   main agent received and whatever the subagent's type. Explore, Plan and
   agents with `omitClaudeMd` load no instruction files, and which other
