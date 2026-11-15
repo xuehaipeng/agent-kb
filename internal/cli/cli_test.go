@@ -1234,6 +1234,18 @@ func TestClaudeMemoryDeterministicImport(t *testing.T) {
 	if p, _ := os.ReadFile(prompt); !strings.Contains(string(p), "Production runbook") || !strings.Contains(string(p), "notes_that_do_not_exist.md") || strings.Contains(string(p), "feedback_testing.md") {
 		t.Fatalf("external references must reach the fallback, topic pointers must not:\n%s", p)
 	}
+	// A link into a subdirectory names a file the topic scan never reads:
+	// an index of such links is not a table of contents to skip.
+	os.MkdirAll(filepath.Join(mem, "topics"), 0o755)
+	os.WriteFile(filepath.Join(mem, "topics", "runbook.md"), []byte("Restart the queue workers before the API during a rollback.\n"), 0o644)
+	write("MEMORY.md", "# Memory index\n\n- [Rollback runbook](topics/runbook.md) — read it before any rollback\n")
+	if out := scan(cmd); !strings.Contains(out, "fallback: MEMORY.md holds notes besides its 0 link(s)") || strings.Contains(out, "1 index skipped") {
+		t.Fatalf("an index linking to a nested file:\n%s", out)
+	}
+	if p, _ := os.ReadFile(prompt); !strings.Contains(string(p), "topics/runbook.md") {
+		t.Fatalf("a nested link must reach the fallback:\n%s", p)
+	}
+	os.RemoveAll(filepath.Join(mem, "topics"))
 
 	// A typed file the earlier model-based import already took is not
 	// imported a second time: unchanged it is done, changed it stays on the
@@ -1648,6 +1660,12 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(home, "outside.md"), []byte("Content outside the repository that must not be imported.\n"), 0o644)
 	os.WriteFile(filepath.Join(home, "shared-rule.md"), []byte("A rule that lives outside the repository.\n"), 0o644)
 	os.Symlink(filepath.Join(home, "shared-rule.md"), filepath.Join(repo, ".claude", "rules", "linked.md"))
+	// A nested instruction file that is a link to somewhere outside the
+	// repository is not the repository's content.
+	os.MkdirAll(filepath.Join(repo, "packages", "api"), 0o755)
+	os.Symlink(filepath.Join(home, "outside.md"), filepath.Join(repo, "packages", "api", "CLAUDE.md"))
+	// A link back to the rules directory itself: read once, not for ever.
+	os.Symlink(".", filepath.Join(repo, ".claude", "rules", "shared"))
 	git(t, repo, "add", "-A")
 	git(t, repo, "commit", "-qm", "rules")
 
@@ -1659,19 +1677,23 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	os.WriteFile(script, []byte("#!/bin/sh\nP=$(cat)\nF=$(printf '%s\\n' \"$P\" | sed -n 's/^File \\(.*\\):$/\\1/p' | tail -1)\nN=$(basename \"$(dirname \"$F\")\")-$(basename \"$F\")\nprintf '%s' \"$P\" > '"+prompts+"'/\"$N\".txt\nprintf '[{\"title\":\"Rule from %s\",\"description\":\"imported for the test\"}]' \"$N\"\n"), 0o755)
 	os.Chdir(repo)
 	out := must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if n := strings.Count(out, "rules/general.md: added 1"); n != 1 {
+		t.Errorf("a rules directory linked into itself must be read once, got %d:\n%s", n, out)
+	}
 	for _, want := range []string{
 		".claude/rules/broken.md: not imported (its frontmatter does not parse",
 		".claude/rules/badglob.md: not imported (pattern \"photos [2024/**\"",
 		".cursor/rules/attached.mdc: not imported (a Cursor rule that is not `alwaysApply: true`",
 		"note: CLAUDE.local.md: not imported (personal instructions",
 		".claude/rules/linked.md: not imported (a link to a location outside",
+		"packages/api/CLAUDE.md: not imported (a link to a location outside",
 		"CLAUDE.md: @AGENTS.md was not followed (other agents read AGENTS.md natively); @~/outside.md was not followed (it is outside",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("import report lacks %q:\n%s", want, out)
 		}
 	}
-	for _, not := range []string{"Rule from rules-broken.md", "Rule from rules-badglob.md", "Rule from rules-attached.mdc", "Rule from rules-linked.md", "CLAUDE.local.md: added"} {
+	for _, not := range []string{"Rule from rules-broken.md", "Rule from rules-badglob.md", "Rule from rules-attached.mdc", "Rule from rules-linked.md", "Rule from api-CLAUDE.md", "CLAUDE.local.md: added"} {
 		if strings.Contains(out, not) {
 			t.Errorf("import report must not contain %q:\n%s", not, out)
 		}
@@ -1743,6 +1765,22 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if out := must(t, "codex", "search", "-f", "src/api/users/create.ts"); !strings.Contains(out, "rule for this file: Rule from rules-api.md") {
 		t.Errorf("search by file:\n%s", out)
 	}
+	// Several files at once: each rule names the files it governs, so a
+	// rule for one package is not handed over as a rule for the other.
+	multi := must(t, "codex", "rules", "-q", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts")
+	for _, want := range []string{
+		"each applies only to the files named after it",
+		"Rule from web-CLAUDE.md - imported for the test [aiproxy/conventions/rule-from-web-claude-md] (only for packages/web/src/a.css)",
+		"Rule from rules-api.md - imported for the test [aiproxy/conventions/rule-from-rules-api-md] (only for src/api/users/create.ts)",
+		"Rule from frontend-styles.md - imported for the test [aiproxy/conventions/rule-from-frontend-styles-md] (only for src/api/users/create.ts)",
+	} {
+		if !strings.Contains(multi, want) {
+			t.Errorf("kb rules for two files lacks %q:\n%s", want, multi)
+		}
+	}
+	if out := must(t, "codex", "search", "-f", "packages/web/src/a.css", "-f", "src/api/users/create.ts"); !strings.Contains(out, "rule for packages/web/src/a.css only: Rule from web-CLAUDE.md") || !strings.Contains(out, "rule for src/api/users/create.ts only: Rule from rules-api.md") {
+		t.Errorf("search by two files must say which file each rule is for:\n%s", out)
+	}
 	show := must(t, "codex", "show", "aiproxy/conventions/rule-from-web-claude-md")
 	if !strings.Contains(show, "conditional rule: applies only when working on ** under packages/web/") {
 		t.Errorf("nested CLAUDE.md should be conditional on its directory:\n%s", show)
@@ -1763,6 +1801,73 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Migrations are forward-only") {
 		t.Errorf("--when rule delivered as always-on:\n%s", got)
 	}
+	// A comma inside {a,b} belongs to its pattern; outside, it separates.
+	must(t, "claude-code", "add", "rule", "Components export a single default", "-d", "one component per file", "-e", "user said so", "--when", "src/ui/**/*.{ts,tsx}, stories/**")
+	for _, path := range []string{"src/ui/forms/Field.tsx", "src/ui/a.ts", "stories/button.mdx"} {
+		if got := forFile(path); !strings.Contains(got, "Components export a single default") {
+			t.Errorf("--when with brace alternatives, %s:\n%s", path, got)
+		}
+	}
+	if got := forFile("src/ui/a.css"); strings.Contains(got, "Components export a single default") {
+		t.Errorf("--when with brace alternatives matched too much:\n%s", got)
+	}
+	// --when limits rules added in bulk too; it is never dropped.
+	seedFile := filepath.Join(base, "seed.json")
+	os.WriteFile(seedFile, []byte(`[{"title":"Handlers return typed errors","description":"callers switch on them"},{"type":"fact","title":"The API gateway terminates TLS","description":"services speak plain HTTP behind it"}]`), 0o644)
+	out = must(t, "claude-code", "add", "rule", "--from", seedFile, "--when", "src/api/**", "-e", "user said so")
+	if !strings.Contains(out, "only rules can be limited to matching files") {
+		t.Errorf("a seeded entry that is not a rule must be refused with --when:\n%s", out)
+	}
+	if got := forFile("src/api/users/list.ts"); !strings.Contains(got, "Handlers return typed errors") {
+		t.Errorf("a seeded rule with --when:\n%s", got)
+	}
+	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Handlers return typed errors") {
+		t.Errorf("a seeded rule lost its condition and became always-on:\n%s", got)
+	}
+
+	// The same instruction for other files is a rule of its own; it repeats
+	// an existing one only where that one is already delivered.
+	must(t, "claude-code", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "services/billing/migrations/**")
+	if got := forFile("services/billing/migrations/0001.sql"); !strings.Contains(got, "Migrations are forward-only") {
+		t.Errorf("the same rule for another directory:\n%s", got)
+	}
+	if _, errs, code := kbRun(t, "claude-code", "", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "db/migrations/**"); code == 0 || !strings.Contains(errs, "db/migrations") && !strings.Contains(errs, "migrations-are-forward-only") {
+		t.Errorf("the same rule for the same files is a duplicate: exit %d\n%s", code, errs)
+	}
+	must(t, "claude-code", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so")
+	if _, _, code := kbRun(t, "claude-code", "", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "tools/migrations/**"); code == 0 {
+		t.Error("a rule that already applies everywhere covers every narrower copy")
+	}
+
+	// Narrowing a rule file's paths changes nothing in its text, yet the
+	// rules it gave follow the new condition.
+	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/v2/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if !strings.Contains(out, "rules/api.md: its condition changed; 1 rule(s) follow it [aiproxy/conventions/rule-from-rules-api-md]") || !strings.Contains(out, "rules/api.md: added 0, duplicates 1") {
+		t.Errorf("a changed paths condition:\n%s", out)
+	}
+	if got := forFile("src/api/users/create.ts"); strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("the rule kept its old, wider condition:\n%s", got)
+	}
+	if got := forFile("src/api/v2/users/create.ts"); !strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("the rule did not take the new condition:\n%s", got)
+	}
+	if api := read("rules-api.md"); !strings.Contains(api, "The rules in this file apply only when working on src/api/v2/**/*.ts") || !strings.Contains(api, "Rule from web-CLAUDE.md (only when working on ** under packages/web/)") {
+		t.Errorf("the prompt must say which files the rules are for:\n%s", api)
+	}
+	// Dropping the condition makes the rule apply everywhere.
+	file(".claude/rules/api.md", "# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); !strings.Contains(out, "rules/api.md: its condition changed; 1 rule(s) follow it") {
+		t.Errorf("a removed paths condition:\n%s", out)
+	}
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("an unconditional rule file's rule must be always-on:\n%s", got)
+	}
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); strings.Contains(out, "condition changed") || !strings.Contains(out, "rules/api.md: skipped (unchanged since last import)") {
+		t.Errorf("nothing changed, nothing to reconcile:\n%s", out)
+	}
+	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+
 	// A path-scoped file named on the command line has no known base.
 	if out := must(t, "", "rules", "import", filepath.Join(repo, ".claude", "rules", "api.md"), "--cmd", script); !strings.Contains(out, "its base directory is unknown here") {
 		t.Errorf("explicit path-scoped file:\n%s", out)
@@ -1973,6 +2078,173 @@ func TestNativeRulesAndSubagentDelivery(t *testing.T) {
 	if h := hooksIn(); h["PreToolUse"] != nil {
 		t.Fatalf("refresh hook not removed: %v", h)
 	}
+
+	// The same hub installed for another Claude configuration directory:
+	// the choice to use the managed file is kept, the file goes where that
+	// configuration is read from, and a session under the old directory no
+	// longer counts on a file that is not there.
+	has("main in kubedl before the move", start(kubedl, "moved", "startup"), []string{volcano}, []string{english})
+	other := filepath.Join(home, "claude-work")
+	t.Setenv("CLAUDE_CONFIG_DIR", other)
+	out = must(t, "", "install", "claude")
+	moved, _ := os.ReadFile(filepath.Join(other, "rules", "kb.md"))
+	has("managed rules file in the new configuration directory", string(moved), []string{english, "<!-- kb:source " + hub}, []string{volcano})
+	if _, err := os.Stat(filepath.Join(other, "settings.json")); err != nil {
+		t.Errorf("settings were not written to the new configuration directory: %v", err)
+	}
+	if _, err := os.Stat(native); err == nil || !strings.Contains(out, "removed "+native) {
+		t.Errorf("the file of the earlier configuration directory must go, and be reported:\n%s", out)
+	}
+	has("main under the new configuration directory", start(kubedl, "moved", "resume"), []string{volcano}, []string{english})
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	has("main under the old configuration directory", start(kubedl, "moved", "resume"), []string{volcano, english}, nil)
+}
+
+// TestManagedFileOverflowAndHookEnvelope: a rule cut from the managed rules
+// file to fit its budget is still delivered by SessionStart, and what a
+// context hook prints stays within the hook limit once it is JSON.
+func TestManagedFileOverflowAndHookEnvelope(t *testing.T) {
+	base, home := hubEnv(t)
+	must(t, "", "hub", "init")
+	var items, titles []string
+	for i := 0; i < 30; i++ {
+		// Markup, quotes and backslashes: characters JSON has to escape.
+		title := fmt.Sprintf("Rule %02d: wrap <T> & \"quoted\" paths like C:\\tmp in <code> tags, %s", i, strings.Repeat("never the raw <b>value</b> & nothing else, ", 7))
+		titles = append(titles, fmt.Sprintf("Rule %02d:", i))
+		items = append(items, fmt.Sprintf(`{"type":"rule","global":true,"title":%q,"description":"because the team agreed on it"}`, title))
+	}
+	out, errs, code := kbRun(t, "claude-code", "["+strings.Join(items, ",")+"]", "add", "--from", "-", "-e", "user said so", "--force")
+	if code != 0 || !strings.Contains(out, "seeded 30 of 30") {
+		t.Fatalf("seed: %d\n%s\n%s", code, out, errs)
+	}
+	must(t, "", "install", "claude")
+	data, _ := os.ReadFile(filepath.Join(home, ".claude", "rules", "kb.md"))
+	file := string(data)
+	os.Chdir(base)
+	hook, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SessionStart","source":"startup","cwd":"`+base+`"}`, "hook", "claude")
+	inFile, inHook := 0, 0
+	for _, title := range titles {
+		f, h := strings.Contains(file, title), strings.Contains(hook, title)
+		if f {
+			inFile++
+		}
+		if h {
+			inHook++
+		}
+		if f && h {
+			t.Errorf("%s is in the managed file and delivered again by the hook", title)
+		}
+		if !f && !h {
+			t.Errorf("%s was cut from the managed file and not delivered by the hook either", title)
+		}
+	}
+	if inFile == 0 || inHook == 0 {
+		t.Fatalf("the test needs rules on both sides: %d in the file, %d in the hook", inFile, inHook)
+	}
+	var st struct {
+		Delivery struct {
+			Rendered int `json:"rendered"`
+			Native   int `json:"native"`
+		} `json:"rules_delivery"`
+	}
+	json.Unmarshal([]byte(must(t, "claude-code", "status", "--json")), &st)
+	if st.Delivery.Native != inFile || st.Delivery.Rendered != inHook {
+		t.Errorf("status reports %d from the file and %d from the hook, want %d and %d", st.Delivery.Native, st.Delivery.Rendered, inFile, inHook)
+	}
+
+	// What a context hook prints is JSON. The limit is on the output, so
+	// the envelope and the escaping count, and so does a refresh's notice.
+	units := func(s string) int {
+		n := 0
+		for _, r := range s {
+			if r >= 0x10000 {
+				n++
+			}
+			n++
+		}
+		return n
+	}
+	check := func(name, out string) {
+		t.Helper()
+		var m struct {
+			Out struct {
+				Context string `json:"additionalContext"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("%s: not JSON: %v", name, err)
+		}
+		if n := units(out); n > 9000 || n < 6000 {
+			t.Errorf("%s prints %d units: it must stay under the hook limit and use its budget", name, n)
+		}
+		if !strings.Contains(m.Out.Context, "wrap <T> & \"quoted\" paths like C:\\tmp") || strings.Contains(out, `\u003c`) {
+			t.Errorf("%s: the rule text must arrive as written, without HTML escapes:\n%.300s", name, out)
+		}
+		if !strings.Contains(m.Out.Context, "more rule(s)") && !strings.Contains(m.Out.Context, "left out") && !strings.Contains(m.Out.Context, "omitted") {
+			t.Errorf("%s: rules were cut to fit, and the payload must say so:\n%.300s", name, m.Out.Context[len(m.Out.Context)-300:])
+		}
+	}
+	sub, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore","cwd":"`+base+`"}`, "hook", "claude")
+	check("SubagentStart", sub)
+	must(t, "claude-code", "add", "rule", "One more rule to change the digest", "-d", "so a refresh is due", "-e", "user said so", "--global")
+	refresh, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Read","agent_id":"a1","agent_type":"Explore","cwd":"`+base+`"}`, "hook", "claude")
+	check("rule refresh", refresh)
+	if !strings.Contains(refresh, "changed since you last received them") {
+		t.Errorf("the refresh notice is part of the payload:\n%.200s", refresh)
+	}
+}
+
+// TestRuleRefreshWhenNoRulesRemain: when the last rule an agent holds is
+// retired, the refresh hook says so once instead of staying silent with the
+// agent marked stale for ever.
+func TestRuleRefreshWhenNoRulesRemain(t *testing.T) {
+	base, _ := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	os.Chdir(repo)
+	must(t, "claude-code", "add", "rule", "Squash commits before merging", "-d", "history stays readable", "-e", "user said so")
+	hook := func(input string) string {
+		t.Helper()
+		out, _, code := kbRun(t, "claude-code", input, "hook", "claude")
+		if code != 0 {
+			t.Fatalf("hook exit %d", code)
+		}
+		return out
+	}
+	tool := func(agent string) string {
+		in := `{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Read","cwd":"` + repo + `"`
+		if agent != "" {
+			in += `,"agent_id":"` + agent + `","agent_type":"Explore"`
+		}
+		return hook(in + "}")
+	}
+	if out := hook(`{"session_id":"s1","hook_event_name":"SessionStart","source":"startup","cwd":"` + repo + `"}`); !strings.Contains(out, "Squash commits before merging") {
+		t.Fatalf("session start:\n%s", out)
+	}
+	hook(`{"session_id":"s1","hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore","cwd":"` + repo + `"}`)
+	if out := tool("") + tool("a1"); out != "" {
+		t.Fatalf("nothing changed yet:\n%s", out)
+	}
+	must(t, "claude-code", "deprecate", "aiproxy/conventions/squash-commits-before-merging", "-m", "the team merges with merge commits now")
+	for _, agent := range []string{"", "a1"} {
+		out := tool(agent)
+		if !strings.Contains(out, "no longer apply here, and no kb rules apply now") || strings.Contains(out, "Squash commits") {
+			t.Errorf("agent %q was not told its rules are gone:\n%s", agent, out)
+		}
+		if again := tool(agent); again != "" {
+			t.Errorf("agent %q is told once:\n%s", agent, again)
+		}
+	}
+	if diag := must(t, "claude-code", "rules", "--delivery"); strings.Contains(diag, "STALE") {
+		t.Errorf("no agent is stale after the refresh:\n%s", diag)
+	}
+	// An agent that never held a rule is not told that its rules are gone.
+	if out := tool("a2"); out != "" {
+		t.Errorf("an agent without rules has nothing to retract:\n%s", out)
+	}
+	if out := tool("a2"); out != "" {
+		t.Errorf("and is not looked at again:\n%s", out)
+	}
 }
 
 // Item 6B: a memory directory is imported only when its project is
@@ -2096,6 +2368,33 @@ func TestMemoryDiscoveryAndOwnership(t *testing.T) {
 			t.Errorf("sources report lacks %q:\n%s", want, report)
 		}
 	}
+	// A directory already imported into one project is mapped to another.
+	// Its sources are known by path, so nothing is written until that is
+	// settled by hand; then it is imported anew and the old entries stay.
+	put(filepath.Join(shared, "memory"), "project_two.md", topic("two", "Shared directory note", "project", "A note from a directory two projects wrote to, edited since."))
+	must(t, "", "extract", "--map-root", filepath.Join(shared, "memory")+"=aiproxy")
+	if out := scan(); !strings.Contains(out, "projects/work/memory: skipped (1 of its files were imported into kubedl, and the directory now belongs to aiproxy; nothing is moved on its own") || strings.Contains(out, "projects/work/memory [aiproxy]") {
+		t.Errorf("a directory whose owner changed after it was imported:\n%s", out)
+	}
+	if got := must(t, "codex", "show", "kubedl/facts/shared-directory-note"); strings.Contains(got, "edited since") {
+		t.Errorf("the new owner's memory was written into the old owner's entry:\n%s", got)
+	}
+	out = scan("--accept-conflicts")
+	if !strings.Contains(out, "projects/work/memory [aiproxy]: 1 imported") || !strings.Contains(out, "its earlier imports into kubedl are no longer tied to it; these entries stay there until someone retires them: kubedl/facts/shared-directory-note") {
+		t.Errorf("settling an owner change by hand:\n%s", out)
+	}
+	if got := search("shared directory note"); !strings.Contains(got, "aiproxy/facts/shared-directory-note") || !strings.Contains(got, "kubedl/facts/shared-directory-note") {
+		t.Errorf("imported anew for the new owner, the old entry kept:\n%s", got)
+	}
+	if out := scan(); strings.Contains(out, "imported into kubedl") || !strings.Contains(out, "projects/work/memory [aiproxy]: 0 imported, 0 updated, 1 unchanged") {
+		t.Errorf("once settled, the directory is its new owner's:\n%s", out)
+	}
+	must(t, "", "extract", "--map-root", filepath.Join(shared, "memory")+"=kubedl")
+	if out := scan(); !strings.Contains(out, "imported into aiproxy, and the directory now belongs to kubedl") {
+		t.Errorf("mapping it back is an owner change too:\n%s", out)
+	}
+	must(t, "", "extract", "--map-root", filepath.Join(shared, "memory")+"=aiproxy")
+
 	// Removing a mapping makes the directory unowned again; its entries stay.
 	must(t, "", "extract", "--map-root", userMem+"=")
 	if out := scan(); !strings.Contains(out, "mem-user: skipped (autoMemoryDirectory in") {
@@ -2112,8 +2411,109 @@ func TestMemoryDiscoveryAndOwnership(t *testing.T) {
 	if rep := must(t, "", "extract", "--sources"); !strings.Contains(rep, "transcript retention: 30 day(s) (the default)") {
 		t.Errorf("default retention:\n%s", rep)
 	}
+
+	// Everything said about a directory is weighed before it gets an
+	// owner. Named by one repository's settings and by a settings file any
+	// project may run with: shared, so not imported.
+	sharedSettings := filepath.Join(base, "shared-settings.json")
+	os.WriteFile(sharedSettings, []byte(`{"autoMemoryDirectory":"`+repoMem+`"}`), 0o644)
+	put(repoMem, "project_seven.md", topic("seven", "Late note in a directory that turned out shared", "project", "Written after the directory was named by a shared settings file."))
+	if out := scan("--settings", sharedSettings); !strings.Contains(out, "mem-kubedl: skipped (autoMemoryDirectory in ") || strings.Contains(out, "mem-kubedl [kubedl]") {
+		t.Errorf("a repository's directory that a shared settings file also names:\n%s", out)
+	}
+	if got := search("late note directory turned out shared"); strings.Contains(got, "late-note") {
+		t.Errorf("a note from a directory a shared settings file names was imported:\n%s", got)
+	}
+	// A default directory with one owner that user settings point every
+	// project at: shared as well.
+	put(filepath.Join(alt, "projects", "-x-kubedl", "memory"), "project_eight.md", topic("eight", "Late note in a default directory", "project", "Written after user settings named the directory."))
+	put(alt, "settings.json", `{"autoMemoryDirectory":"`+filepath.Join(alt, "projects", "-x-kubedl", "memory")+`"}`)
+	if out := scan(); !strings.Contains(out, "-x-kubedl/memory: skipped (autoMemoryDirectory in ") || strings.Contains(out, "-x-kubedl/memory [kubedl]") {
+		t.Errorf("a default directory that user settings name for every project:\n%s", out)
+	}
+	if got := search("late note default directory"); strings.Contains(got, "late-note-in-a-default-directory") {
+		t.Errorf("a note from a default directory user settings share was imported:\n%s", got)
+	}
+	os.Remove(filepath.Join(alt, "settings.json"))
+	// Named by two repositories: neither owns it.
+	put(filepath.Join(aiproxy, ".claude"), "settings.local.json", `{"autoMemoryDirectory":"`+repoMem+`"}`)
+	if out := scan(); !strings.Contains(out, "mem-kubedl: skipped (several projects are named as its owner (aiproxy, kubedl)") {
+		t.Errorf("a directory two repositories name:\n%s", out)
+	}
+	os.Remove(filepath.Join(aiproxy, ".claude", "settings.local.json"))
+	// A session that ran somewhere this hub does not know is evidence too:
+	// the directory is not one project's alone.
+	stray := filepath.Join(alt, "projects", "-x-stray")
+	unknown := filepath.Join(base, "not-a-project")
+	os.MkdirAll(unknown, 0o755)
+	transcript(stray, "a.jsonl", kubedl)
+	transcript(stray, "b.jsonl", unknown)
+	put(filepath.Join(stray, "memory"), "project_ten.md", topic("ten", "Note from a directory with a stray session", "project", "One session ran outside every known project."))
+	if out := scan(); !strings.Contains(out, "-x-stray/memory: skipped (sessions that wrote to it ran in kubedl and also outside any project known here") {
+		t.Errorf("a directory with a session outside every known project:\n%s", out)
+	}
+	// Ownership looks at every transcript, not the last few by name: one
+	// early session in another project makes the directory shared.
+	many := filepath.Join(alt, "projects", "-x-many")
+	transcript(many, "000.jsonl", aiproxy)
+	for i := 1; i <= 70; i++ {
+		transcript(many, fmt.Sprintf("%03d.jsonl", i), kubedl)
+	}
+	put(filepath.Join(many, "memory"), "project_nine.md", topic("nine", "Note in a directory with many sessions", "project", "Seventy sessions in one project and one in another."))
+	if out := scan(); !strings.Contains(out, "-x-many/memory: skipped (its transcripts ran in several projects (aiproxy, kubedl)") {
+		t.Errorf("a directory with more transcripts than a sample would read:\n%s", out)
+	}
 	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {
 		t.Errorf("mappings leaked into the shared hub:\n%s", st)
+	}
+}
+
+// TestRepoModeMemoryFromSeveralRepositories: a repository bundle only knows
+// its own repository, but a session that ran in another one still shows
+// that a memory directory is not this repository's alone. Each repository
+// scanning it would otherwise import the other's notes.
+func TestRepoModeMemoryFromSeveralRepositories(t *testing.T) {
+	repo := setupRepo(t)
+	must(t, "", "init")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	other := t.TempDir()
+	write := func(dir, name, content string) {
+		t.Helper()
+		os.MkdirAll(dir, 0o755)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	transcript := func(dir, name, cwd string) {
+		write(dir, name, `{"type":"user","cwd":"`+cwd+`","sessionId":"`+name+`","message":{"role":"user","content":"hi"}}`+"\n")
+	}
+	note := func(title string) string {
+		return "---\nname: n\ndescription: " + title + "\ntype: project\n---\n\nSomething worth keeping about it.\n"
+	}
+	own := filepath.Join(home, ".claude", "projects", "-own")
+	transcript(own, "a.jsonl", repo)
+	write(filepath.Join(own, "memory"), "project_own.md", note("Releases are cut from the main branch"))
+	mixed := filepath.Join(home, ".claude", "projects", "-mixed")
+	transcript(mixed, "a.jsonl", repo)
+	transcript(mixed, "b.jsonl", other)
+	write(filepath.Join(mixed, "memory"), "project_mixed.md", note("A note that may be about the other repository"))
+
+	out := must(t, "", "extract", "--scan", "claude-memory", "--cmd", "/nonexistent/model")
+	if !strings.Contains(out, "-own/memory") || !strings.Contains(out, "1 imported") {
+		t.Errorf("this repository's own directory:\n%s", out)
+	}
+	if !strings.Contains(out, "-mixed/memory: skipped (sessions that wrote to it ran in this repository and also outside it") {
+		t.Errorf("a directory another repository's session wrote to:\n%s", out)
+	}
+	if got := must(t, "codex", "search", "note other repository", "--no-docs"); strings.Contains(got, "may-be-about-the-other-repository") {
+		t.Errorf("notes from a directory shared with another repository were imported:\n%s", got)
+	}
+	// A mapping made by hand still settles it.
+	must(t, "", "extract", "--map-root", filepath.Join(mixed, "memory")+"=here")
+	if out := must(t, "", "extract", "--scan", "claude-memory", "--cmd", "/nonexistent/model"); !strings.Contains(out, "-mixed/memory") || strings.Contains(out, "-mixed/memory: skipped") {
+		t.Errorf("after mapping by hand:\n%s", out)
 	}
 }
 
@@ -2151,6 +2551,37 @@ func TestAccessStatisticsAreOnlyASignal(t *testing.T) {
 	if e := acc.Entries["aiproxy/conventions/use-pnpm-never-npm"]; e.Delivered != 1 || e.Shown != 0 {
 		t.Errorf("a rule pushed by the hook is delivered, not shown: %+v", e)
 	}
+	// Rules reach agents without hooks too: 'kb rules' (what the pointer
+	// tells every agent to run) and the MCP server's instructions.
+	delivered := func(id string) int {
+		t.Helper()
+		data, _ := os.ReadFile(filepath.Join(os.Getenv("KB_HOME"), ".kb", "access.json"))
+		var a struct {
+			Entries map[string]struct{ Delivered int } `json:"entries"`
+		}
+		json.Unmarshal(data, &a)
+		return a.Entries[id].Delivered
+	}
+	const pnpmRule = "aiproxy/conventions/use-pnpm-never-npm"
+	must(t, "codex", "rules", "-q")
+	if n := delivered(pnpmRule); n != 2 {
+		t.Errorf("'kb rules' hands rules to the agent that runs it: delivered %d, want 2", n)
+	}
+	if out, _, code := kbRun(t, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"cursor"}}}`+"\n", "mcp"); code != 0 || !strings.Contains(out, "Use pnpm, never npm") {
+		t.Fatalf("mcp initialize: exit %d\n%s", code, out)
+	}
+	if n := delivered(pnpmRule); n != 3 {
+		t.Errorf("the MCP instructions hand rules to the client: delivered %d, want 3", n)
+	}
+	must(t, "claude-code", "add", "rule", "Handlers validate their input", "-d", "with the shared schemas", "-e", "user said so", "--when", "src/api/**")
+	must(t, "codex", "rules", "-q", "-f", "src/api/users.ts")
+	if n := delivered("aiproxy/conventions/handlers-validate-their-input"); n != 1 {
+		t.Errorf("'kb rules -f' hands over the rules for that file: delivered %d, want 1", n)
+	}
+	must(t, "codex", "rules", "-q", "--all") // every project at once is an inspection
+	if n := delivered(pnpmRule); n != 3 {
+		t.Errorf("listing every project's rules is not a delivery: delivered %d, want 3", n)
+	}
 	out := must(t, "codex", "status", "--access")
 	for _, want := range []string{"a maintenance signal for this machine only", "never retrieved on this machine", learning + ": last ", "listed 2, shown 1, delivered 0"} {
 		if !strings.Contains(out, want) {
@@ -2179,7 +2610,7 @@ func TestAccessStatisticsAreOnlyASignal(t *testing.T) {
 		t.Errorf("an entry changed because it was retrieved:\n%s", after)
 	}
 	os.Chdir(base)
-	if all := must(t, "codex", "status", "--all"); !strings.Contains(all, "knowledge: 6 active") || !strings.Contains(all, "deprecated 0") {
+	if all := must(t, "codex", "status", "--all"); !strings.Contains(all, "knowledge: 7 active") || !strings.Contains(all, "deprecated 0") {
 		t.Errorf("access statistics must not retire anything:\n%s", all)
 	}
 	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {

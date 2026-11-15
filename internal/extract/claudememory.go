@@ -165,7 +165,7 @@ var indexTargetRe = regexp.MustCompile(`\]\(([^)\s]+)[^)]*\)`)
 // everything else. A pointer is a link line whose target is a memory file in
 // the same directory: that file is imported itself. Any other line is
 // content of the index: a note, or a link to somewhere else (a runbook, a
-// dashboard), which no topic file preserves. An index with pointers only is
+// dashboard, a file in a subdirectory), which no topic file preserves. An index with pointers only is
 // a table of contents; one with other lines holds notes of its own.
 func splitIndex(content, dir string) (links int, rest string) {
 	var keep []string
@@ -188,7 +188,8 @@ func splitIndex(content, dir string) (links int, rest string) {
 }
 
 // pointsToTopic reports whether a link line's first target is a Markdown
-// file that exists in dir.
+// file directly in dir: the files the topic scan reads. A file in a
+// subdirectory is not scanned, so a link to it is content of the index.
 func pointsToTopic(line, dir string) bool {
 	m := indexTargetRe.FindStringSubmatch(line)
 	if m == nil {
@@ -202,7 +203,7 @@ func pointsToTopic(line, dir string) bool {
 		return false
 	}
 	p := filepath.Join(dir, filepath.FromSlash(target))
-	if !within(dir, p) {
+	if filepath.Dir(p) != filepath.Clean(dir) {
 		return false
 	}
 	st, err := os.Stat(p)
@@ -328,6 +329,20 @@ func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 			report = append(report, fmt.Sprintf("%s: skipped (not in the selected projects)", displayPath(root.Dir)))
 			continue
 		}
+		// The directory was imported into another project before (a mapping
+		// changed, or what establishes its owner did). Its sources are known
+		// by path, so going on would keep writing this project's memory
+		// into the other one. Nothing moves on its own.
+		if was, entries := importedElsewhere(l, root); len(entries) > 0 {
+			then, now := projectOr(s, was), projectOr(s, root.Project)
+			if !o.AcceptConflicts {
+				report = append(report, fmt.Sprintf("%s: skipped (%d of its files were imported into %s, and the directory now belongs to %s; nothing is moved on its own: re-run with --accept-conflicts to import it into %s and leave the entries in %s as they are, or map it back with --map-root %s=%s)",
+					displayPath(root.Dir), len(entries), then, now, now, then, displayPath(root.Dir), then))
+				continue
+			}
+			releaseRoot(l, root)
+			report = append(report, fmt.Sprintf("%s: its earlier imports into %s are no longer tied to it; these entries stay there until someone retires them: %s", displayPath(root.Dir), then, strings.Join(entries, ", ")))
+		}
 		r, fallbacks := importMemoryRoot(s, l, root, o, false)
 		report = append(report, r.line(root, o.DryRun))
 		if !o.DryRun {
@@ -385,6 +400,34 @@ func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 }
 
 // trackedRoots lists the directories the ledger holds sources of.
+// importedElsewhere finds what a directory's files became in a project
+// other than the one the directory belongs to now.
+func importedElsewhere(l *ledger, root MemoryRoot) (project string, entries []string) {
+	dir := kb.RealPath(root.Dir)
+	seen := map[string]bool{}
+	for _, e := range l.Sources {
+		if e.Adapter != AdapterClaudeMemory || e.Root != dir || e.Project == root.Project || e.Entry == "" || seen[e.Entry] {
+			continue
+		}
+		seen[e.Entry] = true
+		project = e.Project
+		entries = append(entries, e.Entry)
+	}
+	sort.Strings(entries)
+	return project, entries
+}
+
+// releaseRoot forgets what a directory's files became under another owner,
+// so they are imported anew. The entries themselves are not touched.
+func releaseRoot(l *ledger, root MemoryRoot) {
+	dir := kb.RealPath(root.Dir)
+	for k, e := range l.Sources {
+		if e.Adapter == AdapterClaudeMemory && e.Root == dir && e.Project != root.Project {
+			delete(l.Sources, k)
+		}
+	}
+}
+
 func trackedRoots(l *ledger) []string {
 	seen := map[string]bool{}
 	for _, e := range l.Sources {

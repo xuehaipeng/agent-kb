@@ -314,13 +314,7 @@ func Run(s *kb.Store, target string, opts map[string]string) (*Result, error) {
 	return nil, fmt.Errorf("unknown target %q (one of: %s)", target, strings.Join(Targets, ", "))
 }
 
-func claudeDir() string {
-	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
-		return d
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".claude")
-}
+func claudeDir() string { return kb.ClaudeConfigDir() }
 
 func codexDir() string {
 	if d := os.Getenv("CODEX_HOME"); d != "" {
@@ -500,10 +494,23 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 	cur := rec.Claude[scope]
 	in := &kb.ClaudeInstall{Capture: kb.CaptureFull, Settings: settings}
 	recorded := cur != nil
+	native := filepath.Join(base, "rules", "kb.md")
 	if recorded {
-		in.Capture, in.NativeRules, in.RuleRefresh, in.FileContext = cur.Capture, cur.NativeRules, cur.RuleRefresh, cur.FileContext
+		in.Capture, in.RuleRefresh, in.FileContext = cur.Capture, cur.RuleRefresh, cur.FileContext
+		// The choice is remembered, not the place: this install writes the
+		// settings of the current Claude configuration directory, so that is
+		// where its rules file belongs. A file left in the directory of an
+		// earlier install would go on being loaded there, unmaintained.
+		if cur.NativeRules != "" && s.Hub && global {
+			in.NativeRules = native
+			if filepath.Clean(cur.NativeRules) != filepath.Clean(native) {
+				if did, err := removeNativeRules(s, cur.NativeRules); err == nil && did {
+					res.Notes = append(res.Notes, "removed "+cur.NativeRules+" (the managed rules file now lives in "+filepath.Dir(native)+")")
+				}
+			}
+		}
 	} else if s.Hub && global {
-		in.NativeRules = filepath.Join(base, "rules", "kb.md")
+		in.NativeRules = native
 	}
 	switch opts["capture"] {
 	case "":
@@ -520,7 +527,7 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 		if !s.Hub || !global {
 			return nil, errors.New("the managed rules file holds global rules: it needs a hub and a user-wide install")
 		}
-		in.NativeRules = filepath.Join(base, "rules", "kb.md")
+		in.NativeRules = native
 	case "off":
 		if in.NativeRules != "" {
 			if did, err := removeNativeRules(s, in.NativeRules); err == nil && did {

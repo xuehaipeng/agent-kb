@@ -475,9 +475,14 @@ applies_to:
   (`rules_conditional`).
 - It surfaces for a matching file: `kb rules -f <path>` and `kb search -f
   <path>` (which the pointer already tells agents to run before touching
-  unfamiliar code). `kb rules --all-rules` lists them with their condition.
+  unfamiliar code). Asked about several files at once, each rule names the
+  files it governs, so a rule for one package is never presented as a rule
+  for another. `kb rules --all-rules` lists them with their condition.
   Nothing pushes them yet; a file-access hook is issue #3 item 4.
-- Only rules can be conditional (`kb add rule ... --when <glob>`).
+- Only rules can be conditional (`kb add rule ... --when <glob>`). `--when`
+  repeats or takes a comma-separated list; a comma inside `{a,b}` belongs to
+  its pattern. With `--from` it limits every seeded rule, and an item that
+  is not a rule is refused instead of being added without the condition.
 - Patterns follow Claude Code's documented rule syntax: `**` crosses
   directories; a bare name matches at any depth; a leading `/` anchors to the
   base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work. A
@@ -495,13 +500,30 @@ applies_to:
 | Cursor rule that is not `alwaysApply: true`, other agents' `globs`/`trigger` | not imported: kb cannot reproduce that condition |
 | `CLAUDE.local.md` | not imported: personal, uncommitted instructions stay private |
 | a link or `@path` import leaving the repository (or `~/.claude` for user files) | not followed |
+| a repository instruction file that is itself a link to somewhere outside it (a nested `CLAUDE.md` included) | not imported |
 | `@AGENTS.md` | not followed: other agents read it natively |
 | kb's own blocks and pointer | never re-imported |
 
-Rules directories are walked recursively. `@path` imports are followed up to
+Rules directories are walked recursively, each directory once whatever leads
+to it (a link back to the directory or an ancestor ends there). `@path`
+imports are followed up to
 four hops, once each (cycles end), only to existing files, and never inside
 code spans or fences. Block-level HTML comments are dropped, except inside
 code blocks. Everything left out is listed as a `note:` line.
+
+**The condition is part of what was imported.** A file's condition lives in
+frontmatter (or in where the file is), not in the text sent to the model, so
+the import's change detection covers both. When only the condition changes,
+the rules the file gave earlier (found by their `sources`) take the new
+condition as a new revision; a rule that was in force stays in force.
+
+**A rule repeats another only where that one is already delivered.** The
+same instruction in `packages/web/CLAUDE.md` and `packages/api/CLAUDE.md` is
+two rules, one per directory. A proposal is a duplicate when an existing rule
+with the same text is unconditional, or has the same base and syntax and all
+of the proposal's patterns. Conditions are never merged or widened. The
+import prompt lists existing rules with their condition and says which files
+the file's own rules are for.
 
 ### 2.15 Rule delivery to Claude Code: managed file, hooks, subagents *(issue #3 item 3)*
 
@@ -522,11 +544,22 @@ can be trusted with.
   rewritten on every rule change, `kb maintain` and `kb sync`. A file this
   hub did not write is left alone. `kb rules import` never reads it back.
 - **Fallback.** The hook checks the file before relying on it: recorded by an
-  installation, present, and holding exactly what would be written now. If
-  not, SessionStart delivers the universal rules itself.
+  installation, in the Claude configuration directory the session reads
+  (`CLAUDE_CONFIG_DIR`), present, and holding exactly what would be written
+  now. If not, SessionStart delivers the universal rules itself.
+- **Only what the file holds is left to it.** The file has its own budget.
+  A rule cut from it to fit stays SessionStart's to deliver, and the
+  diagnostics count as "from the managed file" only the rules that are in it.
+- **One place.** The record keeps the choice to use the file, not a path to
+  reuse: an install under another configuration directory writes the file
+  there and removes the one it wrote before.
 - **Nothing is suppressed by session.** SessionStart delivers on every
   startup, resume, clear, compaction and fork: a session seen before may
   hold rules that have since changed.
+- **The hook limit is on what a hook prints.** `SubagentStart` and the rule
+  refresh hand over context as JSON, so their budget covers the serialized
+  output: the envelope, the escaping of the text, and the refresh's opening
+  notice. HTML characters are not escaped.
 - **Subagents get the complete set** through `SubagentStart`, whatever the
   main agent received and whatever the subagent's type. Explore, Plan and
   agents with `omitClaudeMd` load no instruction files, and which other
@@ -538,8 +571,9 @@ can be trusted with.
 - **Rule refresh (opt-in).** A subagent keeps what `SubagentStart` gave it,
   and a running main session gets rules again only at its next start. With
   `kb install claude --rule-refresh on`, a `PreToolUse` hook hands an agent
-  the current rules once when they changed since it last received them. It
-  is off by default because it runs kb before every tool call.
+  the current rules once when they changed since it last received them.
+  When no rule applies any more, an agent that held some is told so, once.
+  It is off by default because it runs kb before every tool call.
 - **Diagnostics.** Each delivery is recorded per session and per agent
   (`.kb/sessions/`, local, pruned after 30 days): how it was delivered, the
   rule digest, compactions seen. `kb rules --delivery` shows the managed
@@ -568,12 +602,25 @@ project is established, never guessed from a name alone:
 
 | Directory | Owner |
 |---|---|
-| default `<config>/projects/<dir>/memory` | the one project its transcripts ran in; failing transcripts, the one project with a registered checkout whose encoded path is `<dir>` |
-| the same, with transcripts from several projects | none: needs a mapping |
+| default `<config>/projects/<dir>/memory` | the one project its transcripts ran in (every transcript is read, not a sample); failing transcripts, the one project with a registered checkout whose encoded path is `<dir>` |
+| the same, with transcripts from several projects, or from one project and from somewhere this store does not know (another repository, in a repo bundle) | none: needs a mapping |
 | `autoMemoryDirectory` in a repository's `.claude/settings*.json` | that repository's project |
 | `autoMemoryDirectory` in user settings, or in a file given with `--settings` | none: shared by every project that runs with it |
 | subagent memory under a checkout (`.claude/agent-memory[-local]/<agent>/`) | that checkout's project |
 | user-level subagent memory (`<config>/agent-memory/<agent>/`) | none: it spans projects and is not turned into global knowledge on its own |
+
+A directory can be reached several of these ways. Everything said about it
+is collected first and weighed together: a mapping made by hand settles it;
+otherwise anything that makes it shared keeps it out, however firmly
+something else names one project (a repository's directory that user
+settings also name is shared); otherwise the projects named must agree.
+
+**An owner change is not applied silently.** Sources are known by path. If
+files of a directory were imported into one project and the directory now
+belongs to another (a new mapping, or different evidence), the scan skips it
+and says so. `--accept-conflicts` settles it: the files are imported anew
+for the new owner, and the earlier entries stay where they are, listed, for
+someone to retire. Mapping it back is the other way out.
 
 `kb extract --map-root <dir>=<project>` records an owner for a shared
 directory in local state (`.kb/extract/roots.json`); `<dir>=` removes it.
@@ -590,7 +637,9 @@ age of the oldest transcript on disk, which bounds any backfill. No fixed
 
 **Access statistics.** `.kb/access.json` (local) counts, per entry, how
 often it was *listed* (a search result line), *shown* (content returned by
-`kb show` or `kb_show`) and *delivered* (a rule pushed by a hook). They are
+`kb show` or `kb_show`) and *delivered* (a rule handed to an agent: by a
+hook, by `kb rules` or `kb rules -f`, or in the MCP server's instructions;
+`kb rules --all` is an inspection and does not count). They are
 kept apart because a result line is not evidence that content reached a
 model. `kb status` reports how many entries in scope were never retrieved
 here, and `kb status --access` lists them and the least recently retrieved.

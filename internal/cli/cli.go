@@ -494,7 +494,7 @@ func (a *App) cmdAdd(args []string) error {
 	f.str(&in.Project, "", "target project (hub)", "p", "project")
 	f.list(&in.Projects, true, "with --global: projects it applies to", "for")
 	var when []string
-	f.list(&when, true, "rule only: apply it only when working on files matching this glob", "when")
+	f.list(&when, false, "rule only: apply it only when working on files matching this glob", "when")
 	var global bool
 	var from string
 	f.boolean(&global, "store in the global scope shared by all projects (hub)", "global")
@@ -509,7 +509,13 @@ func (a *App) cmdAdd(args []string) error {
 		in.Project = kb.GlobalProject
 	}
 	if len(when) > 0 {
-		in.AppliesTo = &okf.Applicability{Paths: when}
+		// Several patterns may share one flag, but a comma inside {a,b}
+		// belongs to its pattern.
+		var paths []string
+		for _, w := range when {
+			paths = append(paths, kb.SplitPatterns(w)...)
+		}
+		in.AppliesTo = &okf.Applicability{Paths: paths}
 	}
 	if from != "" {
 		if len(pos) > 0 {

@@ -104,12 +104,18 @@ func (s *Store) NativeRulesText() string {
 
 // NativeRulesDelivery plans the managed rules file.
 func (s *Store) NativeRulesDelivery() (Delivery, error) {
-	rs, err := s.universalRules()
+	rs, err := s.nativeRuleSet()
 	if err != nil {
 		return Delivery{}, err
 	}
+	return s.planDelivery(SurfaceNativeRules, NativeRulesBudget, "", rs, nil, planOpts{}), nil
+}
+
+// nativeRuleSet is what the managed rules file is planned from.
+func (s *Store) nativeRuleSet() (RuleSet, error) {
+	rs, err := s.universalRules()
 	rs.Conditional = nil // the hook names them; this file holds rules only
-	return s.planDelivery(SurfaceNativeRules, NativeRulesBudget, "", rs, nil, false), nil
+	return rs, err
 }
 
 // universalRules are the always-on global rules without a project
@@ -123,14 +129,30 @@ func (s *Store) universalRules() (RuleSet, error) {
 	return rs, err
 }
 
+// ClaudeConfigDir is the Claude Code configuration directory in effect for
+// this process: where a session started with this environment reads its
+// settings and rules files.
+func ClaudeConfigDir() string {
+	if d := os.Getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		return d
+	}
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".claude")
+}
+
 // NativeRulesActive reports whether this session can count on the managed
 // rules file for the universal global rules: an installation recorded one,
-// the file is there, and it holds exactly what would be written now. When
-// it does not, the hooks deliver those rules themselves.
+// it is in the configuration directory this session reads, the file is
+// there, and it holds exactly what would be written now. When it does not,
+// the hooks deliver those rules themselves.
 func (s *Store) NativeRulesActive() (path string, active bool) {
 	in := s.claudeInstallHere()
 	if in == nil || in.NativeRules == "" || !s.Hub {
 		return "", false
+	}
+	// A session under another configuration directory never loads it.
+	if filepath.Clean(filepath.Dir(filepath.Dir(in.NativeRules))) != filepath.Clean(ClaudeConfigDir()) {
+		return in.NativeRules, false
 	}
 	data, err := os.ReadFile(in.NativeRules)
 	if err != nil {
@@ -174,6 +196,7 @@ type AgentDelivery struct {
 	Surface     string `json:"surface"`          // how it was delivered
 	Event       string `json:"event"`            // hook event and source
 	Native      bool   `json:"native,omitempty"` // universal rules were left to the managed rules file
+	Rules       int    `json:"rules"`            // rules the agent holds after it (in the payload or the managed file)
 	Compactions int    `json:"compactions"`      // compactions of this agent seen so far
 	Deliveries  int    `json:"deliveries"`       // times rules were delivered to it
 	// FileContext is what the file-context hook already gave this agent
@@ -222,6 +245,7 @@ func (s *Store) RecordDelivery(session, agent, agentType, event string, d Delive
 		st.Agents[agent] = a
 	}
 	a.Type, a.Digest, a.Surface, a.Event, a.Native = agentType, s.RuleDigest(), d.Surface, event, native
+	a.Rules = d.Rendered + d.Native
 	a.Deliveries++
 	if compacted {
 		a.Compactions++
