@@ -2803,10 +2803,44 @@ func TestFileContextHookRepoMode(t *testing.T) {
 	if st := git(t, repo, "status", "--porcelain", "--", "knowledge"); strings.Contains(st, ".kb/") {
 		t.Errorf("local state shows up as a change to the bundle:\n%s", st)
 	}
+	// A group kb's hook shares with someone else's command keeps its
+	// matcher: kb's hook moves into a group of its own instead of narrowing
+	// what the other command runs for.
+	var cfg map[string]any
+	data, _ := os.ReadFile(settings)
+	json.Unmarshal(data, &cfg)
+	cfg["hooks"].(map[string]any)["PostToolUse"] = []any{map[string]any{
+		"matcher": "Read|Edit|Write|Bash",
+		"hooks": []any{
+			map[string]any{"type": "command", "command": "kb hook claude file", "timeout": 5},
+			map[string]any{"type": "command", "command": "my-audit-log"},
+		},
+	}}
+	data, _ = json.MarshalIndent(cfg, "", "  ")
+	os.WriteFile(settings, data, 0o644)
+	must(t, "", "install", "claude")
+	var theirs, ours string
+	for _, g := range hooksIn()["PostToolUse"].([]any) {
+		gm := g.(map[string]any)
+		for _, h := range gm["hooks"].([]any) {
+			switch h.(map[string]any)["command"] {
+			case "my-audit-log":
+				theirs = fmt.Sprint(gm["matcher"])
+				if len(gm["hooks"].([]any)) != 1 {
+					t.Errorf("kb's hook should have left the shared group: %v", gm)
+				}
+			case "kb hook claude file":
+				ours = fmt.Sprint(gm["matcher"])
+			}
+		}
+	}
+	if theirs != "Read|Edit|Write|Bash" || ours != "Read|Edit|Write" {
+		t.Errorf("matchers after reinstalling: theirs %q (must be unchanged), kb's %q", theirs, ours)
+	}
 	// Off again: the hooks go from the repository's settings.
 	must(t, "", "install", "claude", "--file-context", "off")
-	if h := hooksIn(); h["PostToolUse"] != nil || h["PreToolUse"] != nil || h["SessionStart"] == nil {
-		t.Fatalf("after turning file context off: %v", h)
+	if h := hooksIn(); h["PreToolUse"] != nil || h["SessionStart"] == nil || strings.Contains(fmt.Sprint(h["PostToolUse"]), "kb hook claude file") || !strings.Contains(fmt.Sprint(h["PostToolUse"]), "my-audit-log") {
+		t.Fatalf("after turning file context off, kb's hooks go and the other command stays: %v", h)
 	}
 	if out := read("s6", ""); out != "" {
 		t.Errorf("off must inject nothing:\n%s", out)
