@@ -135,6 +135,9 @@ memories, Hermes MEMORY.md/USER.md, Antigravity knowledge items) is imported
 so every agent can use it: `kb extract --scan memories`, or only for some
 projects: `kb extract --scan memories -p aiproxy -p kubedl`. Claude Code's is
 imported automatically at session end; files are only re-read when they change.
+An imported entry was read from a memory, not checked against the code: it
+has no commit, and `kb show` names what its deadline is based on. Checking it
+(`kb verify <id> --confirm -e "..."`) gives it a real anchor.
 
 ## Projects (hub mode)
 

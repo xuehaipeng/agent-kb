@@ -38,6 +38,7 @@ type FileSource struct {
 	Kind    string   // KindMemory | KindRules
 	Agent   kb.Actor // whose memory, or which agent the rule file was written for
 	Project string   // default target: "" = current project, "global" = shared
+	Content string   // when set, import this part of the file instead of all of it
 }
 
 // ImportOptions controls an import run.
@@ -47,6 +48,9 @@ type ImportOptions struct {
 	Force    bool     // re-import even if the file is unchanged
 	Projects []string // hub: only import what belongs to these projects
 	Out      io.Writer
+	// AcceptConflicts settles import conflicts after a merge by hand: the
+	// entries as they are now become the baseline for their sources.
+	AcceptConflicts bool
 }
 
 func (o ImportOptions) wants(project string) bool {
@@ -72,6 +76,14 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	}
 	if len(data) > maxImportBytes {
 		data = data[:maxImportBytes]
+	}
+	if src.Content != "" {
+		data = []byte(src.Content)
+	}
+	// The source's own modification time, not the time of this import.
+	var sourceDate time.Time
+	if st, err := os.Stat(src.Path); err == nil {
+		sourceDate = st.ModTime().UTC()
 	}
 	// Never re-import kb's own managed blocks (pointer, delivered rules).
 	content := strings.TrimSpace(kbBlockRe.ReplaceAllString(string(data), ""))
@@ -161,7 +173,11 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 			Evidence: evidence, NoDocCheck: src.Kind == KindRules,
 			// The default project comes from a real repository (or is global).
 			NewProject: project == src.Project,
-			Sources:    []okf.Source{{ID: srcID, Resource: displayPath(src.Path), Author: src.Agent.String(), LastModified: time.Now().UTC().Format(time.RFC3339)}},
+			Sources: []okf.Source{{ID: srcID, Resource: displayPath(src.Path), Author: src.Agent.String(),
+				LastModified: sourceDate.Format(time.RFC3339), IngestedAt: s.Now().UTC().Format(time.RFC3339)}},
+			// Ingested, not checked against the code now: no commit, and the
+			// deadline counts from the file's own date.
+			SourceOnly: true, SourceDate: sourceDate, SourceDateBasis: kb.BasisSourceMtime,
 		}
 		if in.Description == "" {
 			in.Description = c.Title
@@ -332,8 +348,8 @@ func claudeProjectDirName(path string) string {
 	return b.String()
 }
 
-// MemorySources finds agents' memory files: "claude", "codex", "hermes",
-// "antigravity", or "all".
+// MemorySources finds the memory files of agents without a typed format:
+// "codex", "hermes", "antigravity", or "all". They go through the model.
 func MemorySources(s *kb.Store, which string) []FileSource {
 	var out []FileSource
 	add := func(glob string, agent kb.Actor, project string) {
@@ -344,17 +360,7 @@ func MemorySources(s *kb.Store, which string) []FileSource {
 			}
 		}
 	}
-	if which == "claude" || which == "all" {
-		// Claude Code auto memory: ~/.claude/projects/<encoded cwd>/memory/*.md
-		dirs, _ := filepath.Glob(filepath.Join(claudeDir(), "projects", "*", "memory"))
-		for _, d := range dirs {
-			project, ok := claudeMemoryProject(s, filepath.Dir(d))
-			if !ok {
-				continue
-			}
-			add(filepath.Join(d, "*.md"), kb.Actor{Producer: "claude-code"}, project)
-		}
-	}
+	// Claude Code's auto memory has its own adapter (ImportClaudeMemory).
 	if which == "codex" || which == "all" {
 		add(filepath.Join(codexDir(), "memories", "*.md"), kb.Actor{Producer: "codex"}, globalOrCurrent(s))
 	}

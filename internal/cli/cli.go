@@ -86,7 +86,9 @@ Capture and integration:
   kb extract --transcript <file> [--source claude|codex|text] [--final] [--dry-run]
   kb extract --scan codex|claude [--days N]   (hub: routes each session to its project)
   kb extract --scan memories|claude-memory|codex-memory|hermes-memory|antigravity-memory [-p project]... [--force]
-                              import what agents saved in their own memory (only changed files)
+                              import what agents saved in their own memory (only changed files). Claude Code's
+                              typed memory files are imported without a model and tracked: an edit updates the
+                              same entry, a deleted file is flagged; [--accept-conflicts] after merging by hand
   kb hook claude              Claude Code hook entry point (reads hook JSON on stdin)
   kb mcp [--as actor]         stdio MCP server (kb_search, kb_show, kb_add, kb_verify, kb_review)
 
@@ -822,9 +824,10 @@ func (a *App) cmdExtract(args []string) error {
 	f.str(&cmdStr, "", "override extractor command (space separated)", "cmd")
 	f.boolean(&o.Final, "advance the offset even if too short", "final")
 	f.boolean(&o.DryRun, "print the prompt, do not call a model", "dry-run")
-	var thenSync, forceImport bool
+	var thenSync, forceImport, acceptConflicts bool
 	f.boolean(&thenSync, "run 'kb sync' afterwards (hub mode)", "sync")
 	f.boolean(&forceImport, "memory scans: re-import unchanged files", "force")
+	f.boolean(&acceptConflicts, "memory scans: after merging a conflict by hand, take the entries as they are now", "accept-conflicts")
 	var scanProjects []string
 	f.list(&scanProjects, true, "memory scans: only these projects (hub)", "p", "project")
 	if _, err := f.parse(args); err != nil {
@@ -850,7 +853,7 @@ func (a *App) cmdExtract(args []string) error {
 		if scan == "memories" {
 			which = "all"
 		}
-		report := extract.ImportAll(s, extract.MemorySources(s, which), extract.ImportOptions{Command: command, DryRun: o.DryRun, Force: forceImport, Projects: scanProjects, Out: a.Stderr})
+		report := extract.ScanMemories(s, which, extract.ImportOptions{Command: command, DryRun: o.DryRun, Force: forceImport, Projects: scanProjects, Out: a.Stderr, AcceptConflicts: acceptConflicts})
 		a.out("%s\n", strings.Join(report, "\n"))
 		return nil
 	}

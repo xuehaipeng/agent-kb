@@ -157,12 +157,29 @@ func (s *Store) RenderNode(n *Node) string {
 		fmt.Fprintf(&b, "tags: %s\n", strings.Join(m.Tags, ", "))
 	}
 	if m.StaleAfter != "" {
-		fmt.Fprintf(&b, "stale_after: %s\n", m.StaleAfter)
+		fmt.Fprintf(&b, "stale_after: %s", m.StaleAfter)
+		if m.StaleBasis != "" {
+			fmt.Fprintf(&b, " (deadline from %s; when the claim was last observed is unknown)", m.StaleBasis)
+		}
+		b.WriteString("\n")
 	}
 	for _, src := range m.Sources {
 		fmt.Fprintf(&b, "source [^%s]: %s", src.ID, src.Resource)
 		if src.Author != "" {
 			fmt.Fprintf(&b, " by %s", src.Author)
+		}
+		var when []string
+		if src.LastModified != "" {
+			when = append(when, "source modified "+src.LastModified)
+		}
+		if src.IngestedAt != "" {
+			when = append(when, "ingested "+src.IngestedAt)
+		}
+		if src.Session != "" {
+			when = append(when, "from session "+src.Session)
+		}
+		if len(when) > 0 {
+			fmt.Fprintf(&b, " (%s)", strings.Join(when, ", "))
 		}
 		b.WriteString("\n")
 	}

@@ -2,6 +2,9 @@ package cli
 
 import (
 	"bytes"
+	"crypto/sha1"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,6 +13,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestMain keeps every test away from the developer's real hub and agent
@@ -684,7 +688,7 @@ func TestMemoryScanForParticularProjects(t *testing.T) {
 	}
 	cmd, _ := fakeModel(t, base, "m", `[{"type":"learning","title":"A remembered gotcha","description":"From memory."}]`)
 	out := must(t, "", "extract", "--scan", "claude-memory", "-p", "aiproxy", "--cmd", cmd)
-	if !strings.Contains(out, "-x-aiproxy/memory/MEMORY.md: added 1") || !strings.Contains(out, "-x-kubedl/memory/MEMORY.md: skipped (not in the selected projects)") {
+	if !strings.Contains(out, "-x-aiproxy/memory/MEMORY.md: added 1") || !strings.Contains(out, "-x-kubedl/memory: skipped (not in the selected projects)") {
 		t.Fatalf("filtered scan:\n%s", out)
 	}
 	// The filtered run did not mark files as done: a full scan still takes kubedl.
@@ -1030,4 +1034,234 @@ func TestSessionStartOutputStaysWithinHookLimit(t *testing.T) {
 	if n := strings.Count(must(t, "claude-code", "rules", "-q", "--all-rules"), "\n- "); n != 45 {
 		t.Fatalf("kb rules --all-rules lists %d", n)
 	}
+}
+
+// Claude Code's typed memory files are imported without a model, keep their
+// identity across edits, renames and deletions, and carry the source's own
+// dates instead of the time and commit of the import.
+func TestClaudeMemoryDeterministicImport(t *testing.T) {
+	base, home := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	pdir := filepath.Join(home, ".claude", "projects", "-x-aiproxy")
+	mem := filepath.Join(pdir, "memory")
+	os.MkdirAll(mem, 0o755)
+	os.WriteFile(filepath.Join(pdir, "t.jsonl"), []byte(`{"type":"user","cwd":"`+repo+`","sessionId":"s1","message":{"role":"user","content":"hi"}}`+"\n"), 0o644)
+	write := func(name, content string) string {
+		t.Helper()
+		p := filepath.Join(mem, name)
+		if err := os.WriteFile(p, []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	topic := func(name, desc, typ, extra, body string) string {
+		return "---\nname: " + name + "\ndescription: " + desc + "\ntype: " + typ + "\n" + extra + "---\n\n" + body + "\n"
+	}
+	write("MEMORY.md", "# Memory index\n\n- [Testing](feedback_testing.md) — integration tests hit a real database\n- [Release](project_release.md) — freeze dates\n")
+	write("feedback_testing.md", topic("feedback-testing", "Integration tests must hit a real database", "feedback",
+		"modified: 2026-10-20T08:00:00Z\noriginSessionId: 11111111-2222-3333-4444-555555555555\n",
+		"Never mock the database in integration tests.\n\n**Why:** a mocked migration passed while production failed.\n**How to apply:** use the docker compose database."))
+	write("project_release.md", topic("project-release", "Merge freeze before the mobile release", "project",
+		"modified: 2025-01-10T09:30:00Z\n", "Non-critical merges are frozen from the Thursday before each mobile release."))
+	ref := write("reference_dashboard.md", topic("reference-dashboard", "Latency dashboard the on-call watches", "reference", "", "The on-call latency dashboard is the board named api-latency in the monitoring workspace."))
+	old := time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+	os.Chtimes(ref, old, old)
+	write("user_role.md", topic("user-role", "Who the user is", "user", "", "The user is a backend engineer."))
+
+	// Every file here is a typed topic: an extractor that cannot run proves
+	// no model was called.
+	scan := func(cmd string) string {
+		t.Helper()
+		os.Chdir(base)
+		return must(t, "", "extract", "--scan", "claude-memory", "--cmd", cmd)
+	}
+	out := scan("/nonexistent/model")
+	if !strings.Contains(out, "memory [aiproxy]: 3 imported, 0 updated, 0 unchanged, 1 index skipped, 1 user memories skipped") || strings.Contains(out, "error") || strings.Contains(out, "fallback") {
+		t.Fatalf("first scan:\n%s", out)
+	}
+	const ruleID, factID, refID = "aiproxy/conventions/integration-tests-must-hit-a-real-database", "aiproxy/facts/merge-freeze-before-the-mobile-release", "aiproxy/facts/latency-dashboard-the-on-call-watches"
+	show := func(id string) string { t.Helper(); os.Chdir(repo); return must(t, "codex", "show", id) }
+	rule := show(ruleID)
+	for _, want := range []string{"trust: verified", "generated: claude-code at ", "saved in claude-code's memory (~/.claude/projects/-x-aiproxy/memory/feedback_testing.md)",
+		"source modified 2026-10-20T08:00:00Z", "ingested ", "from session 11111111-2222-3333-4444-555555555555", "Never mock the database", "tags: feedback"} {
+		if !strings.Contains(rule, want) {
+			t.Errorf("rule entry lacks %q:\n%s", want, rule)
+		}
+	}
+	// Source-only: no commit from the checkout the import happened to run
+	// near, and a convention has no deadline to invent.
+	if strings.Contains(rule, "(commit ") || strings.Contains(rule, "stale_after") {
+		t.Fatalf("an imported memory must not carry an import-time commit or deadline:\n%s", rule)
+	}
+	// It is the project's rule, not a global one.
+	if out := must(t, "codex", "rules", "-q"); !strings.Contains(out, "aiproxy:\n- Integration tests must hit a real database - Never mock the database in integration tests.") {
+		t.Fatalf("rules in aiproxy:\n%s", out)
+	}
+	os.Chdir(base)
+	if out := must(t, "codex", "rules", "-q"); strings.Contains(out, "Integration tests") {
+		t.Fatalf("feedback must not be promoted to the global scope:\n%s", out)
+	}
+	// Deadlines come from the source's date: an old note is due at once and
+	// says what its deadline is based on; the observation date stays unknown.
+	fact := show(factID)
+	if !strings.Contains(fact, "stale_after: 2025-04-10T09:30:00Z (deadline from source_updated_at; when the claim was last observed is unknown)") || !strings.Contains(fact, "STALE: past stale_after 2025-04-10 (deadline from source_updated_at)") || strings.Contains(fact, "(commit ") {
+		t.Fatalf("old project memory:\n%s", fact)
+	}
+	if r := show(refID); !strings.Contains(r, "stale_after: 2000-03-31T00:00:00Z (deadline from source_mtime;") || !strings.Contains(r, "source modified 2000-01-01T00:00:00Z") {
+		t.Fatalf("memory without a modified field:\n%s", r)
+	}
+	if out := must(t, "codex", "search", "role backend engineer", "--all"); strings.Contains(out, "aiproxy/") {
+		t.Fatalf("a user memory was imported:\n%s", out)
+	}
+
+	// Unchanged: nothing happens, however often it runs.
+	for i := 0; i < 2; i++ {
+		if out := scan("/nonexistent/model"); !strings.Contains(out, "0 imported, 0 updated, 3 unchanged") {
+			t.Fatalf("rescan:\n%s", out)
+		}
+	}
+	// Edited: the same entry gets a new revision; reading the source again
+	// is not a newer check, so no commit appears and deadlines do not move.
+	write("feedback_testing.md", topic("feedback-testing", "Integration tests must hit a real database", "feedback",
+		"modified: 2026-11-01T08:00:00Z\n", "Never mock the database in integration or contract tests."))
+	write("project_release.md", topic("project-release", "Merge freeze before the mobile release", "project",
+		"modified: 2026-11-10T09:30:00Z\n", "Non-critical merges are frozen from the Wednesday before each mobile release."))
+	if out := scan("/nonexistent/model"); !strings.Contains(out, "0 imported, 2 updated, 1 unchanged") {
+		t.Fatalf("after edits:\n%s", out)
+	}
+	rule = show(ruleID)
+	if !strings.Contains(rule, "revision: 2") || !strings.Contains(rule, "contract tests") || !strings.Contains(rule, "source modified 2026-11-01T08:00:00Z") || strings.Contains(rule, "(commit ") || !strings.Contains(rule, "trust: verified") {
+		t.Fatalf("updated rule:\n%s", rule)
+	}
+	if fact = show(factID); !strings.Contains(fact, "revision: 2") || !strings.Contains(fact, "Wednesday") || !strings.Contains(fact, "stale_after: 2025-04-10T09:30:00Z (deadline from source_updated_at") {
+		t.Fatalf("an edited source must not postpone the deadline:\n%s", fact)
+	}
+	os.Chdir(base)
+	if out := must(t, "codex", "status", "--all"); !strings.Contains(out, "knowledge: 3 active") {
+		t.Fatalf("an edit created another entry:\n%s", out)
+	}
+
+	// Edited by hand since the import, then the source changes: a conflict
+	// to merge, never an overwrite.
+	os.Chdir(repo)
+	must(t, "codex", "update", ruleID, "-b", "Never mock the database; use the compose stack (see docs).", "-m", "pointed at the compose stack")
+	write("feedback_testing.md", topic("feedback-testing", "Integration tests must hit a real database", "feedback", "", "Mocks are fine for unit tests only."))
+	out = scan("/nonexistent/model")
+	if !strings.Contains(out, "1 conflicts") || !strings.Contains(out, "conflict: feedback_testing.md changed, but "+ruleID+" was edited since the last import (revision 3, imported 2)") {
+		t.Fatalf("conflict:\n%s", out)
+	}
+	if rule = show(ruleID); !strings.Contains(rule, "compose stack") || strings.Contains(rule, "Mocks are fine") {
+		t.Fatalf("a manual edit was overwritten:\n%s", rule)
+	}
+	// The conflict stands until it is settled, and settling it by hand does
+	// not touch the entry.
+	if out := scan("/nonexistent/model"); !strings.Contains(out, "1 conflicts") || !strings.Contains(out, "conflict (unresolved): feedback_testing.md and "+ruleID) {
+		t.Fatalf("a conflict must keep being reported:\n%s", out)
+	}
+	os.Chdir(base)
+	if out := must(t, "", "extract", "--scan", "claude-memory", "--cmd", "/nonexistent/model", "--accept-conflicts"); strings.Contains(out, "conflict") {
+		t.Fatalf("accepting conflicts:\n%s", out)
+	}
+	if out := scan("/nonexistent/model"); strings.Contains(out, "conflict") {
+		t.Fatalf("after accepting:\n%s", out)
+	}
+	if rule = show(ruleID); !strings.Contains(rule, "revision: 3") || !strings.Contains(rule, "compose stack") {
+		t.Fatalf("accepting a conflict changed the entry:\n%s", rule)
+	}
+
+	// Renamed: the same source, no new entry.
+	os.Rename(filepath.Join(mem, "project_release.md"), filepath.Join(mem, "project_merge_freeze.md"))
+	if out := scan("/nonexistent/model"); !strings.Contains(out, "1 renamed") || strings.Contains(out, "1 imported") || strings.Contains(out, "sources deleted") {
+		t.Fatalf("rename:\n%s", out)
+	}
+	// Deleted: flagged, kept, and not flagged while the directory cannot be
+	// read completely.
+	os.Remove(ref)
+	if os.Geteuid() != 0 {
+		locked := write("zz_locked.md", topic("locked", "Locked note", "reference", "", "Unreadable for now."))
+		os.Chmod(locked, 0o000)
+		if out := scan("/nonexistent/model"); strings.Contains(out, "sources deleted") || !strings.Contains(out, "not read completely") {
+			t.Fatalf("incomplete scan must not report deletions:\n%s", out)
+		}
+		os.Remove(locked)
+	}
+	out = scan("/nonexistent/model")
+	if !strings.Contains(out, "1 sources deleted") || !strings.Contains(out, "source deleted: reference_dashboard.md no longer backs "+refID+"; the entry is kept") {
+		t.Fatalf("deletion:\n%s", out)
+	}
+	if r := show(refID); !strings.Contains(r, "trust: verified") {
+		t.Fatalf("the entry of a deleted source must be kept:\n%s", r)
+	}
+	must(t, "codex", "deprecate", refID, "-m", "dashboard was retired")
+	if out := scan("/nonexistent/model"); strings.Contains(out, "sources deleted") {
+		t.Fatalf("a retired entry needs no further review:\n%s", out)
+	}
+
+	// Files that are not a single typed note go to the model, visibly, and
+	// an index's pointers to topic files are not sent again.
+	write("MEMORY.md", "# Memory index\n\n- [Testing](feedback_testing.md) — integration tests hit a real database\n\nThe staging cluster rejects images without a digest pin.\n")
+	write("legacy_notes.md", "The deploy bot needs the release label before it will merge anything at all.\n")
+	write("odd_type.md", topic("odd", "Something else", "scratch", "", "A note of a type this adapter does not know about yet."))
+	write("mixed.md", topic("mixed", "Several things", "project", "", "# One\n\nFirst topic of the file.\n\n# Two\n\nSecond topic of the file."))
+	cmd, prompt := fakeModel(t, base, "fallback", `[]`)
+	out = scan(cmd)
+	for _, want := range []string{"4 sent to the model fallback", "fallback: MEMORY.md holds notes besides its 1 link(s)", "fallback: legacy_notes.md (no usable frontmatter)",
+		`fallback: odd_type.md (unknown memory type "scratch")`, "fallback: mixed.md (several sections: not a single note)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("fallback report lacks %q:\n%s", want, out)
+		}
+	}
+	// The prompt file holds the last call; MEMORY.md sorts first, so check
+	// its content was reduced to its own notes through a dedicated run.
+	os.Remove(filepath.Join(mem, "legacy_notes.md"))
+	os.Remove(filepath.Join(mem, "odd_type.md"))
+	os.Remove(filepath.Join(mem, "mixed.md"))
+	write("MEMORY.md", "# Memory index\n\n- [Testing](feedback_testing.md) — integration tests hit a real database\n\nThe staging cluster rejects images without a pinned digest.\n")
+	scan(cmd)
+	if p, _ := os.ReadFile(prompt); !strings.Contains(string(p), "pinned digest") || strings.Contains(string(p), "feedback_testing.md") {
+		t.Fatalf("index fallback prompt should hold only the index's own notes:\n%s", p)
+	}
+
+	// A typed file the earlier model-based import already took is not
+	// imported a second time: unchanged it is done, changed it stays on the
+	// model path.
+	legacy := write("legacy_typed.md", topic("legacy-typed", "Deploys need the release label", "project", "", "The deploy bot merges only pull requests that carry the release label."))
+	typed, _ := os.ReadFile(legacy)
+	if err := legacyImportState(filepath.Join(os.Getenv("KB_HOME"), ".kb", "extract"), legacy, typed); err != nil {
+		t.Fatal(err)
+	}
+	if out := scan("/nonexistent/model"); !strings.Contains(out, "1 imported earlier through the model") || strings.Contains(out, " 1 imported,") {
+		t.Fatalf("a file the model path already imported:\n%s", out)
+	}
+	if out := scan("/nonexistent/model"); strings.Contains(out, "imported earlier") {
+		t.Fatalf("rescan of a file the model path imported:\n%s", out)
+	}
+	write("legacy_typed.md", topic("legacy-typed", "Deploys need the release label", "project", "", "The deploy bot merges only labelled pull requests, and only on weekdays."))
+	if out := scan(cmd); !strings.Contains(out, "fallback: legacy_typed.md (changed since the model imported it") {
+		t.Fatalf("a changed file the model path imported:\n%s", out)
+	}
+
+	// A directory with no project to attach to is reported, not skipped silently.
+	os.MkdirAll(filepath.Join(home, ".claude", "projects", "-x-unknown", "memory"), 0o755)
+	os.WriteFile(filepath.Join(home, ".claude", "projects", "-x-unknown", "memory", "a.md"), []byte(topic("a", "A note", "project", "", "Body of a note without a project.")), 0o644)
+	if out := scan(cmd); !strings.Contains(out, "-x-unknown/memory: skipped (no project could be established") {
+		t.Fatalf("unmapped directory:\n%s", out)
+	}
+	// The ledger is local state: nothing of it reaches the shared hub.
+	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {
+		t.Fatalf("import state leaked into the hub:\n%s", st)
+	}
+}
+
+// legacyImportState writes the state file the model-based importer keeps for
+// a file it has imported (path-keyed, with the hash of its trimmed content).
+func legacyImportState(dir, path string, content []byte) error {
+	sum := sha256.Sum256([]byte(strings.TrimSpace(string(content))))
+	key := sha1.Sum([]byte(path))
+	data, _ := json.Marshal(map[string]string{"path": path, "hash": hex.EncodeToString(sum[:]), "updated": "2026-11-01T00:00:00Z"})
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+	return os.WriteFile(filepath.Join(dir, hex.EncodeToString(key[:8])+".json"), data, 0o644)
 }
