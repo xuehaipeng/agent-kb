@@ -498,10 +498,26 @@ applies_to:
 | `@AGENTS.md` | not followed: other agents read it natively |
 | kb's own blocks and pointer | never re-imported |
 
-Rules directories are walked recursively. `@path` imports are followed up to
+Rules directories are walked recursively, each directory once whatever leads
+to it (a link back to the directory or an ancestor ends there). `@path`
+imports are followed up to
 four hops, once each (cycles end), only to existing files, and never inside
 code spans or fences. Block-level HTML comments are dropped, except inside
 code blocks. Everything left out is listed as a `note:` line.
+
+**The condition is part of what was imported.** A file's condition lives in
+frontmatter (or in where the file is), not in the text sent to the model, so
+the import's change detection covers both. When only the condition changes,
+the rules the file gave earlier (found by their `sources`) take the new
+condition as a new revision; a rule that was in force stays in force.
+
+**A rule repeats another only where that one is already delivered.** The
+same instruction in `packages/web/CLAUDE.md` and `packages/api/CLAUDE.md` is
+two rules, one per directory. A proposal is a duplicate when an existing rule
+with the same text is unconditional, or has the same base and syntax and all
+of the proposal's patterns. Conditions are never merged or widened. The
+import prompt lists existing rules with their condition and says which files
+the file's own rules are for.
 
 ### 2.15 Rule delivery to Claude Code: managed file, hooks, subagents *(issue #3 item 3)*
 
@@ -522,8 +538,12 @@ can be trusted with.
   rewritten on every rule change, `kb maintain` and `kb sync`. A file this
   hub did not write is left alone. `kb rules import` never reads it back.
 - **Fallback.** The hook checks the file before relying on it: recorded by an
-  installation, present, and holding exactly what would be written now. If
-  not, SessionStart delivers the universal rules itself.
+  installation, in the Claude configuration directory the session reads
+  (`CLAUDE_CONFIG_DIR`), present, and holding exactly what would be written
+  now. If not, SessionStart delivers the universal rules itself.
+- **One place.** The record keeps the choice to use the file, not a path to
+  reuse: an install under another configuration directory writes the file
+  there and removes the one it wrote before.
 - **Nothing is suppressed by session.** SessionStart delivers on every
   startup, resume, clear, compaction and fork: a session seen before may
   hold rules that have since changed.
@@ -538,8 +558,9 @@ can be trusted with.
 - **Rule refresh (opt-in).** A subagent keeps what `SubagentStart` gave it,
   and a running main session gets rules again only at its next start. With
   `kb install claude --rule-refresh on`, a `PreToolUse` hook hands an agent
-  the current rules once when they changed since it last received them. It
-  is off by default because it runs kb before every tool call.
+  the current rules once when they changed since it last received them.
+  When no rule applies any more, an agent that held some is told so, once.
+  It is off by default because it runs kb before every tool call.
 - **Diagnostics.** Each delivery is recorded per session and per agent
   (`.kb/sessions/`, local, pruned after 30 days): how it was delivered, the
   rule digest, compactions seen. `kb rules --delivery` shows the managed

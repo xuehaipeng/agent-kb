@@ -27,6 +27,41 @@ func Conditional(m *okf.Meta) bool {
 	return m.AppliesTo != nil && len(m.AppliesTo.Paths) > 0
 }
 
+// SameApplies reports whether two applicabilities limit a rule to the same
+// files. Nil and an empty one both mean "everywhere".
+func SameApplies(a, b *okf.Applicability) bool {
+	return AppliesCovers(a, b) && AppliesCovers(b, a)
+}
+
+// AppliesCovers reports whether a rule limited by existing is delivered
+// wherever a rule limited by incoming would be. Only what can be told
+// without matching files counts: no limit covers everything, and a set of
+// patterns covers a subset of itself under the same base and syntax.
+func AppliesCovers(existing, incoming *okf.Applicability) bool {
+	if existing == nil || len(existing.Paths) == 0 {
+		return true
+	}
+	if incoming == nil || len(incoming.Paths) == 0 {
+		return false
+	}
+	if existing.Base != incoming.Base || existing.Origin != incoming.Origin {
+		return false
+	}
+	have := map[string]bool{}
+	for _, p := range existing.Paths {
+		have[p] = true
+	}
+	for _, p := range incoming.Paths {
+		if !have[p] {
+			return false
+		}
+	}
+	return true
+}
+
+// AppliesNote says in words which files a conditional rule is for.
+func AppliesNote(a *okf.Applicability) string { return appliesNote(a) }
+
 // ValidateApplies checks that every pattern can be matched exactly. A
 // pattern that cannot is an error, never a wider or an empty match in
 // disguise: the caller reports it instead of importing the rule.

@@ -143,9 +143,28 @@ func uniqueStrings(in []string) []string {
 // when it stays inside boundary: a linked file elsewhere is someone else's
 // content until the user approves it in their own tool.
 func walkRules(dir, boundary, ext string, notes *[]string) []string {
+	out := walkRulesOnce(dir, boundary, ext, notes, map[string]bool{})
+	sort.Strings(out)
+	return out
+}
+
+// walkRulesOnce reads each directory once, whatever leads to it: a link to
+// a directory already read (itself, an ancestor, a sibling) adds nothing.
+func walkRulesOnce(dir, boundary, ext string, notes *[]string, seen map[string]bool) []string {
 	var out []string
 	_ = filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			real, err := filepath.EvalSymlinks(p)
+			if err != nil {
+				real = p
+			}
+			if seen[real] {
+				return filepath.SkipDir
+			}
+			seen[real] = true
 			return nil
 		}
 		if d.Type()&fs.ModeSymlink != 0 {
@@ -159,13 +178,9 @@ func walkRules(dir, boundary, ext string, notes *[]string) []string {
 				return nil
 			}
 			if st.IsDir() {
-				for _, sub := range walkRules(target, boundary, ext, notes) {
-					out = append(out, sub)
-				}
+				out = append(out, walkRulesOnce(target, boundary, ext, notes, seen)...)
 				return nil
 			}
-		} else if d.IsDir() {
-			return nil
 		}
 		if strings.HasSuffix(d.Name(), ext) {
 			out = append(out, p)
