@@ -724,7 +724,8 @@ transcript, and the same range must not reach the model twice.
   extraction (at session end) reads the range. A summary whose range the
   transcript already covered is skipped. A summary already extracted is
   skipped by its hash. Extractions of one source take a lock, so a summary
-  run and a transcript run cannot overlap. A session that never compacts is
+  run and a transcript run cannot overlap; a run that cannot take the lock
+  stops without reading anything, and the next run picks the range up. A session that never compacts is
   captured as before.
 - **Whole or not at all.** A summary is given to the model complete. It is
   not shortened in the middle the way a long transcript message is, because

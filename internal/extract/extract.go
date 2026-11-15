@@ -371,9 +371,13 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 	// One extraction at a time per source: a run that takes over part of a
 	// transcript (from a compaction summary) and the run that reads the
 	// transcript itself must not both send the same range to the model.
-	if unlock, lerr := s.LockLocal(sourceLock(abs)); lerr == nil {
-		defer unlock()
+	// Without the lock nothing is read: going on would let two runs send
+	// the same range to the model and overwrite each other's position.
+	unlock, lerr := s.LockLocal(sourceLock(abs))
+	if lerr != nil {
+		return nil, fmt.Errorf("another extraction of this source may be running, and its lock could not be taken (%v): nothing was read, and the next run starts where this one would have", lerr)
 	}
+	defer unlock()
 	st := loadState(s, abs)
 	var tr *Transcript
 	if strings.HasSuffix(abs, ".jsonl") {

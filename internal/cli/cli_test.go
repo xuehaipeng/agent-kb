@@ -3337,6 +3337,25 @@ func TestCompactionSummaryCapture(t *testing.T) {
 		t.Errorf("the finished summary was not recorded in the latest record: %v", rec.Done)
 	}
 
+	// An extraction that cannot take its source's lock reads nothing: it
+	// does not go on unsynchronised next to a run that may hold it.
+	appendLine(strings.Repeat("SIXTH: the exporter truncates timestamps to seconds. ", 40))
+	sum := sha1.Sum([]byte(transcript))
+	lock := filepath.Join(local, "extract-"+hex.EncodeToString(sum[:8])+".lock")
+	os.Remove(lock)
+	os.Mkdir(lock, 0o755) // a lock that cannot be opened
+	before = count()
+	if out, errs, code := raw(model); code == 0 || !strings.Contains(errs, "its lock could not be taken") || count() != before {
+		t.Fatalf("an extraction without its lock must stop: %d (%d model calls)\n%s\n%s", code, count()-before, out, errs)
+	}
+	os.Remove(lock)
+	if out, _, _ := raw(model); !strings.Contains(out, "added 1 claim") || count() != before+1 {
+		t.Fatalf("with the lock available again, the range is read:\n%s", out)
+	}
+	if p, _ := os.ReadFile(filepath.Join(calls, fmt.Sprint(before)+".txt")); !strings.Contains(string(p), "SIXTH:") {
+		t.Fatalf("the range of the stopped run was lost:\n%.300s", p)
+	}
+
 	os.Chdir(repo)
 	if d := must(t, "codex", "rules", "--delivery"); !strings.Contains(d, "compaction summaries: captured for main sessions (Claude Code 2.1.325 when turned on); steering off") {
 		t.Errorf("diagnostics:\n%s", d)
