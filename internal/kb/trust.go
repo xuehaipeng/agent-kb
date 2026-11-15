@@ -144,7 +144,11 @@ func (s *Store) trust(n *Node, sup map[string]string, dynamic bool) Trust {
 	rev := m.Rev()
 	author := ContentAuthor(m)
 	t := Trust{State: StateUnverified, Revision: rev, Anchor: author.Commit}
-	anchorAt, anchorBy := author.At, author.By
+	// Whether the anchor still comes from the write that created the entry
+	// (its generation event, or the confirmation 'kb add -e' records with it)
+	// rather than from a later check or update.
+	fromAdd := func(e okf.Event) bool { return e.By == m.Generated.By && e.At == m.Generated.At }
+	anchorFromAdd := rev == 1 && fromAdd(author)
 	authorFam := s.Cfg.FamilyOf(author.By)
 
 	// Events on the current revision, in order. The latest dispute (if any)
@@ -165,7 +169,7 @@ func (s *Store) trust(n *Node, sup map[string]string, dynamic bool) Trust {
 	}
 	confirmers := map[string]bool{}
 	human, cross := false, false
-	for _, e := range events[lastDispute+1:] {
+	for i, e := range events[lastDispute+1:] {
 		if e.Result != "" && e.Result != ResultConfirmed {
 			continue
 		}
@@ -179,13 +183,16 @@ func (s *Store) trust(n *Node, sup map[string]string, dynamic bool) Trust {
 		}
 		if e.Commit != "" {
 			t.Anchor = e.Commit
-			anchorAt, anchorBy = e.At, e.By
+			// Only the first event of revision 1 can be the one Add wrote. A
+			// later confirmation is a real check even by the same actor, at
+			// the same commit, in the same second.
+			anchorFromAdd = rev == 1 && lastDispute+1+i == 0 && fromAdd(e)
 		}
 	}
 	// An import stamps whatever HEAD the chosen checkout had at import time:
 	// that commit says nothing about where the claim was checked. A later
 	// check by anyone (or an update) replaces it with a real anchor.
-	t.importAnchor = importedSource(m) && anchorAt == m.Generated.At && anchorBy == m.Generated.By
+	t.importAnchor = importedSource(m) && anchorFromAdd
 	t.Confirmers = sortedKeys(confirmers)
 	t.Disputers = sortedKeys(disputers)
 	lastIsDispute := len(events) > 0 && events[len(events)-1].Result == ResultDisputed

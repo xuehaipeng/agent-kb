@@ -331,9 +331,12 @@ func (s *Store) Verify(in VerifyInput) (*Node, Trust, error) {
 	}
 	rev := n.Meta().Rev()
 	head := s.headFor(n.Project)
-	// Skip exact repeats (same actor, revision, result and commit).
+	// Skip exact repeats (same actor, revision, result and commit). The
+	// confirmation an import records is not a check of the code, so the
+	// importing agent confirming at the same commit is not a repeat of it:
+	// that check is what gives the entry a real anchor.
 	for _, e := range n.Meta().Verified {
-		if e.By == in.Actor.String() && okf.EventRev(e) == rev && e.Result == in.Result && e.Commit == head && !before.Stale {
+		if e.By == in.Actor.String() && okf.EventRev(e) == rev && e.Result == in.Result && e.Commit == head && !before.Stale && !before.importAnchor {
 			return n, before, nil
 		}
 	}

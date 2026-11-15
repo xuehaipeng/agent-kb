@@ -323,12 +323,25 @@ func TestOwnershipInMultiRepoProject(t *testing.T) {
 	if tr := trustOf(t, out, imp.Node.ID); tr.CodeFreshness != FreshUnknown || tr.FreshnessCode != UnknownAmbiguousRep || !strings.Contains(tr.FreshnessReason, "stamped by an import") {
 		t.Fatalf("import-created anchor: %+v", tr)
 	}
-	// Once someone checks it against the code, that check's commit counts.
-	if _, _, err := b.Verify(VerifyInput{Ref: imp.Node.ID, Result: ResultConfirmed, Evidence: "read pkg/main.go", Actor: claude}); err != nil {
+	// Once someone checks it against the code, that check's commit counts,
+	// even when it is the importing agent at the unchanged import commit
+	// (same actor, commit and, with the test clock, timestamp as the import).
+	if _, _, err := b.Verify(VerifyInput{Ref: imp.Node.ID, Result: ResultConfirmed, Evidence: "read pkg/main.go", Actor: codex}); err != nil {
 		t.Fatal(err)
+	}
+	n, _ := openAt(t, backend).Get(imp.Node.ID)
+	if got := len(n.Meta().Verified); got != 2 {
+		t.Fatalf("the importing agent's check was dropped as a repeat: %d event(s)", got)
 	}
 	if tr := trustOf(t, openAt(t, t.TempDir()), imp.Node.ID); tr.CodeFreshness != FreshUnchanged || tr.Baseline.Repo != beID {
 		t.Fatalf("checked import: %+v baseline %+v", tr, tr.Baseline)
+	}
+	// With a real anchor, repeating the same check is a no-op again.
+	if _, _, err := b.Verify(VerifyInput{Ref: imp.Node.ID, Result: ResultConfirmed, Evidence: "read pkg/main.go again", Actor: codex}); err != nil {
+		t.Fatal(err)
+	}
+	if n, _ := openAt(t, backend).Get(imp.Node.ID); len(n.Meta().Verified) != 2 {
+		t.Fatalf("an exact repeat of a real check was recorded: %d event(s)", len(n.Meta().Verified))
 	}
 
 	// A fork shares the backend's history: the anchor commit is in both, so
