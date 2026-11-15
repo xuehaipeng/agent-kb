@@ -182,26 +182,54 @@ var (
 	headingRe   = regexp.MustCompile(`(?m)^#{1,6}\s`)
 )
 
-// splitIndex separates an index file's link lines (pointers to topic files)
-// from everything else. An index with nothing else is only a table of
-// contents; one with other lines holds notes of its own.
-func splitIndex(content string) (links int, rest string) {
+var indexTargetRe = regexp.MustCompile(`\]\(([^)\s]+)[^)]*\)`)
+
+// splitIndex separates an index file's pointers to topic files from
+// everything else. A pointer is a link line whose target is a memory file in
+// the same directory: that file is imported itself. Any other line is
+// content of the index: a note, or a link to somewhere else (a runbook, a
+// dashboard), which no topic file preserves. An index with pointers only is
+// a table of contents; one with other lines holds notes of its own.
+func splitIndex(content, dir string) (links int, rest string) {
 	var keep []string
+	substantive := false
 	for _, l := range strings.Split(content, "\n") {
-		switch t := strings.TrimSpace(l); {
-		case indexLinkRe.MatchString(l):
+		t := strings.TrimSpace(l)
+		if indexLinkRe.MatchString(l) && pointsToTopic(l, dir) {
 			links++
-		case t == "" || strings.HasPrefix(t, "#"):
-			keep = append(keep, l)
-		default:
-			keep = append(keep, l)
-			rest = "x" // marks substantive content; replaced below
+			continue
+		}
+		keep = append(keep, l)
+		if t != "" && !strings.HasPrefix(t, "#") {
+			substantive = true
 		}
 	}
-	if rest == "" {
+	if !substantive {
 		return links, ""
 	}
 	return links, strings.TrimSpace(strings.Join(keep, "\n"))
+}
+
+// pointsToTopic reports whether a link line's first target is a Markdown
+// file that exists in dir.
+func pointsToTopic(line, dir string) bool {
+	m := indexTargetRe.FindStringSubmatch(line)
+	if m == nil {
+		return false
+	}
+	target := m[1]
+	if i := strings.IndexAny(target, "#?"); i >= 0 {
+		target = target[:i]
+	}
+	if target == "" || strings.Contains(target, "://") || filepath.IsAbs(target) || !strings.HasSuffix(strings.ToLower(target), ".md") {
+		return false
+	}
+	p := filepath.Join(dir, filepath.FromSlash(target))
+	if !within(dir, p) {
+		return false
+	}
+	st, err := os.Stat(p)
+	return err == nil && !st.IsDir()
 }
 
 // memoryKBType maps a memory type to a knowledge type. A type alone never
@@ -471,31 +499,44 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		}
 		r.ambiguous++
 	}
+	// Content first, for every vanished source, then names. A source whose
+	// exact content sits in one new file is that file, whatever else shares
+	// its name; only what content cannot settle is matched by name. Doing
+	// both per source would let an earlier source's name match set aside a
+	// file that a later source matches exactly.
 	for _, key := range sortedKeysOf(vanished) {
 		e := vanished[key]
 		if e.Entry == "" || ambiguous[key] {
 			continue
 		}
-		sameHash, sameName := 0, 0
+		sameHash := 0
 		for _, g := range vanished {
 			if g.Entry != "" && g.Hash == e.Hash {
 				sameHash++
-			}
-			if g.Entry != "" && e.Name != "" && g.Name == e.Name {
-				sameName++
 			}
 		}
 		switch cands := free(newByHash[e.Hash]); {
 		case len(cands) == 1 && sameHash == 1:
 			move(key, cands[0])
-			continue
 		case len(cands) > 0:
 			quarantine(func(g *ledgerEntry) bool { return g.Hash == e.Hash }, cands)
 			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) have the content of %d deleted source(s) (%s among them); nothing was imported or flagged for them (make the files differ, or deprecate the entry)", len(cands), sameHash, e.Entry))
+		}
+	}
+	for _, key := range sortedKeysOf(vanished) {
+		e := vanished[key]
+		if e.Entry == "" || e.Name == "" || ambiguous[key] || movedFrom[key] {
 			continue
 		}
-		if e.Name == "" {
-			continue
+		// Sources that share the name and are still unaccounted for.
+		open := func(p string, g *ledgerEntry) bool {
+			return g.Entry != "" && g.Name == e.Name && !movedFrom[p] && !ambiguous[p]
+		}
+		sameName := 0
+		for p, g := range vanished {
+			if open(p, g) {
+				sameName++
+			}
 		}
 		switch cands := free(newByName[e.Name]); {
 		case len(cands) == 1 && sameName == 1:
@@ -505,7 +546,15 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			// and edited copy next to a backup), or several vanished
 			// sources share it. Which one continues the source is not
 			// knowable, so none is imported and nothing is reported deleted.
-			quarantine(func(g *ledgerEntry) bool { return g.Name == e.Name }, cands)
+			for _, c := range cands {
+				ambiguous[c] = true
+			}
+			for p, g := range vanished {
+				if open(p, g) {
+					ambiguous[p] = true
+				}
+			}
+			r.ambiguous++
 			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) carry the name %q of %d deleted source(s) (%s among them); nothing was imported or flagged for them (keep one file per source with that name, or deprecate the entries)", len(cands), e.Name, sameName, e.Entry))
 		}
 	}
@@ -516,7 +565,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			continue
 		}
 		if base == "MEMORY.md" {
-			links, rest := splitIndex(string(f.data))
+			links, rest := splitIndex(string(f.data), root.Dir)
 			if len([]rune(rest)) < minImportContentLen {
 				r.index++
 				continue
