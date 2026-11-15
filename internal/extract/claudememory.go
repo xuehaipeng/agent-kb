@@ -332,9 +332,6 @@ func (r *rootReport) line(root MemoryRoot, dry bool) string {
 // report block per directory.
 func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 	roots := ClaudeMemoryRoots(s)
-	if len(roots) == 0 {
-		return nil
-	}
 	unlock, err := s.LockLocal("import-ledger.lock")
 	if err != nil {
 		return []string{"claude memory: error: " + err.Error()}
@@ -354,7 +351,7 @@ func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 			report = append(report, fmt.Sprintf("%s: skipped (not in the selected projects)", displayPath(root.Dir)))
 			continue
 		}
-		r, fallbacks := importMemoryRoot(s, l, root, o)
+		r, fallbacks := importMemoryRoot(s, l, root, o, false)
 		report = append(report, r.line(root, o.DryRun))
 		if !o.DryRun {
 			if err := saveLedger(s, l); err != nil {
@@ -366,15 +363,96 @@ func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 			report = append(report, ImportAll(s, fallbacks, o)...)
 		}
 	}
+	// A directory that was imported before and is not found any more. Its
+	// sources are reconciled like deleted files, but only when the
+	// directory is known to be gone: an unreadable or unreachable location
+	// is not a deletion.
+	found := map[string]bool{}
+	for _, root := range roots {
+		found[root.Dir] = true
+	}
+	for _, dir := range trackedRoots(l) {
+		if found[dir] {
+			continue
+		}
+		root := MemoryRoot{Dir: dir, Agent: kb.Actor{Producer: "claude-code"}, Mapped: true}
+		for _, e := range l.Sources {
+			if e.Adapter == AdapterClaudeMemory && e.Root == dir {
+				root.Project = e.Project
+				break
+			}
+		}
+		if len(o.Projects) > 0 && !o.wants(projectOr(s, root.Project)) {
+			continue
+		}
+		gone, why := directoryGone(dir)
+		if !gone {
+			report = append(report, fmt.Sprintf("%s: imported before, and not checked now (%s); nothing was compared with earlier imports", displayPath(dir), why))
+			continue
+		}
+		r, _ := importMemoryRoot(s, l, root, o, true)
+		if r.missing+r.errors == 0 {
+			continue // nothing left there that still backs an entry
+		}
+		report = append(report, r.line(root, o.DryRun)+"\n  the directory itself no longer exists")
+		if !o.DryRun {
+			if err := saveLedger(s, l); err != nil {
+				report = append(report, "  error: could not save the import ledger: "+err.Error())
+			}
+		}
+	}
 	return report
 }
 
-// importMemoryRoot processes one directory against the ledger.
-func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) (*rootReport, []FileSource) {
+// trackedRoots lists the directories the ledger holds sources of.
+func trackedRoots(l *ledger) []string {
+	seen := map[string]bool{}
+	for _, e := range l.Sources {
+		if e.Adapter == AdapterClaudeMemory && e.Root != "" {
+			seen[e.Root] = true
+		}
+	}
+	out := make([]string, 0, len(seen))
+	for d := range seen {
+		out = append(out, d)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// directoryGone reports whether a directory is known to have been removed:
+// it does not exist, and a directory at most two levels above it does and
+// can be read (for a memory directory, its project directory or the
+// projects directory). Anything else (a permission error, a missing config
+// directory, an unmounted home) is not evidence that it was deleted.
+func directoryGone(dir string) (bool, string) {
+	if _, err := os.Stat(dir); err == nil {
+		return false, "it exists, but no longer counts as a memory directory of a known project"
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return false, "it cannot be read: " + err.Error()
+	}
+	up := dir
+	for i := 0; i < 2; i++ {
+		up = filepath.Dir(up)
+		if _, err := os.ReadDir(up); err == nil {
+			return true, ""
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, "its parent cannot be read: " + err.Error()
+		}
+	}
+	return false, "the location it was in is not there either"
+}
+
+// importMemoryRoot processes one directory against the ledger. With removed
+// set, the directory is known to have been removed: it is read as empty.
+func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions, removed bool) (*rootReport, []FileSource) {
 	r := &rootReport{}
 	var fallbacks []FileSource
 	now := s.Now().UTC()
 	entries, err := os.ReadDir(root.Dir)
+	if removed {
+		entries, err = nil, nil
+	}
 	if err != nil {
 		r.errors++
 		r.details = append(r.details, "error: "+err.Error()+" (nothing was compared with earlier imports)")
