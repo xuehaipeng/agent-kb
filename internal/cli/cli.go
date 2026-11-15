@@ -49,6 +49,8 @@ Rules (always-on conventions, delivered at session start):
   kb add rule "<instruction>" -d <why> -e "user said so" [--global] [--when <glob>]...
            --when makes it conditional: left out of session start, shown by kb rules -f <path> and kb search -f <path>
   kb rules -f <path>...              rules that apply only to these files
+  kb rules --delivery                how rules reach Claude Code here: the managed rules file, the hooks, and what
+                                     each recent session and subagent last received
   kb rules import [--user|--repo] [files...]   share rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md, ...)
 
 Record and evolve:
@@ -79,6 +81,8 @@ Cross-review:
 Set up and maintain:
   kb init [--dir knowledge] [--install claude,codex,git-hooks]   single-repo bundle (repo mode)
   kb install <claude|codex|cursor|antigravity|hermes|git-hooks|all>... [--global|--repo]
+           claude: [--capture full|manual] [--native-rules on|off] [--rule-refresh on|off]  (choices are remembered
+           on this machine: a later bare install keeps them)
   kb index [--quiet]          regenerate index.md files (deterministic)
   kb lint [--staged] [--fix]  deterministic checks; exit 1 on errors
   kb maintain                 index + pointer refresh + lint (cron-safe)
@@ -274,6 +278,10 @@ func (a *App) cmdInstall(args []string) error {
 	var skills string
 	var global, repo bool
 	f.str(&skills, "", "Hermes skills directory", "skills-dir")
+	var capture, nativeRules, ruleRefresh string
+	f.str(&capture, "", "claude: full (capture hooks) or manual (rule delivery only); remembered on this machine", "capture")
+	f.str(&nativeRules, "", "claude: on|off, write global rules to a rules file Claude Code loads itself", "native-rules")
+	f.str(&ruleRefresh, "", "claude: on|off, re-deliver rules that changed during a session (runs kb before every tool call)", "rule-refresh")
 	f.boolean(&global, "install user-wide (default with a hub)", "global")
 	f.boolean(&repo, "install into the current repository (default with a repo bundle)", "repo")
 	pos, err := f.parse(args)
@@ -287,6 +295,7 @@ func (a *App) cmdInstall(args []string) error {
 		return errors.New("--global and --repo are exclusive")
 	}
 	opts["skills-dir"] = skills
+	opts["capture"], opts["native-rules"], opts["rule-refresh"] = capture, nativeRules, ruleRefresh
 	if global {
 		opts["scope"] = "global"
 	}

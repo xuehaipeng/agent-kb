@@ -29,12 +29,18 @@ func (a *App) cmdRules(args []string) error {
 	f.boolean(&uncapped, "list every rule that applies, including those a delivery cap leaves out and conditional ones", "all-rules")
 	var files []string
 	f.list(&files, true, "file you will work on: show the rules that apply only to it", "f", "file")
+	var delivery bool
+	f.boolean(&delivery, "how rules reach Claude Code on this machine, and what recent sessions received", "delivery")
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
 	s, err := a.store()
 	if err != nil {
 		return err
+	}
+	if delivery {
+		a.out("%s", s.RenderDeliveryDiagnostics())
+		return nil
 	}
 	if len(files) > 0 {
 		var rel []string

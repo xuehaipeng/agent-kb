@@ -183,10 +183,18 @@ stray project.
 
 | Agent | How rules arrive |
 |---|---|
-| Claude Code | `SessionStart` hook prints the rules for the session's project + global |
+| Claude Code | global rules in `~/.claude/rules/kb.md`, which Claude Code loads itself (also after compaction); the `SessionStart` hook prints the session's project rules; `SubagentStart` gives every subagent the full set |
 | Codex, Antigravity | global rules inside the managed block of `~/.codex/AGENTS.md` / `~/.gemini/GEMINI.md` (refreshed on every rule change); project rules via `kb rules`, as the pointer says |
 | MCP clients (Cursor, Hermes) | the server's `instructions` |
 | Hermes | the skill runs `kb rules -p <project>` |
+
+`kb rules --delivery` shows how rules reach Claude Code on this machine and
+which recent sessions or subagents still hold an older rule set. Installation
+choices are remembered per machine: `kb install claude --capture manual`
+installs rule delivery without any capture hooks, and a later bare
+`kb install claude` keeps that; `--native-rules off` makes the hook deliver
+every rule itself; `--rule-refresh on` re-delivers rules that change during
+a session, at the cost of running kb before every tool call.
 
 Rules are instructions, so their scope is narrower than search. All of these
 surfaces select rules the same way:

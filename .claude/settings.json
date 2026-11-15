@@ -32,6 +32,17 @@
           }
         ]
       }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "command": "kb hook claude",
+            "timeout": 30,
+            "type": "command"
+          }
+        ]
+      }
     ]
   },
   "permissions": {
@@ -44,7 +55,8 @@
       "Bash(kb review:*)",
       "Bash(kb update:*)",
       "Bash(kb deprecate:*)",
-      "Bash(kb project:*)"
+      "Bash(kb project:*)",
+      "Bash(kb rules:*)"
     ]
   }
 }

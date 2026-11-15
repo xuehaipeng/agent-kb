@@ -740,12 +740,15 @@ func TestRuleScopeOnEverySurface(t *testing.T) {
 			}
 		}
 	}
+	// What a Claude Code session has at its start: the managed rules file it
+	// loads itself plus what the SessionStart hook prints.
 	hook := func(cwd string) string {
 		out, _, code := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SessionStart","cwd":"`+cwd+`"}`, "hook", "claude")
 		if code != 0 {
 			t.Fatalf("hook exit %d", code)
 		}
-		return out
+		native, _ := os.ReadFile(filepath.Join(home, ".claude", "rules", "kb.md"))
+		return string(native) + out
 	}
 	mcpInstructions := func() string {
 		out, _, code := kbRun(t, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"cursor"}}}`+"\n", "mcp")
@@ -2048,5 +2051,378 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	// A path-scoped file named on the command line has no known base.
 	if out := must(t, "", "rules", "import", filepath.Join(repo, ".claude", "rules", "api.md"), "--cmd", script); !strings.Contains(out, "its base directory is unknown here") {
 		t.Errorf("explicit path-scoped file:\n%s", out)
+	}
+}
+
+// Item 3: global rules reach Claude Code through a managed rules file, the
+// hooks deliver the rest to the main agent and everything to subagents,
+// capture mode is a recorded choice, and what each agent received is visible.
+func TestNativeRulesAndSubagentDelivery(t *testing.T) {
+	base, home, aiproxy, kubedl := populatedHub(t)
+	const (
+		pnpm, volcano, english, sha = "Use pnpm, never npm", "Submit jobs through volcano queues", "Write commit messages in English", "Tag images with the git sha"
+	)
+	native := filepath.Join(home, ".claude", "rules", "kb.md")
+	settings := filepath.Join(home, ".claude", "settings.json")
+	readNative := func() string { data, _ := os.ReadFile(native); return string(data) }
+	hub, _ := filepath.EvalSymlinks(os.Getenv("KB_HOME")) // the marker names the hub by its resolved path
+	run := func(cwd, input string) string {
+		t.Helper()
+		os.Chdir(cwd)
+		out, _, code := kbRun(t, "claude-code", input, "hook", "claude")
+		if code != 0 {
+			t.Fatalf("hook exit %d", code)
+		}
+		return out
+	}
+	start := func(cwd, session, source string) string {
+		return run(cwd, `{"session_id":"`+session+`","hook_event_name":"SessionStart","source":"`+source+`","cwd":"`+cwd+`"}`)
+	}
+	context := func(out string) string {
+		t.Helper()
+		if strings.TrimSpace(out) == "" {
+			return ""
+		}
+		var m struct {
+			Out struct {
+				Event   string `json:"hookEventName"`
+				Context string `json:"additionalContext"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("hook output is not the JSON a context-only event needs: %v\n%s", err, out)
+		}
+		return m.Out.Event + "|" + m.Out.Context
+	}
+	subagent := func(cwd, session, id, typ string) string {
+		return context(run(cwd, `{"session_id":"`+session+`","hook_event_name":"SubagentStart","agent_id":"`+id+`","agent_type":"`+typ+`","cwd":"`+cwd+`"}`))
+	}
+	has := func(name, text string, want, not []string) {
+		t.Helper()
+		for _, w := range want {
+			if !strings.Contains(text, w) {
+				t.Errorf("%s: missing %q\n%s", name, w, text)
+			}
+		}
+		for _, n := range not {
+			if strings.Contains(text, n) {
+				t.Errorf("%s: must not contain %q\n%s", name, n, text)
+			}
+		}
+	}
+
+	// The managed file: only global rules that apply everywhere, between
+	// kb's markers, owned by this hub.
+	has("managed rules file", readNative(), []string{english, "<!-- kb:begin", "<!-- kb:source " + hub, "<!-- kb:end -->"}, []string{pnpm, volcano, sha, "table-driven"})
+
+	// Main agent, every way a session starts: the hook leaves the universal
+	// rule to the file and delivers the project's rules and the global rules
+	// restricted to it. Nothing is suppressed because a session was seen.
+	for _, source := range []string{"startup", "resume", "clear", "compact", "fork"} {
+		has("main in kubedl ("+source+")", start(kubedl, "main-k", source), []string{volcano, sha}, []string{english, pnpm})
+		has("main in aiproxy ("+source+")", start(aiproxy, "main-a", source), []string{pnpm}, []string{english, volcano, sha})
+		if out := start(base, "main-n", source); strings.Contains(out, pnpm) || strings.Contains(out, volcano) || strings.Contains(out, sha) || strings.Contains(out, english) {
+			t.Errorf("main with no project (%s) should get everything from the file and nothing from the hook:\n%s", source, out)
+		}
+	}
+	// Subagents get the complete applicable set as context, whatever their
+	// type and whatever the main agent received: Explore and Plan load no
+	// CLAUDE.md or rules files at all.
+	for _, typ := range []string{"code-reviewer", "Explore", "Plan", "general-purpose"} {
+		has("subagent "+typ+" in kubedl", subagent(kubedl, "main-k", "agent-"+typ, typ), []string{"SubagentStart|", volcano, sha, english}, []string{pnpm, "table-driven"})
+		has("subagent "+typ+" in aiproxy", subagent(aiproxy, "main-a", "agent-"+typ, typ), []string{"SubagentStart|", pnpm, english}, []string{volcano, sha})
+		has("subagent "+typ+" with no project", subagent(base, "main-n", "agent-"+typ, typ), []string{"SubagentStart|", english}, []string{pnpm, volcano, sha})
+	}
+	// A subagent's own start after it compacts (it carries an agent id).
+	has("subagent after its compaction", run(kubedl, `{"session_id":"main-k","hook_event_name":"SessionStart","source":"compact","agent_id":"agent-Explore","agent_type":"Explore","cwd":"`+kubedl+`"}`), []string{volcano, sha, english}, []string{pnpm})
+
+	// A rule change rewrites the file; a restricted or project rule never enters it.
+	os.Chdir(aiproxy)
+	must(t, "claude-code", "add", "rule", "Never force-push shared branches", "-d", "history is shared", "-e", "user said so", "--global")
+	must(t, "claude-code", "add", "rule", "Use the kubedl staging queue for tests", "-d", "prod queue is metered", "-e", "user said so", "--global", "--for", "kubedl")
+	has("managed rules file after a change", readNative(), []string{english, "Never force-push shared branches"}, []string{"staging queue", pnpm})
+	has("main in kubedl after a change", start(kubedl, "main-k", "resume"), []string{volcano, sha, "staging queue"}, []string{"force-push", english})
+	// The file is never read back in as a rule file.
+	script, _ := fakeModel(t, base, "norules", `[]`)
+	if out := must(t, "", "rules", "import", "--user", "--cmd", script); strings.Contains(out, "rules/kb.md") {
+		t.Errorf("kb's own rules file was offered for import:\n%s", out)
+	}
+
+	// What each agent last received is visible, per agent: the subagents
+	// that started before the change still hold the old rules.
+	os.Chdir(kubedl)
+	diag := must(t, "claude-code", "rules", "--delivery")
+	has("delivery diagnostics", diag, []string{
+		"managed rules file: " + native + " is current",
+		"claude installation: capture full; rule refresh hook off",
+		"main-k [kubedl]", "main: current; via session-start on SessionStart:resume, universal rules from the managed file",
+		"agent-Explore (Explore): STALE: it has ", "refreshed at its next start or compaction",
+		"subagents: SubagentStart gives each one the complete rule set",
+	}, []string{"before its next tool call"})
+
+	// Fallback: when the file is missing or stale, the hook delivers the
+	// universal rules itself and says so in the diagnostics.
+	os.Remove(native)
+	has("main in kubedl without the file", start(kubedl, "main-k", "resume"), []string{volcano, sha, english, "force-push"}, []string{pnpm})
+	has("diagnostics without the file", must(t, "claude-code", "rules", "--delivery"), []string{"is missing or out of date, so SessionStart delivers every rule itself (fallback)"}, nil)
+	os.WriteFile(native, []byte("<!-- kb:begin (managed by 'kb install'; re-run it to update, edits here are overwritten) -->\nan older copy\n<!-- kb:source "+hub+" -->\n<!-- kb:end -->\n"), 0o644)
+	has("main in kubedl with a stale file", start(kubedl, "main-k", "resume"), []string{english}, nil)
+	must(t, "", "install", "claude")
+	has("repaired file", readNative(), []string{english, "force-push"}, []string{"older copy"})
+	has("main in kubedl after repair", start(kubedl, "main-k", "resume"), []string{volcano}, []string{english})
+	// A rules file someone else wrote is not overwritten; the hook covers.
+	os.WriteFile(native, []byte("My own notes in a file named kb.md.\n"), 0o644)
+	if out := must(t, "", "install", "claude"); !strings.Contains(out, "was not written by this hub: left as it is") {
+		t.Errorf("foreign rules file:\n%s", out)
+	}
+	if got := readNative(); got != "My own notes in a file named kb.md.\n" {
+		t.Errorf("a file kb did not write was changed:\n%s", got)
+	}
+	has("main in kubedl beside a foreign file", start(kubedl, "main-k", "resume"), []string{english, volcano}, nil)
+	os.Remove(native)
+	// Turning the file off is remembered.
+	must(t, "", "install", "claude", "--native-rules", "off")
+	must(t, "", "install", "claude")
+	if _, err := os.Stat(native); err == nil {
+		t.Error("the managed rules file came back after it was turned off")
+	}
+	has("main in kubedl with the file turned off", start(kubedl, "main-k", "startup"), []string{english, volcano, sha}, nil)
+	must(t, "", "install", "claude", "--native-rules", "on")
+	has("file turned on again", readNative(), []string{english}, []string{volcano})
+
+	// Capture mode is a recorded choice, separate from rule delivery.
+	hooksIn := func() map[string]any {
+		var m map[string]any
+		data, _ := os.ReadFile(settings)
+		json.Unmarshal(data, &m)
+		h, _ := m["hooks"].(map[string]any)
+		return h
+	}
+	for _, ev := range []string{"SessionStart", "SubagentStart", "PreCompact", "SessionEnd"} {
+		if hooksIn()[ev] == nil {
+			t.Fatalf("full install lacks %s", ev)
+		}
+	}
+	out := must(t, "", "install", "claude", "--capture", "manual")
+	if !strings.Contains(out, "Capture mode: manual (recorded for this machine)") {
+		t.Errorf("manual install notes:\n%s", out)
+	}
+	for i := 0; i < 2; i++ { // a later bare install, twice: still manual
+		if h := hooksIn(); h["PreCompact"] != nil || h["SessionEnd"] != nil || h["SessionStart"] == nil || h["SubagentStart"] == nil {
+			t.Fatalf("manual capture must keep delivery hooks and drop capture hooks: %v", h)
+		}
+		out = must(t, "", "install", "claude")
+		if !strings.Contains(out, "Capture mode: manual (recorded for this machine)") {
+			t.Errorf("a bare install forgot the recorded mode:\n%s", out)
+		}
+	}
+	has("delivery still works in manual mode", start(kubedl, "main-k", "startup"), []string{volcano, sha}, nil)
+	must(t, "", "install", "claude", "--capture", "full")
+	if h := hooksIn(); h["PreCompact"] == nil || h["SessionEnd"] == nil {
+		t.Fatalf("back to full capture: %v", h)
+	}
+	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {
+		t.Errorf("installation choices leaked into the shared hub:\n%s", st)
+	}
+
+	// Rule refresh (opt-in): an agent whose rules changed since it received
+	// them gets the current set before its next tool call, once.
+	tool := func(session, id string) string {
+		in := `{"session_id":"` + session + `","hook_event_name":"PreToolUse","tool_name":"Read","cwd":"` + kubedl + `"`
+		if id != "" {
+			in += `,"agent_id":"` + id + `","agent_type":"Explore"`
+		}
+		return context(run(kubedl, in+"}"))
+	}
+	if h := hooksIn(); h["PreToolUse"] != nil {
+		t.Fatalf("the refresh hook must be opt-in: %v", h)
+	}
+	must(t, "", "install", "claude", "--rule-refresh", "on")
+	if h := hooksIn(); h["PreToolUse"] == nil {
+		t.Fatal("refresh hook not installed")
+	}
+	start(kubedl, "refresh", "startup")
+	subagent(kubedl, "refresh", "agent-r", "Explore")
+	if out := tool("refresh", "") + tool("refresh", "agent-r"); out != "" {
+		t.Errorf("nothing changed: the refresh hook must stay silent:\n%s", out)
+	}
+	os.Chdir(kubedl)
+	must(t, "claude-code", "add", "rule", "Label every job with its team", "-d", "cost reports need it", "-e", "user said so")
+	has("refresh for the subagent", tool("refresh", "agent-r"), []string{"PreToolUse|kb: the rules that apply here changed", "Label every job with its team", volcano, english}, []string{pnpm})
+	has("refresh for the main agent", tool("refresh", ""), []string{"Label every job with its team"}, nil)
+	if out := tool("refresh", "") + tool("refresh", "agent-r"); out != "" {
+		t.Errorf("an agent is refreshed once per change:\n%s", out)
+	}
+	has("diagnostics with refresh on", must(t, "claude-code", "rules", "--delivery"), []string{"rule refresh hook on", "agent-r (Explore): current; via rule-refresh on PreToolUse:refresh"}, nil)
+	must(t, "", "install", "claude", "--rule-refresh", "off")
+	if h := hooksIn(); h["PreToolUse"] != nil {
+		t.Fatalf("refresh hook not removed: %v", h)
+	}
+
+	// The same hub installed for another Claude configuration directory:
+	// the choice to use the managed file is kept, the file goes where that
+	// configuration is read from, and a session under the old directory no
+	// longer counts on a file that is not there.
+	has("main in kubedl before the move", start(kubedl, "moved", "startup"), []string{volcano}, []string{english})
+	other := filepath.Join(home, "claude-work")
+	t.Setenv("CLAUDE_CONFIG_DIR", other)
+	out = must(t, "", "install", "claude")
+	moved, _ := os.ReadFile(filepath.Join(other, "rules", "kb.md"))
+	has("managed rules file in the new configuration directory", string(moved), []string{english, "<!-- kb:source " + hub}, []string{volcano})
+	if _, err := os.Stat(filepath.Join(other, "settings.json")); err != nil {
+		t.Errorf("settings were not written to the new configuration directory: %v", err)
+	}
+	if _, err := os.Stat(native); err == nil || !strings.Contains(out, "removed "+native) {
+		t.Errorf("the file of the earlier configuration directory must go, and be reported:\n%s", out)
+	}
+	has("main under the new configuration directory", start(kubedl, "moved", "resume"), []string{volcano}, []string{english})
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	has("main under the old configuration directory", start(kubedl, "moved", "resume"), []string{volcano, english}, nil)
+}
+
+// TestManagedFileOverflowAndHookEnvelope: a rule cut from the managed rules
+// file to fit its budget is still delivered by SessionStart, and what a
+// context hook prints stays within the hook limit once it is JSON.
+func TestManagedFileOverflowAndHookEnvelope(t *testing.T) {
+	base, home := hubEnv(t)
+	must(t, "", "hub", "init")
+	var items, titles []string
+	for i := 0; i < 30; i++ {
+		// Markup, quotes and backslashes: characters JSON has to escape.
+		title := fmt.Sprintf("Rule %02d: wrap <T> & \"quoted\" paths like C:\\tmp in <code> tags, %s", i, strings.Repeat("never the raw <b>value</b> & nothing else, ", 7))
+		titles = append(titles, fmt.Sprintf("Rule %02d:", i))
+		items = append(items, fmt.Sprintf(`{"type":"rule","global":true,"title":%q,"description":"because the team agreed on it"}`, title))
+	}
+	out, errs, code := kbRun(t, "claude-code", "["+strings.Join(items, ",")+"]", "add", "--from", "-", "-e", "user said so", "--force")
+	if code != 0 || !strings.Contains(out, "seeded 30 of 30") {
+		t.Fatalf("seed: %d\n%s\n%s", code, out, errs)
+	}
+	must(t, "", "install", "claude")
+	data, _ := os.ReadFile(filepath.Join(home, ".claude", "rules", "kb.md"))
+	file := string(data)
+	os.Chdir(base)
+	hook, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SessionStart","source":"startup","cwd":"`+base+`"}`, "hook", "claude")
+	inFile, inHook := 0, 0
+	for _, title := range titles {
+		f, h := strings.Contains(file, title), strings.Contains(hook, title)
+		if f {
+			inFile++
+		}
+		if h {
+			inHook++
+		}
+		if f && h {
+			t.Errorf("%s is in the managed file and delivered again by the hook", title)
+		}
+		if !f && !h {
+			t.Errorf("%s was cut from the managed file and not delivered by the hook either", title)
+		}
+	}
+	if inFile == 0 || inHook == 0 {
+		t.Fatalf("the test needs rules on both sides: %d in the file, %d in the hook", inFile, inHook)
+	}
+	var st struct {
+		Delivery struct {
+			Rendered int `json:"rendered"`
+			Native   int `json:"native"`
+		} `json:"rules_delivery"`
+	}
+	json.Unmarshal([]byte(must(t, "claude-code", "status", "--json")), &st)
+	if st.Delivery.Native != inFile || st.Delivery.Rendered != inHook {
+		t.Errorf("status reports %d from the file and %d from the hook, want %d and %d", st.Delivery.Native, st.Delivery.Rendered, inFile, inHook)
+	}
+
+	// What a context hook prints is JSON. The limit is on the output, so
+	// the envelope and the escaping count, and so does a refresh's notice.
+	units := func(s string) int {
+		n := 0
+		for _, r := range s {
+			if r >= 0x10000 {
+				n++
+			}
+			n++
+		}
+		return n
+	}
+	check := func(name, out string) {
+		t.Helper()
+		var m struct {
+			Out struct {
+				Context string `json:"additionalContext"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("%s: not JSON: %v", name, err)
+		}
+		if n := units(out); n > 9000 || n < 6000 {
+			t.Errorf("%s prints %d units: it must stay under the hook limit and use its budget", name, n)
+		}
+		if !strings.Contains(m.Out.Context, "wrap <T> & \"quoted\" paths like C:\\tmp") || strings.Contains(out, `\u003c`) {
+			t.Errorf("%s: the rule text must arrive as written, without HTML escapes:\n%.300s", name, out)
+		}
+		if !strings.Contains(m.Out.Context, "more rule(s)") && !strings.Contains(m.Out.Context, "left out") && !strings.Contains(m.Out.Context, "omitted") {
+			t.Errorf("%s: rules were cut to fit, and the payload must say so:\n%.300s", name, m.Out.Context[len(m.Out.Context)-300:])
+		}
+	}
+	sub, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore","cwd":"`+base+`"}`, "hook", "claude")
+	check("SubagentStart", sub)
+	must(t, "claude-code", "add", "rule", "One more rule to change the digest", "-d", "so a refresh is due", "-e", "user said so", "--global")
+	refresh, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Read","agent_id":"a1","agent_type":"Explore","cwd":"`+base+`"}`, "hook", "claude")
+	check("rule refresh", refresh)
+	if !strings.Contains(refresh, "changed since you last received them") {
+		t.Errorf("the refresh notice is part of the payload:\n%.200s", refresh)
+	}
+}
+
+// TestRuleRefreshWhenNoRulesRemain: when the last rule an agent holds is
+// retired, the refresh hook says so once instead of staying silent with the
+// agent marked stale for ever.
+func TestRuleRefreshWhenNoRulesRemain(t *testing.T) {
+	base, _ := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	os.Chdir(repo)
+	must(t, "claude-code", "add", "rule", "Squash commits before merging", "-d", "history stays readable", "-e", "user said so")
+	hook := func(input string) string {
+		t.Helper()
+		out, _, code := kbRun(t, "claude-code", input, "hook", "claude")
+		if code != 0 {
+			t.Fatalf("hook exit %d", code)
+		}
+		return out
+	}
+	tool := func(agent string) string {
+		in := `{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Read","cwd":"` + repo + `"`
+		if agent != "" {
+			in += `,"agent_id":"` + agent + `","agent_type":"Explore"`
+		}
+		return hook(in + "}")
+	}
+	if out := hook(`{"session_id":"s1","hook_event_name":"SessionStart","source":"startup","cwd":"` + repo + `"}`); !strings.Contains(out, "Squash commits before merging") {
+		t.Fatalf("session start:\n%s", out)
+	}
+	hook(`{"session_id":"s1","hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore","cwd":"` + repo + `"}`)
+	if out := tool("") + tool("a1"); out != "" {
+		t.Fatalf("nothing changed yet:\n%s", out)
+	}
+	must(t, "claude-code", "deprecate", "aiproxy/conventions/squash-commits-before-merging", "-m", "the team merges with merge commits now")
+	for _, agent := range []string{"", "a1"} {
+		out := tool(agent)
+		if !strings.Contains(out, "no longer apply here, and no kb rules apply now") || strings.Contains(out, "Squash commits") {
+			t.Errorf("agent %q was not told its rules are gone:\n%s", agent, out)
+		}
+		if again := tool(agent); again != "" {
+			t.Errorf("agent %q is told once:\n%s", agent, again)
+		}
+	}
+	if diag := must(t, "claude-code", "rules", "--delivery"); strings.Contains(diag, "STALE") {
+		t.Errorf("no agent is stale after the refresh:\n%s", diag)
+	}
+	// An agent that never held a rule is not told that its rules are gone.
+	if out := tool("a2"); out != "" {
+		t.Errorf("an agent without rules has nothing to retract:\n%s", out)
+	}
+	if out := tool("a2"); out != "" {
+		t.Errorf("and is not looked at again:\n%s", out)
 	}
 }
