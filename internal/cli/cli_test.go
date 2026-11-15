@@ -1234,6 +1234,18 @@ func TestClaudeMemoryDeterministicImport(t *testing.T) {
 	if p, _ := os.ReadFile(prompt); !strings.Contains(string(p), "Production runbook") || !strings.Contains(string(p), "notes_that_do_not_exist.md") || strings.Contains(string(p), "feedback_testing.md") {
 		t.Fatalf("external references must reach the fallback, topic pointers must not:\n%s", p)
 	}
+	// A link into a subdirectory names a file the topic scan never reads:
+	// an index of such links is not a table of contents to skip.
+	os.MkdirAll(filepath.Join(mem, "topics"), 0o755)
+	os.WriteFile(filepath.Join(mem, "topics", "runbook.md"), []byte("Restart the queue workers before the API during a rollback.\n"), 0o644)
+	write("MEMORY.md", "# Memory index\n\n- [Rollback runbook](topics/runbook.md) — read it before any rollback\n")
+	if out := scan(cmd); !strings.Contains(out, "fallback: MEMORY.md holds notes besides its 0 link(s)") || strings.Contains(out, "1 index skipped") {
+		t.Fatalf("an index linking to a nested file:\n%s", out)
+	}
+	if p, _ := os.ReadFile(prompt); !strings.Contains(string(p), "topics/runbook.md") {
+		t.Fatalf("a nested link must reach the fallback:\n%s", p)
+	}
+	os.RemoveAll(filepath.Join(mem, "topics"))
 
 	// A typed file the earlier model-based import already took is not
 	// imported a second time: unchanged it is done, changed it stays on the
@@ -1648,6 +1660,8 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(home, "outside.md"), []byte("Content outside the repository that must not be imported.\n"), 0o644)
 	os.WriteFile(filepath.Join(home, "shared-rule.md"), []byte("A rule that lives outside the repository.\n"), 0o644)
 	os.Symlink(filepath.Join(home, "shared-rule.md"), filepath.Join(repo, ".claude", "rules", "linked.md"))
+	// A link back to the rules directory itself: read once, not for ever.
+	os.Symlink(".", filepath.Join(repo, ".claude", "rules", "shared"))
 	git(t, repo, "add", "-A")
 	git(t, repo, "commit", "-qm", "rules")
 
@@ -1659,6 +1673,9 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	os.WriteFile(script, []byte("#!/bin/sh\nP=$(cat)\nF=$(printf '%s\\n' \"$P\" | sed -n 's/^File \\(.*\\):$/\\1/p' | tail -1)\nN=$(basename \"$(dirname \"$F\")\")-$(basename \"$F\")\nprintf '%s' \"$P\" > '"+prompts+"'/\"$N\".txt\nprintf '[{\"title\":\"Rule from %s\",\"description\":\"imported for the test\"}]' \"$N\"\n"), 0o755)
 	os.Chdir(repo)
 	out := must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if n := strings.Count(out, "rules/general.md: added 1"); n != 1 {
+		t.Errorf("a rules directory linked into itself must be read once, got %d:\n%s", n, out)
+	}
 	for _, want := range []string{
 		".claude/rules/broken.md: not imported (its frontmatter does not parse",
 		".claude/rules/badglob.md: not imported (pattern \"photos [2024/**\"",
@@ -1763,6 +1780,49 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Migrations are forward-only") {
 		t.Errorf("--when rule delivered as always-on:\n%s", got)
 	}
+	// The same instruction for other files is a rule of its own; it repeats
+	// an existing one only where that one is already delivered.
+	must(t, "claude-code", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "services/billing/migrations/**")
+	if got := forFile("services/billing/migrations/0001.sql"); !strings.Contains(got, "Migrations are forward-only") {
+		t.Errorf("the same rule for another directory:\n%s", got)
+	}
+	if _, errs, code := kbRun(t, "claude-code", "", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "db/migrations/**"); code == 0 || !strings.Contains(errs, "db/migrations") && !strings.Contains(errs, "migrations-are-forward-only") {
+		t.Errorf("the same rule for the same files is a duplicate: exit %d\n%s", code, errs)
+	}
+	must(t, "claude-code", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so")
+	if _, _, code := kbRun(t, "claude-code", "", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "tools/migrations/**"); code == 0 {
+		t.Error("a rule that already applies everywhere covers every narrower copy")
+	}
+
+	// Narrowing a rule file's paths changes nothing in its text, yet the
+	// rules it gave follow the new condition.
+	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/v2/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if !strings.Contains(out, "rules/api.md: its condition changed; 1 rule(s) follow it [aiproxy/conventions/rule-from-rules-api-md]") || !strings.Contains(out, "rules/api.md: added 0, duplicates 1") {
+		t.Errorf("a changed paths condition:\n%s", out)
+	}
+	if got := forFile("src/api/users/create.ts"); strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("the rule kept its old, wider condition:\n%s", got)
+	}
+	if got := forFile("src/api/v2/users/create.ts"); !strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("the rule did not take the new condition:\n%s", got)
+	}
+	if api := read("rules-api.md"); !strings.Contains(api, "The rules in this file apply only when working on src/api/v2/**/*.ts") || !strings.Contains(api, "Rule from web-CLAUDE.md (only when working on ** under packages/web/)") {
+		t.Errorf("the prompt must say which files the rules are for:\n%s", api)
+	}
+	// Dropping the condition makes the rule apply everywhere.
+	file(".claude/rules/api.md", "# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); !strings.Contains(out, "rules/api.md: its condition changed; 1 rule(s) follow it") {
+		t.Errorf("a removed paths condition:\n%s", out)
+	}
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from rules-api.md") {
+		t.Errorf("an unconditional rule file's rule must be always-on:\n%s", got)
+	}
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); strings.Contains(out, "condition changed") || !strings.Contains(out, "rules/api.md: skipped (unchanged since last import)") {
+		t.Errorf("nothing changed, nothing to reconcile:\n%s", out)
+	}
+	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
+
 	// A path-scoped file named on the command line has no known base.
 	if out := must(t, "", "rules", "import", filepath.Join(repo, ".claude", "rules", "api.md"), "--cmd", script); !strings.Contains(out, "its base directory is unknown here") {
 		t.Errorf("explicit path-scoped file:\n%s", out)

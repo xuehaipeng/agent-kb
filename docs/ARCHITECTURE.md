@@ -498,10 +498,26 @@ applies_to:
 | `@AGENTS.md` | not followed: other agents read it natively |
 | kb's own blocks and pointer | never re-imported |
 
-Rules directories are walked recursively. `@path` imports are followed up to
+Rules directories are walked recursively, each directory once whatever leads
+to it (a link back to the directory or an ancestor ends there). `@path`
+imports are followed up to
 four hops, once each (cycles end), only to existing files, and never inside
 code spans or fences. Block-level HTML comments are dropped, except inside
 code blocks. Everything left out is listed as a `note:` line.
+
+**The condition is part of what was imported.** A file's condition lives in
+frontmatter (or in where the file is), not in the text sent to the model, so
+the import's change detection covers both. When only the condition changes,
+the rules the file gave earlier (found by their `sources`) take the new
+condition as a new revision; a rule that was in force stays in force.
+
+**A rule repeats another only where that one is already delivered.** The
+same instruction in `packages/web/CLAUDE.md` and `packages/api/CLAUDE.md` is
+two rules, one per directory. A proposal is a duplicate when an existing rule
+with the same text is unconditional, or has the same base and syntax and all
+of the proposal's patterns. Conditions are never merged or widened. The
+import prompt lists existing rules with their condition and says which files
+the file's own rules are for.
 
 ### 2.15 Rule delivery to Claude Code: managed file, hooks, subagents *(issue #3 item 3)*
 

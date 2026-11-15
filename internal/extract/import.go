@@ -92,8 +92,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	}
 	// Never re-import kb's own managed blocks (pointer, delivered rules).
 	content := strings.TrimSpace(kbBlockRe.ReplaceAllString(string(data), ""))
-	sum := sha256.Sum256([]byte(content))
-	hash := hex.EncodeToString(sum[:])
+	hash := importHash(content, src.Applies)
 	abs, _ := filepath.Abs(src.Path)
 	st := loadState(s, abs)
 	// A project-filtered run only takes part of the file, so it neither
@@ -106,6 +105,16 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	if filtered && src.Project != "" && src.Project != kb.GlobalProject && !o.wants(src.Project) {
 		res.Skipped = "not in the selected projects"
 		return res, nil
+	}
+	srcID := src.Kind + "-" + kb.Slugify(src.Agent.Producer)
+	if src.Kind == KindRules && !o.DryRun {
+		// The file says which files its rules are for. Rules it gave
+		// earlier follow a changed condition before anything is added.
+		rescoped, err := reconcileApplies(s, src, srcID, o)
+		if err != nil {
+			return nil, err
+		}
+		res.Rescoped = rescoped
 	}
 	minLen := minImportContentLen
 	if src.Prepared {
@@ -154,7 +163,6 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		claims = claims[:limit]
 	}
 	known := s.ProjectFiles()
-	srcID := src.Kind + "-" + kb.Slugify(src.Agent.Producer)
 	evidence := fmt.Sprintf("saved in %s's memory (%s)", src.Agent.Producer, displayPath(src.Path))
 	if src.Kind == KindRules {
 		evidence = fmt.Sprintf("user rule written for %s in %s", src.Agent.Producer, displayPath(src.Path))
@@ -229,6 +237,66 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	return res, saveHash(s, abs, hash)
 }
 
+// importHash identifies what an import took from a file: its content and,
+// for a conditional rule file, the condition, which lives in frontmatter the
+// content no longer has.
+func importHash(content string, applies *okf.Applicability) string {
+	if applies != nil && len(applies.Paths) > 0 {
+		content += "\x00applies_to\x00" + applies.Base + "\x00" + applies.Origin + "\x00" + strings.Join(applies.Paths, "\x00")
+	}
+	sum := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(sum[:])
+}
+
+// reconcileApplies gives the rules a file produced earlier the condition
+// the file has now. It returns the entries it changed.
+func reconcileApplies(s *kb.Store, src FileSource, srcID string, o ImportOptions) ([]string, error) {
+	nodes, err := s.Nodes()
+	if err != nil {
+		return nil, err
+	}
+	resource := displayPath(src.Path)
+	var stale []*kb.Node
+	for _, n := range nodes {
+		if !s.Cfg.AlwaysOn(n.TypeKey) || s.Trust(n).State == kb.StateDeprecated || kb.SameApplies(n.Meta().AppliesTo, src.Applies) {
+			continue
+		}
+		if len(o.Projects) > 0 && !o.wants(n.Project) {
+			continue
+		}
+		for _, from := range n.Meta().Sources {
+			if from.ID == srcID && from.Resource == resource {
+				stale = append(stale, n)
+				break
+			}
+		}
+	}
+	var date time.Time
+	if st, err := os.Stat(src.Path); err == nil {
+		date = st.ModTime().UTC()
+	}
+	var out []string
+	for _, n := range stale {
+		reason := "its rule file no longer limits it to particular files"
+		if src.Applies != nil && len(src.Applies.Paths) > 0 {
+			reason = "its rule file now applies " + kb.AppliesNote(src.Applies)
+		}
+		// The condition is the user's own, like the rule: a rule in force
+		// stays in force instead of waiting for a confirmation. One that was
+		// not trusted before is not confirmed by a change of its condition.
+		evidence := ""
+		if s.Trust(n).Trusted() {
+			evidence = fmt.Sprintf("user rule written for %s in %s", src.Agent.Producer, resource)
+		}
+		if _, _, err := s.Update(kb.UpdateInput{Ref: n.ID, Reason: reason, Actor: src.Agent, AppliesTo: src.Applies, SetAppliesTo: true, Evidence: evidence,
+			SourceOnly: true, SourceDate: date, SourceDateBasis: kb.BasisSourceMtime}); err != nil {
+			return out, fmt.Errorf("%s: %w", n.ID, err)
+		}
+		out = append(out, n.ID)
+	}
+	return out, nil
+}
+
 func projectOr(s *kb.Store, p string) string {
 	if p == "" {
 		return s.Project
@@ -266,6 +334,12 @@ Return ONLY a JSON array (no prose, no code fence) of at most %d objects shaped 
 - Keep the user's intent and wording; never invent rules. Skip anything that is not an instruction.
 - Do not repeat rules that already exist (listed below). Return [] if nothing qualifies.
 `, agent, displayPath(src.Path), maxRuleClaims, projectField, agent)
+		// A rule that exists for other files only does not cover this file.
+		if src.Applies != nil && len(src.Applies.Paths) > 0 {
+			fmt.Fprintf(&b, "- The rules in this file apply only %s. An existing rule marked for other files is not a repeat: return it for this file too.\n", kb.AppliesNote(src.Applies))
+		} else {
+			b.WriteString("- The rules in this file apply everywhere. An existing rule marked \"only ...\" covers those files alone and is not a repeat: return it.\n")
+		}
 	default:
 		fmt.Fprintf(&b, `These are notes a coding agent (%s) saved in its private memory. The other agents (Claude Code, Codex, Hermes, Cursor, ...) cannot see them. Turn the durable, shareable ones into entries for the knowledge base all agents share.
 
@@ -297,7 +371,11 @@ func existingTitles(s *kb.Store, rulesOnly bool) []string {
 		if n.TypeKey == "review" || (rulesOnly && !s.Cfg.AlwaysOn(n.TypeKey)) || s.Trust(n).State == kb.StateDeprecated {
 			continue
 		}
-		out = append(out, n.Meta().Title)
+		title := n.Meta().Title
+		if rulesOnly && kb.Conditional(n.Meta()) {
+			title += " (only " + kb.AppliesNote(n.Meta().AppliesTo) + ")"
+		}
+		out = append(out, title)
 	}
 	sort.Strings(out)
 	if len(out) > 150 {
@@ -450,6 +528,9 @@ func ImportAll(s *kb.Store, srcs []FileSource, o ImportOptions) []string {
 			report = append(report, fmt.Sprintf("%s: would import (%d-char prompt)", label, len(r.Prompt)))
 		default:
 			report = append(report, fmt.Sprintf("%s: added %d, duplicates %d, already documented %d %v", label, len(r.Added), r.Dupes, r.Documented, r.Added))
+		}
+		if err == nil && len(r.Rescoped) > 0 {
+			report = append(report, fmt.Sprintf("%s: its condition changed; %d rule(s) follow it %v", label, len(r.Rescoped), r.Rescoped))
 		}
 	}
 	if len(report) == 0 {
