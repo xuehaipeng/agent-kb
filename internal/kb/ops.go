@@ -843,3 +843,38 @@ func ContainsSecret(s string) bool {
 
 // ensureDir is a small helper used by init and installers.
 func ensureDir(p string) error { return os.MkdirAll(p, 0o755) }
+
+// RelocateSource records that a source of an entry now lives somewhere
+// else (its file was renamed). It changes provenance only: the content, its
+// revision, its verifications and its deadline stay exactly as they are.
+func (s *Store) RelocateSource(ref, sourceID, resource string, actor Actor) error {
+	if actor.Zero() {
+		return ErrNoActor
+	}
+	unlock, err := s.Lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	s.Invalidate()
+	n, err := s.Get(ref)
+	if err != nil {
+		return err
+	}
+	srcs := append([]okf.Source(nil), n.Meta().Sources...)
+	changed := false
+	for i := range srcs {
+		if srcs[i].ID == sourceID && srcs[i].Resource != resource {
+			srcs[i].Resource = resource
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	n.Doc.Set("sources", okf.SourcesNode(srcs))
+	if err := s.writeNode(n); err != nil {
+		return err
+	}
+	return s.recordChange("source-moved", n.ID, actor, "its source is now "+resource)
+}

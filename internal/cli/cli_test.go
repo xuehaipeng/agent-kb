@@ -1406,6 +1406,13 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 	if !strings.Contains(out, "1 renamed") || !strings.Contains(out, "1 sources deleted") || !strings.Contains(out, "source deleted: project_beta.md no longer backs "+betaID) || strings.Contains(out, "no longer backs "+alphaID) {
 		t.Fatalf("rename next to a deletion:\n%s", out)
 	}
+	// The entry follows its source to the new file name, with the same
+	// content, revision and deadline.
+	// (The confirmation recorded at import keeps naming the file as it was
+	// then: verification events are history and are never rewritten.)
+	if a := show(alphaID); !strings.Contains(a, "source [^memory-claude-code]: ~/.claude/projects/-x-aiproxy/memory/project_alpha_rollout.md by") || strings.Contains(a, "source [^memory-claude-code]: ~/.claude/projects/-x-aiproxy/memory/project_alpha.md") || !strings.Contains(a, "revision: 1") || !strings.Contains(a, "trust: verified") {
+		t.Fatalf("a renamed source must be named by its entry:\n%s", a)
+	}
 	write("project_alpha_rollout.md", topic("shared-name", "Alpha rollout is gated on the canary", "project", "The alpha rollout waits for the canary to pass for two days."))
 	if out := scan(); !strings.Contains(out, "1 updated") {
 		t.Fatalf("edit after the rename:\n%s", out)
