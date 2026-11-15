@@ -526,3 +526,9 @@ func (s *Store) recordChange(op, id string, actor Actor, detail string) error {
 	}
 	return nil
 }
+
+// LockLocal takes an exclusive cross-process lock on a named file in the
+// local state directory, for machine-local state other packages keep there
+// (the import ledger). It is separate from the bundle's write lock, so a
+// holder may still write entries through the store.
+func (s *Store) LockLocal(name string) (func(), error) { return s.lockFile(name) }

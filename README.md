@@ -145,8 +145,22 @@ kb add rule "Write commit messages in English" -d "team convention" -e "user sai
 kb rules import                                 # ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md (global)
                                                 # + CLAUDE.md, GEMINI.md, .claude/rules, .cursor/rules, .agents/rules (this project)
 kb extract --scan memories                      # Claude Code, Codex, Hermes and Antigravity memory files (changed ones only)
+kb extract --scan claude-memory --dry-run       # what Claude Code's memory would add, update or flag; writes nothing
 kb extract --scan memories -p aiproxy -p kubedl # ... only what belongs to these projects
 ```
+
+Claude Code's memory is one typed file per memory, so it is imported without a
+model and tracked: editing a memory updates the same entry, renaming keeps it,
+and deleting it flags the entry for review instead of leaving it as if still
+backed. `feedback` memories become project rules, `project` and `reference`
+memories become facts, and `user` memories are never imported. If an entry was
+edited by hand and its memory changes too, the scan reports a conflict instead
+of overwriting; after merging, `--accept-conflicts` settles it.
+
+Imported entries record no commit and no import-time deadline: they were read,
+not checked against the code. Their deadline counts from the source's own
+date, so an old note is due for a look at once, and `kb show` says what the
+date is based on.
 
 An agent can also seed what it remembers about particular projects itself, in
 one call. Each item goes through the usual duplicate, doc-overlap and

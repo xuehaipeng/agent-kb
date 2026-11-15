@@ -219,6 +219,11 @@ func (s *Store) trust(n *Node, sup map[string]string, dynamic bool) Trust {
 				t.Overdue = true
 				t.Stale = true
 				t.StaleReason = "past stale_after " + ts.Format("2006-01-02")
+				if m.StaleBasis != "" {
+					// The deadline came from the source's date or a review
+					// window, not from a check of the claim.
+					t.StaleReason += " (deadline from " + m.StaleBasis + ")"
+				}
 			}
 		}
 		// The deadline and the code check are independent: an overdue entry

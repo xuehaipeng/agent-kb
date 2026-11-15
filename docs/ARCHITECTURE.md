@@ -234,6 +234,8 @@ Rev 2 shares all three.
   - Entries are recorded as verified by the source agent, with the memory file
     as evidence, and pass the duplicate and doc-overlap checks.
   - Claude Code's memory is imported automatically at `SessionEnd`.
+  - Claude Code's typed memory files are imported without a model and keep
+    their identity; all imports are source-only (§2.13).
 - **Rule-file import:** `kb rules import` splits rule files written for one
   agent into atomic, agent-neutral rules.
   - User-level files become global rules; a repo's `CLAUDE.md`, `GEMINI.md`,
@@ -375,6 +377,80 @@ and is not asked to read the file. Forty rules of full length came to about
   the 40-rule cap and no size budget: it is pulled on request.
 - Not budgeted here: the user-level Codex/Antigravity blocks, which are
   files, not hook output, and keep the count cap only.
+
+### 2.13 Source-only ingestion and the Claude memory adapter *(issue #3 item 2, issue #1 stage 4A for imports)*
+
+**Source-only writes.** A memory or rule file that is imported was not
+checked against the code at import time. `Store.Add` and `Store.Update` take
+an explicit `SourceOnly` origin instead of inferring it from the evidence
+text:
+
+- No commit is recorded, neither on the generation event nor on the
+  confirmation the evidence creates. The HEAD of whatever checkout the import
+  ran near says nothing about the claim. An entry with `resources` and no
+  anchor has unknown code freshness (§2.11), not a pass.
+- Evidence still makes the entry `verified`: source-backed trust is unchanged
+  (§2.10). Trust, the deadline and code freshness stay independent.
+- For types that expire, `stale_after` is `min(source date, import time) +
+  TTL`, never later than an import-time deadline. `stale_basis` says what the
+  date was: `source_updated_at` (a revision date the source records about
+  itself), `source_mtime` (the file's modification time) or
+  `undated_review_schedule` (no usable date, or a future one: import time
+  plus at most seven days). None of them is an observation date. An old note
+  is therefore due at once, and its stale reason names the basis.
+- Refreshing an entry from a changed source never moves its deadline later.
+  A real check (`kb verify --confirm`, an ordinary `kb update`) records a
+  commit, restarts the deadline from now and drops the basis.
+- `sources[]` keeps `last_modified` (the source's own date), `ingested_at`
+  and, when the source names one, `origin_session` (lineage only: it does not
+  say the session was fully captured).
+
+This covers imports. Transcript extraction still records the session
+checkout's HEAD; that part of issue #1 stage 4A is not done here.
+
+**Claude Code auto memory.** Each memory is one file with YAML frontmatter
+(`name`, `description`, `type`, often `modified` and `originSessionId`) next
+to a `MEMORY.md` index. That layout is what Claude Code writes today, not a
+documented contract, so the adapter takes only what it recognises and sends
+the rest to the model-based import, visibly:
+
+| File | Outcome |
+|---|---|
+| `type: feedback` | convention in the directory's project, in the source's wording; never promoted to global |
+| `type: project`, `type: reference` | fact with the type's normal expiry; a memory type alone never makes a decision |
+| `type: user` | skipped and counted: notes about the person stay private |
+| `MEMORY.md` with only links and headings | skipped: it restates the topic files |
+| `MEMORY.md` with other lines | model fallback on those lines only (its links are left out) |
+| no frontmatter, unknown type, several headings, or over 6,000 bytes | model fallback, reported with the reason |
+
+**Identity.** A versioned, gitignored ledger (`.kb/extract/import-ledger.json`)
+records for each source file its directory, content hash, the entry it became
+and the revision the import last wrote.
+
+- Unchanged file: nothing happens.
+- Edited file: the same entry gets a new revision through a conditional
+  `Store.Update`. If the entry was edited since the last import, that is a
+  conflict: nothing is overwritten, and it is reported on every scan until it
+  is merged by hand and settled with `--accept-conflicts`.
+- Renamed file: recognised when exactly one new file carries a vanished
+  source's content (or name). Several identical candidates are reported as
+  ambiguous; nothing is imported or flagged for them.
+- Memory whose type changes to one that maps to another knowledge type: a
+  conflict on every scan, decided on the entry's actual type. An update
+  cannot change an entry's type, so the source is never applied to it, and
+  accepting the conflict does not lift that. Deprecating the entry frees the
+  memory to import as a new entry.
+- Tracked file that stops being a single typed note (several sections, too
+  long, now `user` or empty): also a conflict. The model path only adds
+  entries, so it must not take a file that already owns one.
+- Deleted file: the entry is kept and reported for review until it is
+  confirmed again (a check recorded after the deletion was found), rewritten
+  or deprecated. Deletions are reported only when the whole
+  directory was read: an unreadable file or directory is not a deletion.
+- A directory with no project to attach to is reported and skipped.
+
+Importing a source that overlaps a transcript of the same session
+automatically stays out until session coverage exists (issue #1 stage 3B).
 
 ## 3. Doc C (ChatGPT plan) review
 

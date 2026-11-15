@@ -28,7 +28,9 @@ type Source struct {
 	ID           string `yaml:"id"`
 	Resource     string `yaml:"resource,omitempty"`
 	Author       string `yaml:"author,omitempty"`
-	LastModified string `yaml:"last_modified,omitempty"`
+	LastModified string `yaml:"last_modified,omitempty"`  // when the source itself last changed, not when it was read
+	IngestedAt   string `yaml:"ingested_at,omitempty"`    // when kb read the source
+	Session      string `yaml:"origin_session,omitempty"` // session the source says it came from (lineage, not coverage)
 }
 
 // Review is the AgentKB extension block carried by `type: Review` nodes.
@@ -77,6 +79,7 @@ type Meta struct {
 	Updated     *Event     `yaml:"updated"` // last content update (revision > 1)
 	Verified    []Event    `yaml:"verified"`
 	StaleAfter  string     `yaml:"stale_after"`
+	StaleBasis  string     `yaml:"stale_basis"` // what stale_after was derived from when not from a check of the code
 	Sources     []Source   `yaml:"sources"`
 	Supersedes  StringList `yaml:"supersedes"`
 	Review      *Review    `yaml:"review"`
@@ -172,14 +175,33 @@ func New(m Meta, body string) *Doc {
 	if m.StaleAfter != "" {
 		d.Set("stale_after", str(m.StaleAfter))
 	}
+	if m.StaleBasis != "" {
+		d.Set("stale_basis", str(m.StaleBasis))
+	}
 	if len(m.Sources) > 0 {
-		seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
-		for _, s := range m.Sources {
-			seq.Content = append(seq.Content, sourceNode(s))
-		}
-		d.Set("sources", seq)
+		d.Set("sources", SourcesNode(m.Sources))
 	}
 	return d
+}
+
+// SourcesNode builds the `sources` list.
+func SourcesNode(srcs []Source) *yaml.Node {
+	seq := &yaml.Node{Kind: yaml.SequenceNode, Tag: "!!seq"}
+	for _, s := range srcs {
+		seq.Content = append(seq.Content, sourceNode(s))
+	}
+	return seq
+}
+
+// Delete removes a top-level frontmatter key, if present.
+func (d *Doc) Delete(key string) {
+	for i := 0; i+1 < len(d.root.Content); i += 2 {
+		if d.root.Content[i].Value == key {
+			d.root.Content = append(d.root.Content[:i], d.root.Content[i+2:]...)
+			d.refresh()
+			return
+		}
+	}
 }
 
 // Set replaces (or appends) a top-level frontmatter key and refreshes Meta.
@@ -356,6 +378,8 @@ func sourceNode(s Source) *yaml.Node {
 	add("resource", s.Resource)
 	add("author", s.Author)
 	add("last_modified", s.LastModified)
+	add("ingested_at", s.IngestedAt)
+	add("origin_session", s.Session)
 	return m
 }
 

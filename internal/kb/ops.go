@@ -30,6 +30,58 @@ type AddInput struct {
 	Force       bool // skip the near-duplicate and doc-overlap checks
 	NoDocCheck  bool // imported rules: they are pushed to agents, not searched
 	NewProject  bool // allow creating Project if it does not exist yet
+
+	// SourceOnly marks a claim ingested from a source (a memory or rule
+	// file) rather than checked against the code now. No commit is recorded
+	// for it, because the HEAD of whatever checkout the import ran in says
+	// nothing about the claim, and its revalidation deadline comes from the
+	// source's own date instead of the time of import.
+	SourceOnly      bool
+	SourceDate      time.Time // the source's own revision date; zero when unknown
+	SourceDateBasis string    // BasisSourceUpdatedAt or BasisSourceMtime
+}
+
+// What a revalidation deadline was derived from when an entry was ingested
+// from a source. None of them is an observation date: they only make sure
+// ingested knowledge comes up for a look.
+const (
+	BasisSourceUpdatedAt = "source_updated_at"       // a revision date the source records about itself
+	BasisSourceMtime     = "source_mtime"            // the source file's modification time
+	BasisUndated         = "undated_review_schedule" // no usable source date: a short review window
+)
+
+const undatedReviewWindow = 7 * 24 * time.Hour
+
+// sourceDeadline is the revalidation deadline of a source-only entry with
+// type TTL ttl: the source's date plus the TTL, never later than an import
+// "now" would give. A missing or future date is not trusted: the entry gets
+// a short review window instead. A zero ttl means the type does not expire.
+func sourceDeadline(now time.Time, ttl time.Duration, date time.Time, basis string) (time.Time, string) {
+	if ttl <= 0 {
+		return time.Time{}, ""
+	}
+	if date.IsZero() || basis == "" || date.After(now.Add(24*time.Hour)) {
+		w := ttl
+		if w > undatedReviewWindow {
+			w = undatedReviewWindow
+		}
+		return now.Add(w), BasisUndated
+	}
+	if date.After(now) {
+		date = now // clock skew: never later than the import-time deadline
+	}
+	return date.Add(ttl), basis
+}
+
+// RevisionConflictError reports an update that expected another revision:
+// the entry changed since the caller last wrote it.
+type RevisionConflictError struct {
+	ID        string
+	Want, Got int
+}
+
+func (e *RevisionConflictError) Error() string {
+	return fmt.Sprintf("%s is at revision %d, not %d: it was changed since it was last imported", e.ID, e.Got, e.Want)
 }
 
 // AddResult reports what Add did.
@@ -237,6 +289,9 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	now := s.Now().UTC()
 	tc := s.Cfg.Types[tk]
 	head := s.headFor(project)
+	if in.SourceOnly {
+		head = ""
+	}
 	meta := okf.Meta{
 		Type:        DisplayType(tk),
 		Title:       in.Title,
@@ -257,6 +312,10 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	}
 	if tc.TTLDays > 0 {
 		meta.StaleAfter = now.Add(time.Duration(tc.TTLDays) * 24 * time.Hour).Format(time.RFC3339)
+		if in.SourceOnly {
+			due, basis := sourceDeadline(now, time.Duration(tc.TTLDays)*24*time.Hour, in.SourceDate.UTC(), in.SourceDateBasis)
+			meta.StaleAfter, meta.StaleBasis = due.Format(time.RFC3339), basis
+		}
 	}
 	body := strings.TrimSpace(in.Body)
 	if body == "" {
@@ -368,6 +427,18 @@ type UpdateInput struct {
 	Reason       string // why it changed (required)
 	Evidence     string // optional: how the updater knows; verifies the new revision
 	Actor        Actor
+
+	Sources    []okf.Source // replaces when SetSources
+	SetSources bool
+	// ExpectRevision, when set, makes the update conditional: it fails with
+	// a RevisionConflictError unless the entry is still at that revision.
+	ExpectRevision int
+	// SourceOnly: the new content comes from a changed source, not from a
+	// check of the code (see AddInput.SourceOnly). No commit is recorded and
+	// the deadline is never moved later than it already was.
+	SourceOnly      bool
+	SourceDate      time.Time
+	SourceDateBasis string
 }
 
 // Update rewrites an entry's content as a new revision. Knowledge evolves:
@@ -406,6 +477,9 @@ func (s *Store) Update(in UpdateInput) (*Node, Trust, error) {
 	if s.Trust(n).State == StateDeprecated {
 		return nil, Trust{}, fmt.Errorf("%s is deprecated; add a new entry instead", n.ID)
 	}
+	if in.ExpectRevision > 0 && n.Meta().Rev() != in.ExpectRevision {
+		return nil, Trust{}, &RevisionConflictError{ID: n.ID, Want: in.ExpectRevision, Got: n.Meta().Rev()}
+	}
 	var red int
 	if in.Title != nil {
 		t, r := Redact(oneLine(*in.Title, 0))
@@ -437,8 +511,14 @@ func (s *Store) Update(in UpdateInput) (*Node, Trust, error) {
 	if in.SetTags {
 		n.Doc.Set("tags", okf.ListNode(cleanList(in.Tags)))
 	}
+	if in.SetSources {
+		n.Doc.Set("sources", okf.SourcesNode(in.Sources))
+	}
 	rev := n.Meta().Rev() + 1
 	head := s.headFor(n.Project)
+	if in.SourceOnly {
+		head = ""
+	}
 	now := s.nowString()
 	n.Doc.Set("revision", okf.IntNode(rev))
 	n.Doc.Set("updated", okf.EventNode(okf.Event{By: in.Actor.String(), At: now, Rev: rev, Commit: head, Evidence: in.Reason}, true))
@@ -446,7 +526,11 @@ func (s *Store) Update(in UpdateInput) (*Node, Trust, error) {
 	if evidence != "" {
 		n.Doc.AppendVerified(okf.Event{By: in.Actor.String(), At: now, Result: ResultConfirmed, Rev: rev, Commit: head, Evidence: evidence})
 	}
-	s.refreshStaleAfter(n)
+	if in.SourceOnly {
+		s.sourceStaleAfter(n, in.SourceDate, in.SourceDateBasis)
+	} else {
+		s.refreshStaleAfter(n)
+	}
 	t := s.Trust(n)
 	s.applyStatus(n, t)
 	if err := s.writeNode(n); err != nil {
@@ -462,10 +546,30 @@ func (s *Store) Update(in UpdateInput) (*Node, Trust, error) {
 	return n, t, nil
 }
 
+// refreshStaleAfter restarts the deadline after a real check or rewrite of
+// an entry. The deadline then counts from now, so a basis recorded by an
+// earlier ingestion no longer applies.
 func (s *Store) refreshStaleAfter(n *Node) {
 	if ttl := s.Cfg.Types[n.TypeKey].TTLDays; ttl > 0 {
 		n.Doc.SetString("stale_after", s.Now().UTC().Add(time.Duration(ttl)*24*time.Hour).Format(time.RFC3339))
 	}
+	n.Doc.Delete("stale_basis")
+}
+
+// sourceStaleAfter sets the deadline of an entry whose content was refreshed
+// from its source. Re-reading or editing a source is not a newer check of
+// the claim, so the deadline never moves later than it already was.
+func (s *Store) sourceStaleAfter(n *Node, date time.Time, basis string) {
+	ttl := s.Cfg.Types[n.TypeKey].TTLDays
+	if ttl <= 0 {
+		return
+	}
+	due, basis := sourceDeadline(s.Now().UTC(), time.Duration(ttl)*24*time.Hour, date.UTC(), basis)
+	if old, err := parseTime(n.Meta().StaleAfter); err == nil && !old.After(due) {
+		return // keep the earlier deadline and its basis
+	}
+	n.Doc.SetString("stale_after", due.Format(time.RFC3339))
+	n.Doc.SetString("stale_basis", basis)
 }
 
 // Resolve is a human decision on an entry: keep (confirm) or deprecate.
@@ -727,3 +831,38 @@ func ContainsSecret(s string) bool {
 
 // ensureDir is a small helper used by init and installers.
 func ensureDir(p string) error { return os.MkdirAll(p, 0o755) }
+
+// RelocateSource records that a source of an entry now lives somewhere
+// else (its file was renamed). It changes provenance only: the content, its
+// revision, its verifications and its deadline stay exactly as they are.
+func (s *Store) RelocateSource(ref, sourceID, resource string, actor Actor) error {
+	if actor.Zero() {
+		return ErrNoActor
+	}
+	unlock, err := s.Lock()
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	s.Invalidate()
+	n, err := s.Get(ref)
+	if err != nil {
+		return err
+	}
+	srcs := append([]okf.Source(nil), n.Meta().Sources...)
+	changed := false
+	for i := range srcs {
+		if srcs[i].ID == sourceID && srcs[i].Resource != resource {
+			srcs[i].Resource = resource
+			changed = true
+		}
+	}
+	if !changed {
+		return nil
+	}
+	n.Doc.Set("sources", okf.SourcesNode(srcs))
+	if err := s.writeNode(n); err != nil {
+		return err
+	}
+	return s.recordChange("source-moved", n.ID, actor, "its source is now "+resource)
+}
