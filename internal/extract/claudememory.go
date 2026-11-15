@@ -43,29 +43,6 @@ const (
 	maxTopicBytes = 6000
 )
 
-// MemoryRoot is one auto-memory directory and the project it belongs to.
-type MemoryRoot struct {
-	Dir     string
-	Agent   kb.Actor
-	Project string // hub: project id; repo mode: ""
-	Mapped  bool   // false when no project could be established for the directory
-}
-
-// ClaudeMemoryRoots lists Claude Code's auto-memory directories.
-func ClaudeMemoryRoots(s *kb.Store) []MemoryRoot {
-	var out []MemoryRoot
-	dirs, _ := filepath.Glob(filepath.Join(claudeDir(), "projects", "*", "memory"))
-	sort.Strings(dirs)
-	for _, d := range dirs {
-		if st, err := os.Stat(d); err != nil || !st.IsDir() {
-			continue
-		}
-		project, ok := claudeMemoryProject(s, filepath.Dir(d))
-		out = append(out, MemoryRoot{Dir: d, Agent: kb.Actor{Producer: "claude-code"}, Project: project, Mapped: ok})
-	}
-	return out
-}
-
 // ledger is the machine-local record of what each source file became.
 type ledger struct {
 	Version int                     `json:"version"`
@@ -332,7 +309,7 @@ func (r *rootReport) line(root MemoryRoot, dry bool) string {
 // ImportClaudeMemory imports every auto-memory directory and returns one
 // report block per directory.
 func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
-	roots := ClaudeMemoryRoots(s)
+	roots := ClaudeMemoryRoots(s, o)
 	unlock, err := s.LockLocal("import-ledger.lock")
 	if err != nil {
 		return []string{"claude memory: error: " + err.Error()}
@@ -346,11 +323,25 @@ func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 	for _, root := range roots {
 		switch {
 		case !root.Mapped:
-			report = append(report, fmt.Sprintf("%s: skipped (no project could be established for this directory; run kb inside its repository once)", displayPath(root.Dir)))
+			report = append(report, fmt.Sprintf("%s: skipped (%s)", displayPath(root.Dir), root.Why))
 			continue
 		case len(o.Projects) > 0 && !o.wants(projectOr(s, root.Project)):
 			report = append(report, fmt.Sprintf("%s: skipped (not in the selected projects)", displayPath(root.Dir)))
 			continue
+		}
+		// The directory was imported into another project before (a mapping
+		// changed, or what establishes its owner did). Its sources are known
+		// by path, so going on would keep writing this project's memory
+		// into the other one. Nothing moves on its own.
+		if was, entries := importedElsewhere(l, root); len(entries) > 0 {
+			then, now := projectOr(s, was), projectOr(s, root.Project)
+			if !o.AcceptConflicts {
+				report = append(report, fmt.Sprintf("%s: skipped (%d of its files were imported into %s, and the directory now belongs to %s; nothing is moved on its own: re-run with --accept-conflicts to import it into %s and leave the entries in %s as they are, or map it back with --map-root %s=%s)",
+					displayPath(root.Dir), len(entries), then, now, now, then, displayPath(root.Dir), then))
+				continue
+			}
+			releaseRoot(l, root)
+			report = append(report, fmt.Sprintf("%s: its earlier imports into %s are no longer tied to it; these entries stay there until someone retires them: %s", displayPath(root.Dir), then, strings.Join(entries, ", ")))
 		}
 		r, fallbacks := importMemoryRoot(s, l, root, o, false)
 		report = append(report, r.line(root, o.DryRun))
@@ -409,6 +400,34 @@ func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 }
 
 // trackedRoots lists the directories the ledger holds sources of.
+// importedElsewhere finds what a directory's files became in a project
+// other than the one the directory belongs to now.
+func importedElsewhere(l *ledger, root MemoryRoot) (project string, entries []string) {
+	dir := kb.RealPath(root.Dir)
+	seen := map[string]bool{}
+	for _, e := range l.Sources {
+		if e.Adapter != AdapterClaudeMemory || e.Root != dir || e.Project == root.Project || e.Entry == "" || seen[e.Entry] {
+			continue
+		}
+		seen[e.Entry] = true
+		project = e.Project
+		entries = append(entries, e.Entry)
+	}
+	sort.Strings(entries)
+	return project, entries
+}
+
+// releaseRoot forgets what a directory's files became under another owner,
+// so they are imported anew. The entries themselves are not touched.
+func releaseRoot(l *ledger, root MemoryRoot) {
+	dir := kb.RealPath(root.Dir)
+	for k, e := range l.Sources {
+		if e.Adapter == AdapterClaudeMemory && e.Root == dir && e.Project != root.Project {
+			delete(l.Sources, k)
+		}
+	}
+}
+
 func trackedRoots(l *ledger) []string {
 	seen := map[string]bool{}
 	for _, e := range l.Sources {

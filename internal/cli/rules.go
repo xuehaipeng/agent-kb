@@ -52,6 +52,7 @@ func (a *App) cmdRules(args []string) error {
 			return err
 		}
 		out := s.RenderFileRules(rules, rel)
+		noteRulesDelivered(s, rules)
 		if out == "" && !quiet {
 			out = "no rule applies only to " + strings.Join(rel, ", ") + " (the always-on rules still do: kb rules)\n"
 		}
@@ -67,6 +68,11 @@ func (a *App) cmdRules(args []string) error {
 		return err
 	}
 	out := s.RenderRules(rs, !quiet)
+	if !all {
+		// An agent that runs 'kb rules' receives them, like one a hook
+		// hands them to. Every project's rules at once is an inspection.
+		noteRulesDelivered(s, append(append([]*kb.Node{}, rs.Scoped...), rs.Global...))
+	}
 	if out == "" && !quiet {
 		out = "no rules yet. When the user states a lasting rule or preference: kb add rule \"<instruction>\" -d \"<why>\" -e \"user said so\" [--global]\n" +
 			"Import rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md, ...): kb rules import\n"
@@ -135,4 +141,14 @@ func (a *App) cmdRulesImport(args []string) error {
 		a.out("note: %s\n", n)
 	}
 	return nil
+}
+
+// noteRulesDelivered counts rules handed to whoever ran the command in the
+// local access statistics.
+func noteRulesDelivered(s *kb.Store, rules []*kb.Node) {
+	ids := make([]string, 0, len(rules))
+	for _, n := range rules {
+		ids = append(ids, n.ID)
+	}
+	s.NoteAccess(kb.AccessDelivered, ids)
 }

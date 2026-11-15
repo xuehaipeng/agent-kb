@@ -102,6 +102,8 @@ func (s *Server) handle(req request) {
 		// for this field (the fixed guidance is always kept).
 		d, _ := s.Store.MCPInstructionsDelivery(baseInstructions)
 		instructions := d.Text
+		// The client receives these rules: count them as delivered.
+		s.Store.NoteAccess(kb.AccessDelivered, d.IDs)
 		reply(map[string]any{
 			"protocolVersion": version,
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},
@@ -238,6 +240,7 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		s.Store.NoteHits(hits)
 		return s.Store.RenderHits(hits, q), nil
 	case "kb_show":
 		var a struct {
@@ -258,6 +261,7 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 				continue
 			}
 			parts = append(parts, s.Store.RenderNode(n))
+			s.Store.NoteAccess(kb.AccessShown, []string{n.ID})
 		}
 		return strings.Join(parts, "\n---\n"), nil
 	case "kb_add":

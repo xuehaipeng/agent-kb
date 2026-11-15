@@ -235,6 +235,9 @@ func (s *Store) RecordDelivery(session, agent, agentType, event string, d Delive
 		_, _ = WriteFileIfChanged(s.deliveryPath(session), data)
 	}
 	s.pruneDeliveries()
+	// The agent holds the rules in the payload and those the managed rules
+	// file gave it: both were delivered.
+	s.NoteAccess(AccessDelivered, append(append([]string{}, d.IDs...), d.NativeIDs...))
 }
 
 // pruneDeliveries drops session records not touched for 30 days.

@@ -511,8 +511,7 @@ func Scan(s *kb.Store, o ScanOptions) ([]string, error) {
 		actor = kb.Actor{Producer: "codex"}
 	case "claude":
 		if home == "" {
-			h, _ := os.UserHomeDir()
-			home = filepath.Join(h, ".claude")
+			home = claudeDir() // honors CLAUDE_CONFIG_DIR
 		}
 		root = filepath.Join(home, "projects")
 		pattern = func(name string) bool { return strings.HasSuffix(name, ".jsonl") }

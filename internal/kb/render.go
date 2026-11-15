@@ -367,6 +367,9 @@ func RenderStatus(r *StatusReport) string {
 			fmt.Fprintf(&b, "  %s\n", id)
 		}
 	}
+	if a := r.Access; a != nil && a.NeverRetrieved > 0 {
+		fmt.Fprintf(&b, "never retrieved on this machine since %s: %d of %d (a maintenance hint only; kb status --access)\n", a.Since[:min(10, len(a.Since))], a.NeverRetrieved, a.NeverRetrieved+a.Retrieved)
+	}
 	if r.Uncommitted > 0 || r.Unpushed > 0 {
 		fmt.Fprintf(&b, "not yet shared: %d uncommitted file(s), %d unpushed commit(s) (kb sync)\n", r.Uncommitted, r.Unpushed)
 	}

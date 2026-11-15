@@ -620,6 +620,58 @@ input through the CLI. Whether Claude Code loads `rules/kb.md` into a given
 agent type, and how `SubagentStart` and `PreToolUse` context behave across a
 real resume or compaction, was not tested on a live session.
 
+### 2.16 Memory discovery, retention and local access statistics *(issue #3 item 6B)*
+
+**Whose a memory directory is.** A directory is imported only when its
+project is established, never guessed from a name alone:
+
+| Directory | Owner |
+|---|---|
+| default `<config>/projects/<dir>/memory` | the one project its transcripts ran in (every transcript is read, not a sample); failing transcripts, the one project with a registered checkout whose encoded path is `<dir>` |
+| the same, with transcripts from several projects, or from one project and from somewhere this store does not know (another repository, in a repo bundle) | none: needs a mapping |
+| `autoMemoryDirectory` in a repository's `.claude/settings*.json` | that repository's project |
+| `autoMemoryDirectory` in user settings, or in a file given with `--settings` | none: shared by every project that runs with it |
+| subagent memory under a checkout (`.claude/agent-memory[-local]/<agent>/`) | that checkout's project |
+| user-level subagent memory (`<config>/agent-memory/<agent>/`) | none: it spans projects and is not turned into global knowledge on its own |
+
+A directory can be reached several of these ways. Everything said about it
+is collected first and weighed together: a mapping made by hand settles it;
+otherwise anything that makes it shared keeps it out, however firmly
+something else names one project (a repository's directory that user
+settings also name is shared); otherwise the projects named must agree.
+
+**An owner change is not applied silently.** Sources are known by path. If
+files of a directory were imported into one project and the directory now
+belongs to another (a new mapping, or different evidence), the scan skips it
+and says so. `--accept-conflicts` settles it: the files are imported anew
+for the new owner, and the earlier entries stay where they are, listed, for
+someone to retire. Mapping it back is the other way out.
+
+`kb extract --map-root <dir>=<project>` records an owner for a shared
+directory in local state (`.kb/extract/roots.json`); `<dir>=` removes it.
+The config directory is the effective one (`CLAUDE_CONFIG_DIR`), for
+transcripts too. A settings file a session received through `--settings`
+is invisible to an offline scan and has to be named. `kb extract --sources`
+lists every directory found, its owner and how that was established, or why
+it is not imported.
+
+**Retention.** The same report gives the transcript retention it can read
+(`cleanupPeriodDays`, 30 by default, and the separate desktop limit) and the
+age of the oldest transcript on disk, which bounds any backfill. No fixed
+30-day window is assumed.
+
+**Access statistics.** `.kb/access.json` (local) counts, per entry, how
+often it was *listed* (a search result line), *shown* (content returned by
+`kb show` or `kb_show`) and *delivered* (a rule handed to an agent: by a
+hook, by `kb rules` or `kb rules -f`, or in the MCP server's instructions;
+`kb rules --all` is an inspection and does not count). They are
+kept apart because a result line is not evidence that content reached a
+model. `kb status` reports how many entries in scope were never retrieved
+here, and `kb status --access` lists them and the least recently retrieved.
+This is a maintenance signal only: it never changes trust, never expires or
+deletes anything, and says nothing about use on other machines.
+`KB_NO_ACCESS_LOG=1` turns it off.
+
 ## 3. Doc C (ChatGPT plan) review
 
 **Adopted in rev 2** (also: §2.9, repo docs as the source of truth):
