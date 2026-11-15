@@ -206,13 +206,14 @@ func walkRulesOnce(dir, boundary, ext string, notes *[]string, seen map[string]b
 // nestedClaudeFiles lists tracked Claude instruction files below the root
 // directory (repo-relative, slash separated).
 func nestedClaudeFiles(root string) []string {
-	out, err := kb.Git(root, "ls-files", "--", "*CLAUDE.md", "*/.claude/rules/*.md")
+	// -z: paths as they are, NUL-separated. Without it git quotes and
+	// escapes a path with non-ASCII characters, and the file is not found.
+	out, err := kb.Git(root, "ls-files", "-z", "--", "*CLAUDE.md", "*/.claude/rules/*.md")
 	if err != nil {
 		return nil
 	}
 	var files []string
-	for _, l := range strings.Split(out, "\n") {
-		l = strings.TrimSpace(l)
+	for _, l := range strings.Split(out, "\x00") {
 		switch {
 		case l == "" || l == "CLAUDE.md" || l == ".claude/CLAUDE.md" || strings.HasPrefix(l, ".claude/rules/"):
 		case strings.HasSuffix(l, "/CLAUDE.md") || strings.Contains(l, "/.claude/rules/"):

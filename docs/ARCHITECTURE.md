@@ -477,7 +477,9 @@ applies_to:
   <path>` (which the pointer already tells agents to run before touching
   unfamiliar code). Asked about several files at once, each rule names the
   files it governs, so a rule for one package is never presented as a rule
-  for another. `kb rules --all-rules` lists them with their condition.
+  for another. `kb search -f <path> --json` lists the same rules (`kind:
+  "rule"`) with `applies_to` and, in `rule_for`, the files asked about that
+  each one governs. `kb rules --all-rules` lists them with their condition.
   Nothing pushes them yet; a file-access hook is issue #3 item 4.
 - Only rules can be conditional (`kb add rule ... --when <glob>`). `--when`
   repeats or takes a comma-separated list; a comma inside `{a,b}` belongs to
@@ -485,7 +487,8 @@ applies_to:
   is not a rule is refused instead of being added without the condition.
 - Patterns follow Claude Code's documented rule syntax: `**` crosses
   directories; a bare name matches at any depth; a leading `/` anchors to the
-  base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work. A
+  base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work,
+  and a bracket expression, negated or not, stays within one path segment. A
   pattern that cannot be matched exactly is an error and matches nothing. It
   is never widened.
 
