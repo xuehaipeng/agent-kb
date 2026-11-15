@@ -50,7 +50,12 @@ func (s *Store) RenderHits(hits []Hit, q SearchQuery) string {
 		// Rules that apply only to these files: the moment they matter.
 		if rules, err := s.RulesForFiles(files, q.Projects, q.AllProjects); err == nil {
 			for _, n := range rules {
-				fmt.Fprintf(&b, "rule for this file: %s [%s]\n", ruleText(n), n.ID)
+				// With several files, say which ones a rule is for.
+				which := "this file"
+				if len(files) > 1 {
+					which = strings.Join(FilesGoverned(n, files), ", ") + " only"
+				}
+				fmt.Fprintf(&b, "rule for %s: %s [%s]\n", which, ruleText(n), n.ID)
 			}
 		}
 		open, _ := s.Reviews(ReviewFilter{Projects: q.Projects, AllProjects: q.AllProjects})
