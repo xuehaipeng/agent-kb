@@ -2368,6 +2368,33 @@ func TestMemoryDiscoveryAndOwnership(t *testing.T) {
 			t.Errorf("sources report lacks %q:\n%s", want, report)
 		}
 	}
+	// A directory already imported into one project is mapped to another.
+	// Its sources are known by path, so nothing is written until that is
+	// settled by hand; then it is imported anew and the old entries stay.
+	put(filepath.Join(shared, "memory"), "project_two.md", topic("two", "Shared directory note", "project", "A note from a directory two projects wrote to, edited since."))
+	must(t, "", "extract", "--map-root", filepath.Join(shared, "memory")+"=aiproxy")
+	if out := scan(); !strings.Contains(out, "projects/work/memory: skipped (1 of its files were imported into kubedl, and the directory now belongs to aiproxy; nothing is moved on its own") || strings.Contains(out, "projects/work/memory [aiproxy]") {
+		t.Errorf("a directory whose owner changed after it was imported:\n%s", out)
+	}
+	if got := must(t, "codex", "show", "kubedl/facts/shared-directory-note"); strings.Contains(got, "edited since") {
+		t.Errorf("the new owner's memory was written into the old owner's entry:\n%s", got)
+	}
+	out = scan("--accept-conflicts")
+	if !strings.Contains(out, "projects/work/memory [aiproxy]: 1 imported") || !strings.Contains(out, "its earlier imports into kubedl are no longer tied to it; these entries stay there until someone retires them: kubedl/facts/shared-directory-note") {
+		t.Errorf("settling an owner change by hand:\n%s", out)
+	}
+	if got := search("shared directory note"); !strings.Contains(got, "aiproxy/facts/shared-directory-note") || !strings.Contains(got, "kubedl/facts/shared-directory-note") {
+		t.Errorf("imported anew for the new owner, the old entry kept:\n%s", got)
+	}
+	if out := scan(); strings.Contains(out, "imported into kubedl") || !strings.Contains(out, "projects/work/memory [aiproxy]: 0 imported, 0 updated, 1 unchanged") {
+		t.Errorf("once settled, the directory is its new owner's:\n%s", out)
+	}
+	must(t, "", "extract", "--map-root", filepath.Join(shared, "memory")+"=kubedl")
+	if out := scan(); !strings.Contains(out, "imported into aiproxy, and the directory now belongs to kubedl") {
+		t.Errorf("mapping it back is an owner change too:\n%s", out)
+	}
+	must(t, "", "extract", "--map-root", filepath.Join(shared, "memory")+"=aiproxy")
+
 	// Removing a mapping makes the directory unowned again; its entries stay.
 	must(t, "", "extract", "--map-root", userMem+"=")
 	if out := scan(); !strings.Contains(out, "mem-user: skipped (autoMemoryDirectory in") {
@@ -2414,6 +2441,17 @@ func TestMemoryDiscoveryAndOwnership(t *testing.T) {
 		t.Errorf("a directory two repositories name:\n%s", out)
 	}
 	os.Remove(filepath.Join(aiproxy, ".claude", "settings.local.json"))
+	// A session that ran somewhere this hub does not know is evidence too:
+	// the directory is not one project's alone.
+	stray := filepath.Join(alt, "projects", "-x-stray")
+	unknown := filepath.Join(base, "not-a-project")
+	os.MkdirAll(unknown, 0o755)
+	transcript(stray, "a.jsonl", kubedl)
+	transcript(stray, "b.jsonl", unknown)
+	put(filepath.Join(stray, "memory"), "project_ten.md", topic("ten", "Note from a directory with a stray session", "project", "One session ran outside every known project."))
+	if out := scan(); !strings.Contains(out, "-x-stray/memory: skipped (sessions that wrote to it ran in kubedl and also outside any project known here") {
+		t.Errorf("a directory with a session outside every known project:\n%s", out)
+	}
 	// Ownership looks at every transcript, not the last few by name: one
 	// early session in another project makes the directory shared.
 	many := filepath.Join(alt, "projects", "-x-many")
@@ -2427,6 +2465,55 @@ func TestMemoryDiscoveryAndOwnership(t *testing.T) {
 	}
 	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {
 		t.Errorf("mappings leaked into the shared hub:\n%s", st)
+	}
+}
+
+// TestRepoModeMemoryFromSeveralRepositories: a repository bundle only knows
+// its own repository, but a session that ran in another one still shows
+// that a memory directory is not this repository's alone. Each repository
+// scanning it would otherwise import the other's notes.
+func TestRepoModeMemoryFromSeveralRepositories(t *testing.T) {
+	repo := setupRepo(t)
+	must(t, "", "init")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("CLAUDE_CONFIG_DIR", "")
+	other := t.TempDir()
+	write := func(dir, name, content string) {
+		t.Helper()
+		os.MkdirAll(dir, 0o755)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	transcript := func(dir, name, cwd string) {
+		write(dir, name, `{"type":"user","cwd":"`+cwd+`","sessionId":"`+name+`","message":{"role":"user","content":"hi"}}`+"\n")
+	}
+	note := func(title string) string {
+		return "---\nname: n\ndescription: " + title + "\ntype: project\n---\n\nSomething worth keeping about it.\n"
+	}
+	own := filepath.Join(home, ".claude", "projects", "-own")
+	transcript(own, "a.jsonl", repo)
+	write(filepath.Join(own, "memory"), "project_own.md", note("Releases are cut from the main branch"))
+	mixed := filepath.Join(home, ".claude", "projects", "-mixed")
+	transcript(mixed, "a.jsonl", repo)
+	transcript(mixed, "b.jsonl", other)
+	write(filepath.Join(mixed, "memory"), "project_mixed.md", note("A note that may be about the other repository"))
+
+	out := must(t, "", "extract", "--scan", "claude-memory", "--cmd", "/nonexistent/model")
+	if !strings.Contains(out, "-own/memory") || !strings.Contains(out, "1 imported") {
+		t.Errorf("this repository's own directory:\n%s", out)
+	}
+	if !strings.Contains(out, "-mixed/memory: skipped (sessions that wrote to it ran in this repository and also outside it") {
+		t.Errorf("a directory another repository's session wrote to:\n%s", out)
+	}
+	if got := must(t, "codex", "search", "note other repository", "--no-docs"); strings.Contains(got, "may-be-about-the-other-repository") {
+		t.Errorf("notes from a directory shared with another repository were imported:\n%s", got)
+	}
+	// A mapping made by hand still settles it.
+	must(t, "", "extract", "--map-root", filepath.Join(mixed, "memory")+"=here")
+	if out := must(t, "", "extract", "--scan", "claude-memory", "--cmd", "/nonexistent/model"); !strings.Contains(out, "-mixed/memory") || strings.Contains(out, "-mixed/memory: skipped") {
+		t.Errorf("after mapping by hand:\n%s", out)
 	}
 }
 
@@ -2464,6 +2551,37 @@ func TestAccessStatisticsAreOnlyASignal(t *testing.T) {
 	if e := acc.Entries["aiproxy/conventions/use-pnpm-never-npm"]; e.Delivered != 1 || e.Shown != 0 {
 		t.Errorf("a rule pushed by the hook is delivered, not shown: %+v", e)
 	}
+	// Rules reach agents without hooks too: 'kb rules' (what the pointer
+	// tells every agent to run) and the MCP server's instructions.
+	delivered := func(id string) int {
+		t.Helper()
+		data, _ := os.ReadFile(filepath.Join(os.Getenv("KB_HOME"), ".kb", "access.json"))
+		var a struct {
+			Entries map[string]struct{ Delivered int } `json:"entries"`
+		}
+		json.Unmarshal(data, &a)
+		return a.Entries[id].Delivered
+	}
+	const pnpmRule = "aiproxy/conventions/use-pnpm-never-npm"
+	must(t, "codex", "rules", "-q")
+	if n := delivered(pnpmRule); n != 2 {
+		t.Errorf("'kb rules' hands rules to the agent that runs it: delivered %d, want 2", n)
+	}
+	if out, _, code := kbRun(t, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"cursor"}}}`+"\n", "mcp"); code != 0 || !strings.Contains(out, "Use pnpm, never npm") {
+		t.Fatalf("mcp initialize: exit %d\n%s", code, out)
+	}
+	if n := delivered(pnpmRule); n != 3 {
+		t.Errorf("the MCP instructions hand rules to the client: delivered %d, want 3", n)
+	}
+	must(t, "claude-code", "add", "rule", "Handlers validate their input", "-d", "with the shared schemas", "-e", "user said so", "--when", "src/api/**")
+	must(t, "codex", "rules", "-q", "-f", "src/api/users.ts")
+	if n := delivered("aiproxy/conventions/handlers-validate-their-input"); n != 1 {
+		t.Errorf("'kb rules -f' hands over the rules for that file: delivered %d, want 1", n)
+	}
+	must(t, "codex", "rules", "-q", "--all") // every project at once is an inspection
+	if n := delivered(pnpmRule); n != 3 {
+		t.Errorf("listing every project's rules is not a delivery: delivered %d, want 3", n)
+	}
 	out := must(t, "codex", "status", "--access")
 	for _, want := range []string{"a maintenance signal for this machine only", "never retrieved on this machine", learning + ": last ", "listed 2, shown 1, delivered 0"} {
 		if !strings.Contains(out, want) {
@@ -2492,7 +2610,7 @@ func TestAccessStatisticsAreOnlyASignal(t *testing.T) {
 		t.Errorf("an entry changed because it was retrieved:\n%s", after)
 	}
 	os.Chdir(base)
-	if all := must(t, "codex", "status", "--all"); !strings.Contains(all, "knowledge: 6 active") || !strings.Contains(all, "deprecated 0") {
+	if all := must(t, "codex", "status", "--all"); !strings.Contains(all, "knowledge: 7 active") || !strings.Contains(all, "deprecated 0") {
 		t.Errorf("access statistics must not retire anything:\n%s", all)
 	}
 	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {

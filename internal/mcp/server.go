@@ -102,6 +102,8 @@ func (s *Server) handle(req request) {
 		// for this field (the fixed guidance is always kept).
 		d, _ := s.Store.MCPInstructionsDelivery(baseInstructions)
 		instructions := d.Text
+		// The client receives these rules: count them as delivered.
+		s.Store.NoteAccess(kb.AccessDelivered, d.IDs)
 		reply(map[string]any{
 			"protocolVersion": version,
 			"capabilities":    map[string]any{"tools": map[string]any{"listChanged": false}},

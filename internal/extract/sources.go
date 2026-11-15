@@ -299,10 +299,14 @@ func sortedStrings[V any](m map[string]V) []string {
 // to the directory's name, when that is one project.
 func claudeMemoryOwner(s *kb.Store, projectDir string) (project string, level int, why string) {
 	const none = "no project could be established for this directory: run kb inside its repository once, or map it by hand with --map-root"
+	const repo, elsewhere = "\x00repo", "\x00elsewhere"
+	mapIt := ": map it by hand with --map-root " + displayPath(filepath.Join(projectDir, "memory")) + "=<project>"
 	projects := map[string]bool{}
 	byCWD := map[string]string{}
 	// Every transcript counts: the memory still there may come from any
-	// session, and a file's name says nothing about which.
+	// session, and a file's name says nothing about which. A session that
+	// ran somewhere this store does not know (another repository) counts
+	// too: it is evidence that the directory is not one project's alone.
 	ts, _ := filepath.Glob(filepath.Join(projectDir, "*.jsonl"))
 	sort.Strings(ts)
 	for _, t := range ts {
@@ -312,25 +316,29 @@ func claudeMemoryOwner(s *kb.Store, projectDir string) (project string, level in
 		}
 		p, known := byCWD[tr.CWD]
 		if !known {
+			p = elsewhere
 			if s.Hub {
-				p = s.ForDir(tr.CWD).Project
+				if id := s.ForDir(tr.CWD).Project; id != "" {
+					p = id
+				}
 			} else {
 				root := s.GitTop()
 				if root == "" {
 					root = s.CodeRoot
 				}
 				if within(root, tr.CWD) {
-					p = "\x00repo"
+					p = repo
 				}
 			}
 			byCWD[tr.CWD] = p
 		}
-		if p != "" {
-			projects[p] = true
-		}
+		projects[p] = true
 	}
+	outside := projects[elsewhere]
+	delete(projects, elsewhere)
+	byTranscripts := len(projects) > 0
 	name := filepath.Base(projectDir)
-	if len(projects) == 0 {
+	if !byTranscripts {
 		if s.Hub {
 			for id := range s.ProjectFiles() {
 				for _, c := range s.Checkouts(id) {
@@ -340,25 +348,38 @@ func claudeMemoryOwner(s *kb.Store, projectDir string) (project string, level in
 				}
 			}
 		} else if s.CodeRoot != "" && claudeProjectDirName(s.CodeRoot) == name {
-			projects["\x00repo"] = true
+			projects[repo] = true
 		}
-		if len(projects) == 1 {
-			for p := range projects {
-				return strings.TrimPrefix(p, "\x00repo"), ownerOne, "its name is the encoded path of a registered checkout"
-			}
-		}
-		if len(projects) > 1 {
-			return "", ownerShared, "its name matches checkouts of several projects (" + strings.Join(sortedStrings(projects), ", ") + "): map it by hand with --map-root"
-		}
-		return "", ownerUnknown, none
 	}
-	if len(projects) > 1 {
-		return "", ownerShared, "its transcripts ran in several projects (" + strings.Join(sortedStrings(projects), ", ") + "), so whose memory it holds is not known: map it by hand with --map-root " + displayPath(filepath.Join(projectDir, "memory")) + "=<project>"
+	var names []string
+	for p := range projects {
+		if p == repo {
+			p = "this repository"
+		}
+		names = append(names, p)
+	}
+	sort.Strings(names)
+	switch {
+	case len(projects) == 0:
+		return "", ownerUnknown, none
+	case len(projects) > 1 && byTranscripts:
+		return "", ownerShared, "its transcripts ran in several projects (" + strings.Join(names, ", ") + "), so whose memory it holds is not known" + mapIt
+	case len(projects) > 1:
+		return "", ownerShared, "its name matches checkouts of several projects (" + strings.Join(names, ", ") + ")" + mapIt
+	case outside:
+		where := "outside any project known here"
+		if !s.Hub {
+			where = "outside it"
+		}
+		return "", ownerShared, "sessions that wrote to it ran in " + names[0] + " and also " + where + ", so whose memory it holds is not known" + mapIt
 	}
 	for p := range projects {
-		return strings.TrimPrefix(p, "\x00repo"), ownerOne, "its transcripts ran in this project"
+		project = strings.TrimPrefix(p, repo)
 	}
-	return "", ownerUnknown, none
+	if byTranscripts {
+		return project, ownerOne, "its transcripts ran in this project"
+	}
+	return project, ownerOne, "its name is the encoded path of a registered checkout"
 }
 
 // SourcesReport describes what a scan would look at: memory directories and

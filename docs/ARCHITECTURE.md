@@ -603,7 +603,7 @@ project is established, never guessed from a name alone:
 | Directory | Owner |
 |---|---|
 | default `<config>/projects/<dir>/memory` | the one project its transcripts ran in (every transcript is read, not a sample); failing transcripts, the one project with a registered checkout whose encoded path is `<dir>` |
-| the same, with transcripts from several projects | none: needs a mapping |
+| the same, with transcripts from several projects, or from one project and from somewhere this store does not know (another repository, in a repo bundle) | none: needs a mapping |
 | `autoMemoryDirectory` in a repository's `.claude/settings*.json` | that repository's project |
 | `autoMemoryDirectory` in user settings, or in a file given with `--settings` | none: shared by every project that runs with it |
 | subagent memory under a checkout (`.claude/agent-memory[-local]/<agent>/`) | that checkout's project |
@@ -614,6 +614,13 @@ is collected first and weighed together: a mapping made by hand settles it;
 otherwise anything that makes it shared keeps it out, however firmly
 something else names one project (a repository's directory that user
 settings also name is shared); otherwise the projects named must agree.
+
+**An owner change is not applied silently.** Sources are known by path. If
+files of a directory were imported into one project and the directory now
+belongs to another (a new mapping, or different evidence), the scan skips it
+and says so. `--accept-conflicts` settles it: the files are imported anew
+for the new owner, and the earlier entries stay where they are, listed, for
+someone to retire. Mapping it back is the other way out.
 
 `kb extract --map-root <dir>=<project>` records an owner for a shared
 directory in local state (`.kb/extract/roots.json`); `<dir>=` removes it.
@@ -630,7 +637,9 @@ age of the oldest transcript on disk, which bounds any backfill. No fixed
 
 **Access statistics.** `.kb/access.json` (local) counts, per entry, how
 often it was *listed* (a search result line), *shown* (content returned by
-`kb show` or `kb_show`) and *delivered* (a rule pushed by a hook). They are
+`kb show` or `kb_show`) and *delivered* (a rule handed to an agent: by a
+hook, by `kb rules` or `kb rules -f`, or in the MCP server's instructions;
+`kb rules --all` is an inspection and does not count). They are
 kept apart because a result line is not evidence that content reached a
 model. `kb status` reports how many entries in scope were never retrieved
 here, and `kb status --access` lists them and the least recently retrieved.
