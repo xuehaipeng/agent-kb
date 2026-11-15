@@ -82,6 +82,7 @@ Set up and maintain:
   kb init [--dir knowledge] [--install claude,codex,git-hooks]   single-repo bundle (repo mode)
   kb install <claude|codex|cursor|antigravity|hermes|git-hooks|all>... [--global|--repo]
            claude: [--capture full|manual] [--native-rules on|off] [--rule-refresh on|off] [--file-context off|post|pre]
+                   [--summary-capture on|off] [--summary-steering on|off]
            (choices are remembered on this machine: a later bare install keeps them)
   kb bench file-context --cases <file.json>   measure what --file-context would inject for judged cases
                               ([{"file":"path","relevant":["id",...]}]): precision, recall, context cost, latency
@@ -288,6 +289,9 @@ func (a *App) cmdInstall(args []string) error {
 	f.str(&capture, "", "claude: full (capture hooks) or manual (rule delivery only); remembered on this machine", "capture")
 	f.str(&nativeRules, "", "claude: on|off, write global rules to a rules file Claude Code loads itself", "native-rules")
 	f.str(&ruleRefresh, "", "claude: on|off, re-deliver rules that changed during a session (runs kb before every tool call)", "rule-refresh")
+	var summaryCapture, summarySteering string
+	f.str(&summaryCapture, "", "claude: on|off, capture from compaction summaries instead of the transcript range before them (needs Claude Code 2.1.323+)", "summary-capture")
+	f.str(&summarySteering, "", "claude: on|off, with summary capture: ask Claude Code to keep durable learnings in its summaries (changes them)", "summary-steering")
 	var fileContext string
 	f.str(&fileContext, "", "claude: off|post|pre, hand an agent what is recorded about a file it reads or edits (off by default)", "file-context")
 	f.boolean(&global, "install user-wide (default with a hub)", "global")
@@ -305,6 +309,7 @@ func (a *App) cmdInstall(args []string) error {
 	opts["skills-dir"] = skills
 	opts["capture"], opts["native-rules"], opts["rule-refresh"] = capture, nativeRules, ruleRefresh
 	opts["file-context"] = fileContext
+	opts["summary-capture"], opts["summary-steering"] = summaryCapture, summarySteering
 	if global {
 		opts["scope"] = "global"
 	}
@@ -868,6 +873,12 @@ func (a *App) cmdExtract(args []string) error {
 	f.boolean(&acceptConflicts, "memory scans: after merging a conflict by hand, take the entries as they are now", "accept-conflicts")
 	var scanProjects []string
 	f.list(&scanProjects, true, "memory scans: only these projects (hub)", "p", "project")
+	var summaryFile, covers string
+	var upto, compactionN int
+	f.str(&summaryFile, "", "extract from a stored compaction summary (run by the PostCompact hook)", "summary")
+	f.str(&covers, "", "with --summary: the transcript the summary stands for", "covers")
+	f.integer(&upto, 0, "with --summary: how far the transcript went when the compaction began", "upto")
+	f.integer(&compactionN, 0, "with --summary: which compaction of the session", "compaction")
 	var mapRoots, settingsFiles []string
 	var sources bool
 	f.list(&mapRoots, false, "memory scans: <directory>=<project>, record whose a shared memory directory is (local)", "map-root")
@@ -920,6 +931,31 @@ func (a *App) cmdExtract(args []string) error {
 			return err
 		}
 		a.out("%s\n", strings.Join(report, "\n"))
+		return nil
+	}
+	if summaryFile != "" {
+		if covers == "" || upto <= 0 || o.SessionID == "" {
+			return errors.New("usage: kb extract --summary <file> --session <id> --covers <transcript> --upto <bytes> [--compaction n]")
+		}
+		actor, err := a.actor()
+		if err != nil {
+			actor = kb.Actor{Producer: "claude-code"}
+		}
+		res, err := extract.RunSummary(s, extract.SummaryOptions{
+			QueuedSummary: extract.QueuedSummary{File: summaryFile, Session: o.SessionID, Transcript: covers, Upto: int64(upto), N: compactionN},
+			Actor:         actor, Command: command, DryRun: o.DryRun, Out: a.Stderr,
+		})
+		if err != nil {
+			return fmt.Errorf("%w (the transcript keeps its position: its own extraction covers this range)", err)
+		}
+		switch {
+		case o.DryRun:
+			a.out("%s", res.Prompt)
+		case res.Skipped != "":
+			a.out("skipped: %s\n", res.Skipped)
+		default:
+			a.out("added %d claim(s) from compaction summary %d, %d duplicate(s), %d already in the repo's docs; the summary stands for the transcript up to byte %d\n", len(res.Added), compactionN, res.Dupes, res.Documented, upto)
+		}
 		return nil
 	}
 	if o.Path == "" {

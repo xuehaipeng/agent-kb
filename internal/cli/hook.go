@@ -26,8 +26,9 @@ type hookInput struct {
 	AgentID   string `json:"agent_id"`
 	AgentType string `json:"agent_type"`
 	// Tool events.
-	ToolName  string `json:"tool_name"`
-	ToolInput struct {
+	CompactSummary string `json:"compact_summary"` // PostCompact
+	ToolName       string `json:"tool_name"`
+	ToolInput      struct {
 		FilePath string `json:"file_path"`
 	} `json:"tool_input"`
 }
@@ -124,7 +125,45 @@ func (a *App) cmdHook(args []string) int {
 			a.hookContext("PreToolUse", "kb: the rules that apply here changed since you last received them. They are now:\n"+d.Text)
 			s.RecordDelivery(in.SessionID, orMain(in.AgentID), in.AgentType, "PreToolUse:refresh", d, false, false)
 		}
+	case "PostCompact":
+		// Opt-in: the summary of a main session's compaction is extracted,
+		// and stands for the part of the transcript before it. A subagent's
+		// compaction is not captured: its summary belongs to another
+		// conversation than the session's transcript.
+		if capture, _ := s.SummaryCapture(); !capture {
+			return 0
+		}
+		if in.AgentID != "" {
+			logLine(s, "hook: compaction summary of subagent "+in.AgentID+" not captured (main sessions only)")
+			return 0
+		}
+		q, skip := extract.QueueSummary(s, in.SessionID, in.CompactSummary)
+		if skip != "" {
+			logLine(s, "hook: compaction summary of "+in.SessionID+" not captured: "+skip+" (the transcript is read at session end instead)")
+			return 0
+		}
+		if os.Getenv(extract.GuardEnv) != "" {
+			return 0
+		}
+		if err := a.spawn(s, in, a.summaryArgs(s, q), "summary"); err != nil {
+			logLine(s, "hook: "+err.Error())
+		}
 	case "PreCompact", "SessionEnd", "Stop":
+		// With summary capture on, a main session's compaction is captured
+		// from its summary, after the fact. Here only the point the
+		// compaction begins at is recorded, so the same range is not also
+		// extracted from the transcript. Steering is printed only when it
+		// was chosen: PreCompact stdout becomes instructions for the summary.
+		if capture, steering := s.SummaryCapture(); capture && in.HookEventName == "PreCompact" && in.AgentID == "" && in.TranscriptPath != "" {
+			if err := extract.NoteCompaction(s, in.SessionID, in.TranscriptPath); err != nil {
+				logLine(s, "hook: "+err.Error())
+			} else {
+				if steering {
+					fmt.Fprintln(a.Stdout, extract.SummarySteering)
+				}
+				return 0
+			}
+		}
 		if os.Getenv(extract.GuardEnv) != "" || in.TranscriptPath == "" {
 			return 0
 		}
@@ -158,6 +197,19 @@ func (a *App) spawnExtract(s *kb.Store, in hookInput) error {
 		}
 	}
 	return a.spawn(s, in, args, "extract")
+}
+
+// summaryArgs is the detached 'kb extract --summary' run for a queued summary.
+func (a *App) summaryArgs(s *kb.Store, q extract.QueuedSummary) []string {
+	actor := a.as
+	if actor == "" {
+		actor = os.Getenv("KB_ACTOR")
+	}
+	if actor == "" {
+		actor = "claude-code"
+	}
+	return []string{"--root", s.Dir, "--as", actor, "extract", "--summary", q.File, "--session", q.Session, "--covers", q.Transcript,
+		"--upto", fmt.Sprint(q.Upto), "--compaction", fmt.Sprint(q.N)}
 }
 
 // spawn starts a detached kb subprocess, logging to .kb/extract.log. It runs

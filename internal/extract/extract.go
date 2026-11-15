@@ -282,6 +282,12 @@ type Options struct {
 	Final     bool     // advance the offset even if too little content (session end)
 	DryRun    bool     // print the prompt instead of running the model
 	Out       io.Writer
+	// Resource overrides how the source is named on the entries (default
+	// "<source> session <id>"); NoMinimum extracts however short the input
+	// is. Both are for inputs that are already distilled, such as a
+	// compaction summary.
+	Resource  string
+	NoMinimum bool
 }
 
 // Result summarises an extraction run.
@@ -294,10 +300,14 @@ type Result struct {
 }
 
 type state struct {
-	Path    string `json:"path"`
-	Offset  int64  `json:"offset,omitempty"` // transcripts: bytes consumed
-	Hash    string `json:"hash,omitempty"`   // memory/rule files: content imported
-	Updated string `json:"updated"`
+	Path   string `json:"path"`
+	Offset int64  `json:"offset,omitempty"` // transcripts: bytes consumed
+	Hash   string `json:"hash,omitempty"`   // memory/rule files: content imported
+	// Covered lists ranges of a transcript taken over by another
+	// representation of the same conversation (a compaction summary), so
+	// the raw range is not sent to the model as well.
+	Covered []coveredRange `json:"covered,omitempty"`
+	Updated string         `json:"updated"`
 }
 
 func statePath(s *kb.Store, path string) string {
@@ -318,8 +328,22 @@ func saveState(s *kb.Store, path string, off int64) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	data, _ := json.Marshal(state{Path: path, Offset: off, Updated: time.Now().UTC().Format(time.RFC3339)})
+	st := loadState(s, path) // keep what else is recorded about the source
+	st.Path, st.Offset, st.Updated = path, off, time.Now().UTC().Format(time.RFC3339)
+	data, _ := json.Marshal(st)
 	return os.WriteFile(p, data, 0o644)
+}
+
+func sourceLock(abs string) string {
+	h := sha1.Sum([]byte(abs))
+	return "extract-" + hex.EncodeToString(h[:8]) + ".lock"
+}
+
+func sourceResource(o Options) string {
+	if o.Resource != "" {
+		return o.Resource
+	}
+	return fmt.Sprintf("%s session %s", o.Source, o.SessionID)
 }
 
 // Run extracts claims from the new part of a transcript and adds them.
@@ -331,6 +355,12 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 	abs, err := filepath.Abs(o.Path)
 	if err != nil {
 		return nil, err
+	}
+	// One extraction at a time per source: a run that takes over part of a
+	// transcript (from a compaction summary) and the run that reads the
+	// transcript itself must not both send the same range to the model.
+	if unlock, lerr := s.LockLocal(sourceLock(abs)); lerr == nil {
+		defer unlock()
 	}
 	st := loadState(s, abs)
 	var tr *Transcript
@@ -353,7 +383,7 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 		o.SessionID = tr.SessionID
 	}
 	condensed := Condense(tr.Messages, 2500, 60000)
-	if len(condensed) < s.Cfg.Extract.MinChars {
+	if len(condensed) < s.Cfg.Extract.MinChars && !o.NoMinimum {
 		res.Skipped = fmt.Sprintf("only %d chars of new transcript (min %d)", len(condensed), s.Cfg.Extract.MinChars)
 		if o.Final && !o.DryRun {
 			return res, saveState(s, abs, tr.NewOffset)
@@ -424,7 +454,7 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 			Type: c.Type, Title: c.Title, Description: c.Description, Body: body,
 			Tags: c.Tags, Resources: c.Resources, Actor: o.Actor,
 			Sources: []okf.Source{{
-				ID: srcID, Resource: fmt.Sprintf("%s session %s", o.Source, o.SessionID),
+				ID: srcID, Resource: sourceResource(o),
 				Author: o.Actor.String(), LastModified: time.Now().UTC().Format(time.RFC3339),
 			}},
 		})
