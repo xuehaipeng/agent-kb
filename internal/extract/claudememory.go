@@ -88,8 +88,11 @@ type ledgerEntry struct {
 	Missing  string   `json:"missing_since,omitempty"`
 	// MissingChecks is how many verification events the entry had when its
 	// source was first found deleted; a later confirmation settles it.
-	MissingChecks int    `json:"missing_checks,omitempty"`
-	Updated       string `json:"updated"`
+	MissingChecks int `json:"missing_checks,omitempty"`
+	// MissingRevision is the entry's revision at that moment; only a later
+	// rewrite settles it (the entry may have been edited before).
+	MissingRevision int    `json:"missing_revision,omitempty"`
+	Updated         string `json:"updated"`
 }
 
 func ledgerPath(s *kb.Store) string { return s.LocalPath("extract", "import-ledger.json") }
@@ -419,7 +422,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		delete(gone, from)
 		delete(l.Sources, from)
 		e.Aliases = append(e.Aliases, from)
-		e.Path, e.Missing, e.MissingChecks = to, "", 0
+		e.Path, e.Missing, e.MissingChecks, e.MissingRevision = to, "", 0, 0
 		l.Sources[to] = e
 	}
 	free := func(paths []string) []string {
@@ -572,7 +575,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 
 		e := l.Sources[f.path]
 		if e != nil && e.Missing != "" && !o.DryRun {
-			e.Missing, e.MissingChecks = "", 0 // the file is back
+			e.Missing, e.MissingChecks, e.MissingRevision = "", 0, 0 // the file is back
 		}
 		// A conflict stands until someone settles it: it is reported on
 		// every scan, not once. --accept-conflicts records the entry as it
@@ -759,7 +762,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		}
 		// Someone looked at the entry after the deletion was reported: it
 		// now stands on that check (or rewrite), not on the vanished file.
-		if e.Missing != "" && reviewedSince(n, e.MissingChecks, e.Revision) {
+		if e.Missing != "" && reviewedSince(n, e.MissingChecks, e.MissingRevision) {
 			if !o.DryRun {
 				delete(l.Sources, key)
 			}
@@ -767,7 +770,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		}
 		r.missing++
 		if e.Missing == "" && !o.DryRun {
-			e.Missing, e.MissingChecks = now.Format(time.RFC3339), len(n.Meta().Verified)
+			e.Missing, e.MissingChecks, e.MissingRevision = now.Format(time.RFC3339), len(n.Meta().Verified), n.Meta().Rev()
 		}
 		r.details = append(r.details, fmt.Sprintf("source deleted: %s no longer backs %s; the entry is kept. If it still holds: kb verify %s --confirm -e \"...\"; if not: kb deprecate %s -m \"...\"", filepath.Base(key), e.Entry, e.Entry, e.Entry))
 	}
@@ -786,12 +789,13 @@ func entryAlive(s *kb.Store, id string) bool {
 
 // reviewedSince reports whether an entry was confirmed or rewritten after
 // its source was found deleted: a confirmation of its current revision
-// recorded since (beyond the checks it had then), or a revision newer than
-// the one the import last wrote. Events are counted, not compared by time:
-// an import and the scan that finds its source gone can share a timestamp.
-func reviewedSince(n *kb.Node, checksThen, importedRev int) bool {
+// beyond the checks it had then, or a revision newer than the one it had
+// then. Both baselines are taken at detection. Events are counted, not
+// compared by time (an import and the scan that finds its source gone can
+// share a timestamp), and an edit made before the deletion does not count.
+func reviewedSince(n *kb.Node, checksThen, revisionThen int) bool {
 	m := n.Meta()
-	if importedRev > 0 && m.Rev() > importedRev {
+	if revisionThen > 0 && m.Rev() > revisionThen {
 		return true
 	}
 	for i, e := range m.Verified {
