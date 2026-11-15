@@ -1418,10 +1418,16 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 	}
 
 	// 3. A deleted source keeps being reported until its entry is checked
-	// again; the check the report recommends settles it.
+	// again; the check the report recommends settles it. An edit made by
+	// hand before the deletion does not settle anything.
+	os.Chdir(repo)
+	must(t, "codex", "update", runbookID, "-d", "Where the incident runbook lives", "-m", "clearer wording")
 	os.Remove(filepath.Join(mem, "reference_runbook.md"))
 	if out := scan(); !strings.Contains(out, "2 sources deleted") || !strings.Contains(out, "no longer backs "+runbookID) {
 		t.Fatalf("second deletion:\n%s", out)
+	}
+	if out := scan(); !strings.Contains(out, "2 sources deleted") || !strings.Contains(out, "no longer backs "+runbookID) {
+		t.Fatalf("a warning must not clear itself because the entry was edited before the deletion:\n%s", out)
 	}
 	os.Chdir(repo)
 	must(t, "codex", "verify", runbookID, "--confirm", "-e", "the pinned page is still there")
