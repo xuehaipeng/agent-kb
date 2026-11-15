@@ -671,8 +671,14 @@ hook-side equivalent, without writing anything into a repository.
   summary may have dropped the headers. Another agent of the same session is
   independent in both directions.
 - **Bounded.** One injection is at most 2,000 units, whole lines only, with a
-  count of what was left out; the next touch brings those. The lookup runs
-  synchronously under a 1.5 s limit, after which the hook says nothing.
+  count of what was left out; the next touch brings those. The lookup takes
+  every entry anchored to the file and removes what was already given
+  before the budget is applied, so repeated touches reach all of them. It
+  runs synchronously under a 1.5 s limit, after which the hook says nothing.
+- **Recorded only once handed over.** The timed lookup records nothing.
+  What was given is recorded after it has been printed, so a lookup dropped
+  for taking too long leaves no trace and the next touch tries again. The
+  price is that two hooks racing on the same file can both give an entry.
   Headers carry the usual badges, so stale and unknown-freshness entries are
   labelled. Scope is the session's project plus applicable global entries.
 - **Not covered:** files reached through shell commands (`cat`, `sed`), other

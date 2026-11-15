@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/xuehaipeng/agent-kb/internal/extract"
@@ -216,16 +217,31 @@ func (a *App) hookFileContext(s *kb.Store, in hookInput) {
 	default:
 		return // not a file access this hook covers (a shell command, another tool)
 	}
+	// Only the lookup is timed, and it records nothing. What was given is
+	// recorded after it has been printed: a lookup that is dropped for
+	// taking too long leaves no trace, so the next touch of the file tries
+	// again instead of treating those entries as already delivered.
 	done := make(chan kb.FileContext, 1)
-	go func() { done <- s.FileContextFor(in.SessionID, in.AgentID, in.AgentType, in.ToolInput.FilePath, pre) }()
+	go func() { done <- s.PlanFileContext(in.SessionID, in.AgentID, in.ToolInput.FilePath, pre) }()
 	select {
 	case fc := <-done:
 		if fc.Text != "" {
 			a.hookContext(in.HookEventName, fc.Text)
+			s.RecordFileContext(in.SessionID, in.AgentID, in.AgentType, fc)
 		}
-	case <-time.After(fileContextTimeout):
+	case <-fileContextDeadline():
 		logLine(s, "hook: file context lookup took longer than "+fileContextTimeout.String()+" and was dropped")
 	}
+}
+
+// fileContextDeadline is when a lookup is given up. KB_FILE_CONTEXT_TIMEOUT_MS
+// overrides it (tests, slow disks).
+func fileContextDeadline() <-chan time.Time {
+	d := fileContextTimeout
+	if v, err := strconv.Atoi(os.Getenv("KB_FILE_CONTEXT_TIMEOUT_MS")); err == nil && v >= 0 {
+		d = time.Duration(v) * time.Millisecond
+	}
+	return time.After(d)
 }
 
 func orMain(agent string) string {

@@ -2786,6 +2786,44 @@ func TestFileContextHook(t *testing.T) {
 	if next := read("s7", ""); !strings.Contains(next, "Package pitfall number") || strings.Contains(next, learning+" [") {
 		t.Errorf("the next touch should bring entries not yet given:\n%s", next)
 	}
+	// Repeated touches drain everything anchored to the file: the lookup
+	// is not cut to a first few that have all been given already.
+	got := map[string]bool{}
+	first := ""
+	for i := 0; i < 12; i++ {
+		out := read("s9", "")
+		if i == 0 {
+			first = out
+		}
+		if out == "" {
+			break
+		}
+		for _, l := range strings.Split(out, "\n") {
+			if j := strings.Index(l, "Package pitfall number "); j >= 0 {
+				n := l[j+len("Package pitfall number "):][:2]
+				if got[n] {
+					t.Errorf("pitfall %s was given twice", n)
+				}
+				got[n] = true
+			}
+		}
+	}
+	if len(got) != 30 {
+		t.Errorf("repeated touches gave %d of the 30 anchored entries", len(got))
+	}
+	if !strings.Contains(first, "(+") || read("s9", "") != "" {
+		t.Errorf("the first touch says how many are still to come, and a drained file adds nothing:\n%s", first)
+	}
+	// A lookup that is dropped for taking too long was not delivered: it
+	// leaves no record, and the next touch gives those entries.
+	t.Setenv("KB_FILE_CONTEXT_TIMEOUT_MS", "0")
+	if out := read("s10", ""); out != "" {
+		t.Fatalf("a lookup past its deadline must print nothing:\n%s", out)
+	}
+	t.Setenv("KB_FILE_CONTEXT_TIMEOUT_MS", "")
+	if out := read("s10", ""); !strings.Contains(out, "Package pitfall number") && !strings.Contains(out, learning) {
+		t.Errorf("entries of a dropped lookup were recorded as delivered and never arrived:\n%s", out)
+	}
 
 	if d := must(t, "codex", "rules", "--delivery"); !strings.Contains(d, "file context pre") {
 		t.Errorf("diagnostics:\n%s", d)

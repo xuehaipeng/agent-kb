@@ -28,8 +28,10 @@ type FileContext struct {
 	File    string
 	Text    string   // "" when there is nothing (new) to say
 	IDs     []string // entries and rules named in Text
-	Omitted int      // matches left out to fit the budget
+	Omitted int      // matches not yet given that were left out to fit the budget
 	Skipped string   // why nothing was looked up
+
+	revs map[string]int // revision of each entry in IDs, for the record
 }
 
 type fileMatch struct {
@@ -49,7 +51,11 @@ func (s *Store) fileMatches(rel string) ([]fileMatch, error) {
 	for _, n := range rules {
 		out = append(out, fileMatch{n.ID, n.Meta().Rev(), fmt.Sprintf("- rule for this file: %s [%s]", ruleText(n), n.ID)})
 	}
-	hits, err := s.Search(SearchQuery{Files: []string{rel}, NoDocs: true, Limit: 12})
+	// Every entry anchored to the file, not the first few: what was given
+	// before is taken out afterwards, so a cut here would hide the rest for
+	// good once the first few have been delivered. The budget, applied to
+	// what is still to give, bounds the injection.
+	hits, err := s.Search(SearchQuery{Files: []string{rel}, NoDocs: true, Limit: 1 << 20})
 	if err != nil {
 		return nil, err
 	}
@@ -112,13 +118,19 @@ func renderFileContext(rel string, pre bool, ms []fileMatch) (text string, ids [
 	return head + body, ids, omitted
 }
 
-// FileContextFor plans the injection for one file access by one agent of a
-// session, and records it. Each entry is given to an agent once per
-// revision and per compaction of that agent: a second touch of the same
-// file adds nothing, a rewritten entry is given again, and after the agent
-// compacts it starts over, since its summary may have dropped the headers.
-// Another agent of the same session is not affected either way.
-func (s *Store) FileContextFor(session, agent, agentType, file string, pre bool) FileContext {
+// PlanFileContext plans the injection for one file access by one agent of
+// a session. Each entry is given to an agent once per revision and per
+// compaction of that agent: a second touch of the same file adds nothing
+// (or the next entries that did not fit before), a rewritten entry is
+// given again, and after the agent compacts it starts over, since its
+// summary may have dropped the headers. Another agent of the same session
+// is not affected either way.
+//
+// Planning records nothing. The caller hands the text over and then calls
+// RecordFileContext: an injection that was planned but never reached the
+// agent (the hook ran out of time) must not count as given, or the agent
+// would never see those entries.
+func (s *Store) PlanFileContext(session, agent, file string, pre bool) FileContext {
 	rel, skip := s.relForContext(file)
 	fc := FileContext{File: rel, Skipped: skip}
 	if skip != "" {
@@ -131,44 +143,64 @@ func (s *Store) FileContextFor(session, agent, agentType, file string, pre bool)
 	if err != nil || len(ms) == 0 {
 		return fc
 	}
-	unlock, err := s.lockFile("sessions.lock")
-	if err != nil {
-		return fc
-	}
-	defer unlock()
-	st := s.LoadDelivery(session)
-	a := st.Agents[agent]
-	if a == nil {
-		a = &AgentDelivery{Type: agentType}
-		st.Agents[agent] = a
+	given := map[string]int{}
+	if a := s.LoadDelivery(session).Agents[agent]; a != nil {
+		given = a.FileContext
 	}
 	var fresh []fileMatch
 	for _, m := range ms {
-		if rev, seen := a.FileContext[m.id]; !seen || rev != m.rev {
+		if rev, seen := given[m.id]; !seen || rev != m.rev {
 			fresh = append(fresh, m)
 		}
 	}
 	fc.Text, fc.IDs, fc.Omitted = renderFileContext(rel, pre, fresh)
-	if len(fc.IDs) == 0 || session == "" {
-		return fc
-	}
-	if a.FileContext == nil {
-		a.FileContext = map[string]int{}
-	}
-	given := map[string]bool{}
+	in := map[string]bool{}
 	for _, id := range fc.IDs {
-		given[id] = true
+		in[id] = true
 	}
+	fc.revs = map[string]int{}
 	for _, m := range fresh {
-		if given[m.id] {
-			a.FileContext[m.id] = m.rev
+		if in[m.id] {
+			fc.revs[m.id] = m.rev
 		}
 	}
-	st.Project = s.Project
-	if data, err := json.MarshalIndent(st, "", "  "); err == nil {
-		_, _ = WriteFileIfChanged(s.deliveryPath(session), data)
+	return fc
+}
+
+// RecordFileContext notes that a planned injection was handed to the agent.
+func (s *Store) RecordFileContext(session, agent, agentType string, fc FileContext) {
+	if len(fc.IDs) == 0 || session == "" {
+		return
+	}
+	if agent == "" {
+		agent = "main"
+	}
+	if unlock, err := s.lockFile("sessions.lock"); err == nil {
+		st := s.LoadDelivery(session)
+		a := st.Agents[agent]
+		if a == nil {
+			a = &AgentDelivery{Type: agentType}
+			st.Agents[agent] = a
+		}
+		if a.FileContext == nil {
+			a.FileContext = map[string]int{}
+		}
+		for id, rev := range fc.revs {
+			a.FileContext[id] = rev
+		}
+		st.Project = s.Project
+		if data, err := json.MarshalIndent(st, "", "  "); err == nil {
+			_, _ = WriteFileIfChanged(s.deliveryPath(session), data)
+		}
+		unlock()
 	}
 	s.NoteAccess(AccessListed, fc.IDs)
+}
+
+// FileContextFor plans an injection and records it as given.
+func (s *Store) FileContextFor(session, agent, agentType, file string, pre bool) FileContext {
+	fc := s.PlanFileContext(session, agent, file, pre)
+	s.RecordFileContext(session, agent, agentType, fc)
 	return fc
 }
 
