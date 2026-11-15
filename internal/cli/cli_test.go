@@ -2894,6 +2894,34 @@ func TestFileContextHook(t *testing.T) {
 	if bench := must(t, "codex", "bench", "file-context", "--cases", cases); !strings.Contains(bench, "relevant 1 of 1") || !strings.Contains(bench, "recall 1.00 (1 of 1 judged relevant were injected)") {
 		t.Errorf("the benchmark counted one entry twice:\n%s", bench)
 	}
+	// A session started in a subdirectory: the touched file is looked up
+	// by its place in the repository, not taken again as relative to the
+	// working directory (where pkg/pkg/x.go happens to exist).
+	must(t, "claude-code", "add", "learning", "Exact anchor for the top-level x.go only", "-d", "It is about pkg/x.go and no other file.", "-r", "pkg/x.go", "-e", "read the code")
+	os.MkdirAll(filepath.Join(aiproxy, "pkg", "pkg"), 0o755)
+	os.WriteFile(filepath.Join(aiproxy, "pkg", "pkg", "x.go"), []byte("package pkg\n"), 0o644)
+	sub := ""
+	for i := 0; i < 15 && !strings.Contains(sub, "Exact anchor"); i++ {
+		out := tool(filepath.Join(aiproxy, "pkg"), "PostToolUse", "Read", file, "s13", "")
+		if out == "" {
+			break
+		}
+		sub += out
+	}
+	if !strings.Contains(sub, "kb: recorded about pkg/x.go") || !strings.Contains(sub, "Exact anchor for the top-level x.go only") {
+		t.Errorf("from a subdirectory, the touched file's own entries must be found:\n%s", sub)
+	}
+	if out := tool(filepath.Join(aiproxy, "pkg"), "PostToolUse", "Read", filepath.Join(aiproxy, "pkg", "pkg", "x.go"), "s14", ""); strings.Contains(out, "Exact anchor") {
+		t.Errorf("an entry anchored to pkg/x.go was given for pkg/pkg/x.go:\n%s", out)
+	}
+	// The benchmark keeps the hook's scope: a file the hook does not cover
+	// counts as nothing injected, not as a lookup the hook never does.
+	must(t, "claude-code", "add", "learning", "Go files are formatted on save", "-d", "Anchored to every Go file by name.", "-r", "*.go", "-e", "read the code")
+	os.WriteFile(cases, []byte(`[{"file":"`+filepath.Join(base, "elsewhere.go")+`","relevant":["aiproxy/learnings/go-files-are-formatted-on-save"]}]`), 0o644)
+	os.Chdir(aiproxy)
+	if bench := must(t, "codex", "bench", "file-context", "--cases", cases); !strings.Contains(bench, "not covered by the hook (outside the repository): injected 0, relevant 0 of 1") || !strings.Contains(bench, "cases 1, injections 0:") {
+		t.Errorf("the benchmark looked up a file the hook never would:\n%s", bench)
+	}
 	// A title of any length is cut in a header: it cannot use up the
 	// budget and hold back itself and everything ranked after it.
 	must(t, "claude-code", "add", "learning", "Oversized "+strings.Repeat("title about the retry queue ", 120), "-d", "An entry whose title alone is longer than one injection.", "-r", "pkg/**", "-e", "read the code", "--force")
