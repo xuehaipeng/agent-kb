@@ -2034,7 +2034,7 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	// it states follows, and the prompt asks for it by name.
 	file(".claude/rules/swap.md", "---\npaths: \"docs/**\"\n---\nPrefer small pull requests over large ones.\n")
 	must(t, "", "rules", "import", "--repo", "--cmd", script)
-	if p := read("rules-swap.md"); !strings.Contains(p, "This file gave these rules earlier, when it applied to other files than it does now.") || !strings.Contains(p, "- Prefer small pull requests over large ones\n") {
+	if p := read("rules-swap.md"); !strings.Contains(p, "This file gave these rules earlier, when it applied to other files than it does now.") || !strings.Contains(p, "- Prefer small pull requests over large ones.\n") {
 		t.Errorf("the prompt must name the rules whose condition has to follow the file:\n%s", p)
 	}
 
