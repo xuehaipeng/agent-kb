@@ -15,6 +15,7 @@ import (
 	"github.com/xuehaipeng/agent-kb/internal/install"
 	"github.com/xuehaipeng/agent-kb/internal/kb"
 	"github.com/xuehaipeng/agent-kb/internal/mcp"
+	"github.com/xuehaipeng/agent-kb/internal/okf"
 )
 
 // Version is set at build time.
@@ -45,7 +46,9 @@ Rules (always-on conventions, delivered at session start):
                                      everywhere; --all lists every project's for inspection), plus proposed ones
            [--all-rules]             include rules a delivery cap leaves out (session start and MCP instructions
                                      are fitted to a size budget; kb status shows what was delivered)
-  kb add rule "<instruction>" -d <why> -e "user said so" [--global]
+  kb add rule "<instruction>" -d <why> -e "user said so" [--global] [--when <glob>]...
+           --when makes it conditional: left out of session start, shown by kb rules -f <path> and kb search -f <path>
+  kb rules -f <path>...              rules that apply only to these files
   kb rules import [--user|--repo] [files...]   share rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md, ...)
 
 Record and evolve:
@@ -469,6 +472,8 @@ func (a *App) cmdAdd(args []string) error {
 	f.str(&in.Evidence, "", "how you know (makes the entry verified)", "e", "evidence")
 	f.str(&in.Project, "", "target project (hub)", "p", "project")
 	f.list(&in.Projects, true, "with --global: projects it applies to", "for")
+	var when []string
+	f.list(&when, true, "rule only: apply it only when working on files matching this glob", "when")
 	var global bool
 	var from string
 	f.boolean(&global, "store in the global scope shared by all projects (hub)", "global")
@@ -481,6 +486,9 @@ func (a *App) cmdAdd(args []string) error {
 	}
 	if global {
 		in.Project = kb.GlobalProject
+	}
+	if len(when) > 0 {
+		in.AppliesTo = &okf.Applicability{Paths: when}
 	}
 	if from != "" {
 		if len(pos) > 0 {

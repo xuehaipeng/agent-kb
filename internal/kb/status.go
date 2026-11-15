@@ -37,6 +37,7 @@ type StatusReport struct {
 	Rules            int            `json:"rules_delivered"` // applicable trusted rules, before the delivery cap
 	RulesScope       string         `json:"rules_scope"`
 	RulesOmitted     int            `json:"rules_omitted_by_cap"` // applicable rules the session-start delivery leaves out (count cap or size budget)
+	RulesConditional int            `json:"rules_conditional"`    // trusted rules that apply only to matching files; never in rules_delivered
 	Delivery         *Delivery      `json:"rules_delivery,omitempty"`
 	PendingRules     []string       `json:"rules_pending"`
 	Uncommitted      int            `json:"uncommitted_files"`
@@ -139,6 +140,7 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 	}
 	if rs, err := s.Rules(o.Projects, o.AllProjects); err == nil {
 		r.Rules, r.RulesScope, r.RulesOmitted = rs.Applicable(), rs.Scope, rs.Omitted
+		r.RulesConditional = len(rs.Conditional)
 		for _, n := range rs.Pending {
 			r.PendingRules = append(r.PendingRules, n.ID)
 		}

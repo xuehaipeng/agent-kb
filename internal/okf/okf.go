@@ -75,14 +75,37 @@ type Meta struct {
 	Resources   StringList `yaml:"resources"`
 	Revision    int        `yaml:"revision"` // content revision; 0 or absent means 1
 	Projects    StringList `yaml:"projects"` // for global entries: projects they apply to
-	Generated   Event      `yaml:"generated"`
-	Updated     *Event     `yaml:"updated"` // last content update (revision > 1)
-	Verified    []Event    `yaml:"verified"`
-	StaleAfter  string     `yaml:"stale_after"`
-	StaleBasis  string     `yaml:"stale_basis"` // what stale_after was derived from when not from a check of the code
-	Sources     []Source   `yaml:"sources"`
-	Supersedes  StringList `yaml:"supersedes"`
-	Review      *Review    `yaml:"review"`
+	// AppliesTo makes a rule conditional: it applies only when matching
+	// files are worked on. It is not `resources` (what a claim depends on).
+	AppliesTo  *Applicability `yaml:"applies_to"`
+	Generated  Event          `yaml:"generated"`
+	Updated    *Event         `yaml:"updated"` // last content update (revision > 1)
+	Verified   []Event        `yaml:"verified"`
+	StaleAfter string         `yaml:"stale_after"`
+	StaleBasis string         `yaml:"stale_basis"` // what stale_after was derived from when not from a check of the code
+	Sources    []Source       `yaml:"sources"`
+	Supersedes StringList     `yaml:"supersedes"`
+	Review     *Review        `yaml:"review"`
+}
+
+// Applicability scopes a rule to files matching path patterns.
+type Applicability struct {
+	Paths  StringList `yaml:"paths"`
+	Base   string     `yaml:"base,omitempty"`   // directory (repo-relative) the patterns are relative to
+	Origin string     `yaml:"origin,omitempty"` // whose pattern syntax, e.g. "claude-rules"
+}
+
+// AppliesNode builds the `applies_to` mapping.
+func AppliesNode(a *Applicability) *yaml.Node {
+	m := &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	m.Content = append(m.Content, str("paths"), flowList(a.Paths))
+	if a.Base != "" {
+		m.Content = append(m.Content, str("base"), str(a.Base))
+	}
+	if a.Origin != "" {
+		m.Content = append(m.Content, str("origin"), str(a.Origin))
+	}
+	return m
 }
 
 // Doc is a parsed concept file.
@@ -157,6 +180,9 @@ func New(m Meta, body string) *Doc {
 	}
 	if len(m.Projects) > 0 {
 		d.Set("projects", flowList(m.Projects))
+	}
+	if m.AppliesTo != nil && len(m.AppliesTo.Paths) > 0 {
+		d.Set("applies_to", AppliesNode(m.AppliesTo))
 	}
 	if len(m.Supersedes) > 0 {
 		d.Set("supersedes", flowList(m.Supersedes))

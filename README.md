@@ -139,7 +139,9 @@ kb deprecate stream-timeout -m "gateway replaced by envoy"
 kb rules                                        # rules for this project + global; proposed ones awaiting confirmation
 kb rules -p kubedl                              # a named project's rules (+ the global ones that apply to it)
 kb rules --all                                  # every project's rules, for inspection
-kb rules --all-rules                            # include rules a delivery cap left out
+kb rules --all-rules                            # include rules a delivery cap left out, and conditional ones
+kb rules -f src/api/users.ts                    # rules that apply only to this file
+kb add rule "Migrations are forward-only" -d "no down migrations" -e "user said so" --when "db/migrations/**"
 kb add rule "Use pnpm, never npm" -d "lockfile is pnpm-lock.yaml" -e "user said so"
 kb add rule "Write commit messages in English" -d "team convention" -e "user said so" --global
 kb rules import                                 # ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md (global)
@@ -208,6 +210,14 @@ the MCP `instructions` to the same figure. When it doesn't fit, health lines
 give way first, then global rules, then project rules; a notice says how many
 were left out, `kb rules --all-rules` lists them, and `kb status` shows what
 session start delivered (`rules_delivery` in `--json`).
+
+A rule can be conditional: it applies only when matching files are worked on
+(`--when <glob>`, or imported from a path-scoped rule file). Conditional rules
+are never delivered as always-on rules. They show up for a matching file in
+`kb rules -f <path>` and `kb search -f <path>`. `kb rules import` reads rule
+files the way their own agent loads them, so a path-scoped Claude rule or a
+subdirectory's `CLAUDE.md` stays conditional, and anything whose condition kb
+cannot reproduce exactly is listed as not imported rather than widened.
 
 Only evidence-backed rules are delivered (`-e "user said so"`, an imported
 rule file, a memory the agent saved). A rule an agent inferred on its own waits

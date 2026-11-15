@@ -237,7 +237,8 @@ Rev 2 shares all three.
   - Claude Code's typed memory files are imported without a model and keep
     their identity; all imports are source-only (§2.13).
 - **Rule-file import:** `kb rules import` splits rule files written for one
-  agent into atomic, agent-neutral rules.
+  agent into atomic, agent-neutral rules. Files are read the way their own
+  agent loads them, and a path-scoped rule stays conditional (§2.14).
   - User-level files become global rules; a repo's `CLAUDE.md`, `GEMINI.md`,
     `.claude/rules`, `.cursor/rules`, `.agents/rules`, `.windsurfrules` and
     Copilot instructions become project rules.
@@ -447,6 +448,56 @@ and the revision the import last wrote.
 Importing a source that overlaps a transcript of the same session
 automatically stays out until session coverage exists (issue #1 stage 3B).
 
+### 2.14 Conditional rules and rule-file fidelity *(issue #3 item 6A)*
+
+**Applicability is not anchoring.** `resources` says which code a claim
+depends on, for search and staleness. It never limited when a rule is
+delivered, so copying a path-scoped rule's patterns into `resources` would
+have made it an always-on rule. A rule that applies only to some files now
+carries `applies_to`:
+
+```yaml
+applies_to:
+  paths: ["src/api/**/*.ts"]
+  base: packages/web        # directory the patterns are relative to
+  origin: claude-rules      # whose pattern syntax
+```
+
+- A conditional rule is trusted and in scope but is left out of every
+  always-on surface: `kb rules`, SessionStart, MCP `instructions`, the
+  user-level blocks, and `rules_delivered`. Those surfaces carry one line
+  saying how many such rules exist. `kb status` counts them separately
+  (`rules_conditional`).
+- It surfaces for a matching file: `kb rules -f <path>` and `kb search -f
+  <path>` (which the pointer already tells agents to run before touching
+  unfamiliar code). `kb rules --all-rules` lists them with their condition.
+  Nothing pushes them yet; a file-access hook is issue #3 item 4.
+- Only rules can be conditional (`kb add rule ... --when <glob>`).
+- Patterns follow Claude Code's documented rule syntax: `**` crosses
+  directories; a bare name matches at any depth; a leading `/` anchors to the
+  base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work. A
+  pattern that cannot be matched exactly is an error and matches nothing. It
+  is never widened.
+
+**Reading rule files as their agent does.** `kb rules import` now:
+
+| Found | Outcome |
+|---|---|
+| Claude rule with `paths:` | imported as conditional, base = the directory holding its `.claude` |
+| `CLAUDE.md` or rules in a subdirectory | conditional on that directory (they load only for files there) |
+| frontmatter that does not parse | not imported: Claude Code would load it unconditionally, kb must not guess |
+| a pattern kb cannot match exactly | not imported |
+| Cursor rule that is not `alwaysApply: true`, other agents' `globs`/`trigger` | not imported: kb cannot reproduce that condition |
+| `CLAUDE.local.md` | not imported: personal, uncommitted instructions stay private |
+| a link or `@path` import leaving the repository (or `~/.claude` for user files) | not followed |
+| `@AGENTS.md` | not followed: other agents read it natively |
+| kb's own blocks and pointer | never re-imported |
+
+Rules directories are walked recursively. `@path` imports are followed up to
+four hops, once each (cycles end), only to existing files, and never inside
+code spans or fences. Block-level HTML comments are dropped, except inside
+code blocks. Everything left out is listed as a `note:` line.
+
 ## 3. Doc C (ChatGPT plan) review
 
 **Adopted in rev 2** (also: §2.9, repo docs as the source of truth):
@@ -489,7 +540,7 @@ automatically stays out until session coverage exists (issue #1 stage 3B).
 | `kb search [query] [-f path] [-p project] [--all]` | compact ranked headers with trust badges |
 | `kb show <id>` | entry with trust trail, revisions, resources, fenced body |
 | `kb add <type> <title> -d ... [-e evidence] [--global [--for ...]]` | record knowledge (`rule` = convention) |
-| `kb rules [-p project / --all] [import]` | the rules that apply here (§2.11); share rule files written for one agent |
+| `kb rules [-p project / --all] [-f path] [import]` | the rules that apply here (§2.11), or only to a file (§2.14); share rule files written for one agent |
 | `kb update <id> -m <why> [...] [-e evidence]` | new revision of an entry |
 | `kb verify <id> --confirm / --dispute -e ...` | record a check (any agent) |
 | `kb deprecate <id> -m ...`, `kb resolve` (human) | retire or decide |

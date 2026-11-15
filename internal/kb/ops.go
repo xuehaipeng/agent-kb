@@ -30,6 +30,9 @@ type AddInput struct {
 	Force       bool // skip the near-duplicate and doc-overlap checks
 	NoDocCheck  bool // imported rules: they are pushed to agents, not searched
 	NewProject  bool // allow creating Project if it does not exist yet
+	// AppliesTo makes a rule conditional on the files being worked on; it
+	// is then kept out of always-on delivery.
+	AppliesTo *okf.Applicability
 
 	// SourceOnly marks a claim ingested from a source (a memory or rule
 	// file) rather than checked against the code now. No commit is recorded
@@ -228,6 +231,14 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	if err != nil {
 		return nil, err
 	}
+	if in.AppliesTo != nil {
+		if !s.Cfg.AlwaysOn(tk) {
+			return nil, fmt.Errorf("only rules can be limited to matching files; for a %s, use resources (-r) to say which code it depends on", tk)
+		}
+		if err := ValidateApplies(in.AppliesTo); err != nil {
+			return nil, fmt.Errorf("applies_to: %w", err)
+		}
+	}
 	unlock, err := s.Lock()
 	if err != nil {
 		return nil, err
@@ -306,6 +317,7 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	if project == GlobalProject {
 		meta.Projects = cleanList(in.Projects)
 	}
+	meta.AppliesTo = in.AppliesTo
 	if in.Evidence != "" {
 		meta.Status = "stable"
 		meta.Verified = []okf.Event{{By: in.Actor.String(), At: now.Format(time.RFC3339), Result: ResultConfirmed, Rev: 1, Commit: head, Evidence: in.Evidence}}

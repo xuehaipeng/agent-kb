@@ -39,6 +39,11 @@ type FileSource struct {
 	Agent   kb.Actor // whose memory, or which agent the rule file was written for
 	Project string   // default target: "" = current project, "global" = shared
 	Content string   // when set, import this part of the file instead of all of it
+	// Prepared: Content is the file as its agent loads it (frontmatter and
+	// comments removed, imports expanded), even when that leaves nothing.
+	Prepared bool
+	// Applies makes every rule from this file conditional on matching files.
+	Applies *okf.Applicability
 }
 
 // ImportOptions controls an import run.
@@ -77,7 +82,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 	if len(data) > maxImportBytes {
 		data = data[:maxImportBytes]
 	}
-	if src.Content != "" {
+	if src.Content != "" || src.Prepared {
 		data = []byte(src.Content)
 	}
 	// The source's own modification time, not the time of this import.
@@ -102,7 +107,13 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		res.Skipped = "not in the selected projects"
 		return res, nil
 	}
-	if len(content) < minImportContentLen {
+	minLen := minImportContentLen
+	if src.Prepared {
+		// Frontmatter and comments are already gone: a one-line rule file
+		// is a whole rule, not noise.
+		minLen = 10
+	}
+	if len(content) < minLen {
 		res.Skipped = "nothing to import"
 		if !o.DryRun {
 			return res, saveHash(s, abs, hash)
@@ -170,7 +181,7 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		in := kb.AddInput{
 			Type: typ, Title: c.Title, Description: c.Description, Body: strings.TrimSpace(c.Body),
 			Tags: c.Tags, Resources: c.Resources, Project: project, Actor: src.Agent,
-			Evidence: evidence, NoDocCheck: src.Kind == KindRules,
+			Evidence: evidence, NoDocCheck: src.Kind == KindRules, AppliesTo: src.Applies,
 			// The default project comes from a real repository (or is global).
 			NewProject: project == src.Project,
 			Sources: []okf.Source{{ID: srcID, Resource: displayPath(src.Path), Author: src.Agent.String(),
@@ -422,45 +433,6 @@ func claudeMemoryProject(s *kb.Store, projectDir string) (string, bool) {
 	}
 	t := s.ForDir(cwd)
 	return t.Project, t.Project != ""
-}
-
-// RuleFileSources finds rule files written for a single agent: user-level
-// instruction files (shared as global rules) and, inside a repository,
-// agent-specific rule files the other agents don't read. AGENTS.md is left
-// out: Codex, Cursor and Antigravity already read it natively.
-func RuleFileSources(s *kb.Store, user, project bool) []FileSource {
-	var out []FileSource
-	add := func(p string, agent string, proj string) {
-		if st, err := os.Stat(p); err == nil && !st.IsDir() {
-			out = append(out, FileSource{Path: p, Kind: KindRules, Agent: kb.Actor{Producer: agent}, Project: proj})
-		}
-	}
-	if user {
-		g := globalOrCurrent(s)
-		add(filepath.Join(claudeDir(), "CLAUDE.md"), "claude-code", g)
-		add(filepath.Join(codexDir(), "AGENTS.md"), "codex", g)
-		add(filepath.Join(homeDir(), ".gemini", "GEMINI.md"), "antigravity", g)
-	}
-	if project && s.CodeRoot != "" {
-		root := s.CodeRoot
-		add(filepath.Join(root, "CLAUDE.md"), "claude-code", "")
-		add(filepath.Join(root, ".claude", "CLAUDE.md"), "claude-code", "")
-		add(filepath.Join(root, "GEMINI.md"), "antigravity", "")
-		add(filepath.Join(root, ".windsurfrules"), "windsurf", "")
-		add(filepath.Join(root, ".github", "copilot-instructions.md"), "copilot", "")
-		for _, g := range []struct{ glob, agent string }{
-			{".claude/rules/*.md", "claude-code"},
-			{".cursor/rules/*.mdc", "cursor"},
-			{".cursor/rules/*.md", "cursor"},
-			{".agents/rules/*.md", "antigravity"},
-		} {
-			matches, _ := filepath.Glob(filepath.Join(root, filepath.FromSlash(g.glob)))
-			for _, m := range matches {
-				add(m, g.agent, "")
-			}
-		}
-	}
-	return out
 }
 
 // ImportAll imports a list of sources and returns one report line each.

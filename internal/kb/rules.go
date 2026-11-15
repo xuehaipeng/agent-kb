@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/xuehaipeng/agent-kb/internal/okf"
 )
 
 // Rules are always-on entries (conventions by default): unlike facts and
@@ -23,6 +25,10 @@ type RuleSet struct {
 	Global  []*Node // global rules that apply here
 	Pending []*Node // unverified or disputed rules in scope, not delivered
 	Omitted int     // trusted rules left out by the size cap
+	// Conditional rules apply only when matching files are worked on. They
+	// are trusted and in scope, but never part of always-on delivery.
+	Conditional     []*Node
+	ShowConditional bool // list them (inspection) instead of counting them
 }
 
 // Applicable counts the trusted rules in scope, including those the size cap
@@ -127,6 +133,10 @@ func (s *Store) rules(projects []string, all bool, limit int) (RuleSet, error) {
 			rs.Pending = append(rs.Pending, n)
 			continue
 		}
+		if Conditional(n.Meta()) {
+			rs.Conditional = append(rs.Conditional, n)
+			continue
+		}
 		r := ranked{n, trustWeight(t)}
 		if n.Project == GlobalProject {
 			global = append(global, r)
@@ -167,7 +177,58 @@ func (s *Store) rules(projects []string, all bool, limit int) (RuleSet, error) {
 		}
 	}
 	sort.Slice(rs.Pending, func(i, j int) bool { return rs.Pending[i].ID < rs.Pending[j].ID })
+	sort.Slice(rs.Conditional, func(i, j int) bool { return rs.Conditional[i].ID < rs.Conditional[j].ID })
+	rs.ShowConditional = limit == 0
 	return rs, nil
+}
+
+// RulesForFiles returns the conditional rules in scope that apply to any of
+// the given files (paths relative to the repository root).
+func (s *Store) RulesForFiles(files []string, projects []string, all bool) ([]*Node, error) {
+	rs, err := s.rules(projects, all, 0)
+	if err != nil {
+		return nil, err
+	}
+	var out []*Node
+	for _, n := range rs.Conditional {
+		for _, f := range files {
+			if AppliesToFile(n.Meta().AppliesTo, f) {
+				out = append(out, n)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
+// RenderFileRules prints the conditional rules that apply to files.
+func (s *Store) RenderFileRules(rules []*Node, files []string) string {
+	if len(rules) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "Rules from kb that apply to %s (follow them for this work unless the user says otherwise):\n", strings.Join(files, ", "))
+	for _, n := range rules {
+		fmt.Fprintf(&b, "- %s [%s]\n", ruleText(n), n.ID)
+	}
+	return b.String()
+}
+
+func ruleText(n *Node) string {
+	m := n.Meta()
+	text := m.Title
+	if d := strings.TrimSpace(m.Description); d != "" && !strings.EqualFold(strings.TrimRight(d, "."), strings.TrimRight(text, ".")) {
+		text += " - " + d
+	}
+	return oneLine(text, 220)
+}
+
+func appliesNote(a *okf.Applicability) string {
+	note := "when working on " + strings.Join(a.Paths, ", ")
+	if a.Base != "" {
+		note += " under " + a.Base + "/"
+	}
+	return note
 }
 
 // RenderRules prints rules compactly for an agent's context. Each line is
@@ -179,15 +240,12 @@ func (s *Store) RenderRules(rs RuleSet, withPending bool) string {
 	}
 	line := func(n *Node) {
 		m := n.Meta()
-		text := m.Title
-		if d := strings.TrimSpace(m.Description); d != "" && !strings.EqualFold(strings.TrimRight(d, "."), strings.TrimRight(text, ".")) {
-			text += " - " + d
-		}
+		text := ruleText(n)
 		only := ""
 		if rs.All && n.Project == GlobalProject && len(m.Projects) > 0 {
 			only = " (only for " + strings.Join(m.Projects, ", ") + ")"
 		}
-		fmt.Fprintf(&b, "- %s [%s]%s\n", oneLine(text, 220), n.ID, only)
+		fmt.Fprintf(&b, "- %s [%s]%s\n", text, n.ID, only)
 	}
 	prev := ""
 	for _, n := range rs.Scoped {
@@ -207,6 +265,18 @@ func (s *Store) RenderRules(rs RuleSet, withPending bool) string {
 	}
 	if rs.Omitted > 0 {
 		fmt.Fprintf(&b, "(+%d more rule(s) apply here but were left out to keep this short: kb rules --all-rules)\n", rs.Omitted)
+	}
+	// Conditional rules are named, not delivered: they apply only to
+	// matching files and would otherwise act as always-on rules.
+	if n := len(rs.Conditional); n > 0 {
+		if rs.ShowConditional {
+			b.WriteString("Conditional rules (not delivered at session start; they apply only to matching files):\n")
+			for _, c := range rs.Conditional {
+				fmt.Fprintf(&b, "- %s [%s] (%s)\n", ruleText(c), c.ID, appliesNote(c.Meta().AppliesTo))
+			}
+		} else {
+			fmt.Fprintf(&b, "(+%d rule(s) apply only to particular files: kb rules -f <path> before working on a file)\n", n)
+		}
 	}
 	if withPending && len(rs.Pending) > 0 {
 		b.WriteString("Proposed rules awaiting confirmation (not applied; confirm with 'kb verify <id> --confirm -e \"<why>\"' or retire with 'kb deprecate'):\n")
