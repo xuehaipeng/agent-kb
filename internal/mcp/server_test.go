@@ -71,7 +71,7 @@ func TestMCPSession(t *testing.T) {
 	if !strings.Contains(text(2), "added facts/ports-are-fixed") {
 		t.Fatalf("add: %s", text(2))
 	}
-	if !strings.Contains(text(3), "[unverified] Ports are fixed") {
+	if !strings.Contains(text(3), "[unverified,code-not-applicable] Ports are fixed") {
 		t.Fatalf("search: %s", text(3))
 	}
 	// clientInfo said codex: the author may verify its own entry (verified, not cross-checked).

@@ -43,6 +43,14 @@ func (a *App) cmdRules(args []string) error {
 			"Import rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md, ...): kb rules import\n"
 	}
 	a.out("%s", out)
+	if !quiet && s.Hub {
+		switch {
+		case all:
+			a.out("(every project's rules, for inspection; a session gets only the rules of its own project plus the global ones that apply to it)\n")
+		case len(projects) == 0 && s.Project == "":
+			a.out("(not inside a project: these are the global rules that apply everywhere; kb rules -p <project> adds a project's, --all lists every project's)\n")
+		}
+	}
 	return nil
 }
 

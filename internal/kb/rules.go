@@ -17,11 +17,17 @@ const maxDeliveredRules = 40
 // RuleSet is what applies in a scope.
 type RuleSet struct {
 	Project string
-	Scoped  []*Node // the project's rules (repo mode: all rules)
+	Scope   string  // human description of the scope the rules were selected for
+	All     bool    // all-project inspection rather than what applies here
+	Scoped  []*Node // project rules (repo mode: all rules), grouped by project
 	Global  []*Node // global rules that apply here
 	Pending []*Node // unverified or disputed rules in scope, not delivered
 	Omitted int     // trusted rules left out by the size cap
 }
+
+// Applicable counts the trusted rules in scope, including those the size cap
+// left out of the rendered list.
+func (r RuleSet) Applicable() int { return len(r.Scoped) + len(r.Global) + r.Omitted }
 
 // Empty reports whether there is nothing to deliver or confirm.
 func (r RuleSet) Empty() bool { return len(r.Scoped)+len(r.Global)+len(r.Pending) == 0 }
@@ -30,14 +36,69 @@ func (r RuleSet) Empty() bool { return len(r.Scoped)+len(r.Global)+len(r.Pending
 // installers can refresh the rule blocks in agents' instruction files.
 var ChangeHook func(s *Store)
 
-// Rules collects the rules for the current scope (or the given projects).
+// ruleScope selects the rules that apply, which is narrower than the
+// discovery scope of search/status/review: a rule is an instruction, so one
+// project's rule must never reach a session working elsewhere.
+//
+//   - repo mode: every rule of the bundle;
+//   - all: every rule of every project (inspection, not delivery);
+//   - projects given: those projects' rules plus the global rules that apply
+//     to them ("global" itself selects the rules that apply everywhere);
+//   - otherwise the current project, or outside any project only the global
+//     rules without a `projects:` restriction.
+func (s *Store) ruleScope(projects []string, all bool) (func(*Node) bool, string) {
+	if !s.Hub {
+		return func(*Node) bool { return true }, "repository"
+	}
+	if all {
+		return func(*Node) bool { return true }, "all projects"
+	}
+	want := map[string]bool{}
+	var named []string
+	for _, p := range projects {
+		if !want[p] {
+			want[p] = true
+			if p != GlobalProject {
+				named = append(named, p)
+			}
+		}
+	}
+	if len(want) == 0 && s.Project != "" {
+		want[s.Project] = true
+		named = []string{s.Project}
+	}
+	scope := "global only"
+	if len(named) > 0 {
+		scope = strings.Join(named, ", ") + " + global"
+	}
+	return func(n *Node) bool {
+		if n.Project != GlobalProject {
+			return want[n.Project]
+		}
+		ps := n.Meta().Projects
+		if len(ps) == 0 {
+			return true
+		}
+		for _, p := range ps {
+			if want[p] {
+				return true
+			}
+		}
+		return false
+	}, scope
+}
+
+// Rules collects the rules that apply in the current scope (or to the given
+// projects). Every delivery surface goes through here: 'kb rules', the
+// SessionStart hook, MCP instructions, the user-level managed blocks and the
+// rule count in 'kb status'.
 func (s *Store) Rules(projects []string, all bool) (RuleSet, error) {
 	nodes, err := s.Nodes()
 	if err != nil {
 		return RuleSet{}, err
 	}
-	rs := RuleSet{Project: s.Project}
-	inScope := s.scopeFilter(projects, all)
+	inScope, scope := s.ruleScope(projects, all)
+	rs := RuleSet{Project: s.Project, Scope: scope, All: s.Hub && all}
 	sup := s.supersededIndex()
 	type ranked struct {
 		n *Node
@@ -65,6 +126,13 @@ func (s *Store) Rules(projects []string, all bool) (RuleSet, error) {
 	}
 	order := func(xs []ranked) []*Node {
 		sort.SliceStable(xs, func(i, j int) bool {
+			// Keep each project's rules together, the current project first.
+			if pi, pj := xs[i].n.Project, xs[j].n.Project; pi != pj {
+				if pi == s.Project || pj == s.Project {
+					return pi == s.Project
+				}
+				return pi < pj
+			}
 			if xs[i].w != xs[j].w {
 				return xs[i].w > xs[j].w
 			}
@@ -105,15 +173,19 @@ func (s *Store) RenderRules(rs RuleSet, withPending bool) string {
 		if d := strings.TrimSpace(m.Description); d != "" && !strings.EqualFold(strings.TrimRight(d, "."), strings.TrimRight(text, ".")) {
 			text += " - " + d
 		}
-		fmt.Fprintf(&b, "- %s [%s]\n", oneLine(text, 220), n.ID)
+		only := ""
+		if rs.All && n.Project == GlobalProject && len(m.Projects) > 0 {
+			only = " (only for " + strings.Join(m.Projects, ", ") + ")"
+		}
+		fmt.Fprintf(&b, "- %s [%s]%s\n", oneLine(text, 220), n.ID, only)
 	}
-	if len(rs.Scoped) > 0 {
-		if s.Hub && rs.Project != "" {
-			fmt.Fprintf(&b, "%s:\n", rs.Project)
+	prev := ""
+	for _, n := range rs.Scoped {
+		if s.Hub && n.Project != prev {
+			fmt.Fprintf(&b, "%s:\n", n.Project)
+			prev = n.Project
 		}
-		for _, n := range rs.Scoped {
-			line(n)
-		}
+		line(n)
 	}
 	if len(rs.Global) > 0 {
 		if s.Hub {
@@ -137,7 +209,9 @@ func (s *Store) RenderRules(rs RuleSet, withPending bool) string {
 
 // GlobalRulesText renders the rules that apply everywhere (for user-level
 // instruction files that cannot run commands, such as ~/.codex/AGENTS.md).
-// Repo mode returns the bundle's rules.
+// Those files are read in every repository, so project rules and global rules
+// restricted to some projects (--for) stay out. Repo mode returns the
+// bundle's rules.
 func (s *Store) GlobalRulesText() string {
 	var rs RuleSet
 	var err error

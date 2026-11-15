@@ -36,9 +36,13 @@ Retrieve (in a hub: current repo's project + global by default):
                  (also lists matching sections of the repo's own docs: they are the source of truth)
   kb show <id>... [--raw]
   kb status [--brief] [-p project] [--all] [--json]
+                 search/show/status compare code with a baseline checkout: [--checkout <work tree>] [--ref <ref>] override it
+  Badges: <evidence>[,code-unchanged|code-changed|unknown-freshness|code-not-applicable][,stale]
+          unknown-freshness = the code could not be compared on this machine (not a pass, not stale)
 
 Rules (always-on conventions, delivered at session start):
-  kb rules [-p project] [--all]      the rules that apply here, plus proposed ones awaiting confirmation
+  kb rules [-p project] [--all]      the rules that apply here (outside a project: only global rules that apply
+                                     everywhere; --all lists every project's for inspection), plus proposed ones
   kb add rule "<instruction>" -d <why> -e "user said so" [--global]
   kb rules import [--user|--repo] [files...]   share rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md, ...)
 
@@ -56,6 +60,8 @@ Projects (hub mode):
   kb hub clone <git url>             use an existing hub on this machine (e.g. the Hermes host)
   kb hub import <repo>/knowledge [-p project]   move a repo bundle into the hub
   kb project [list | link <id>]      show/list projects; map this repo to a project
+  kb project checkout [list [project] | set [project] [--repo id] [--path dir] | clear [project] [--repo id]]
+                                     this machine's checkouts and which one code is compared with
 
 Cross-review:
   kb review submit <title> [-m summary] [--base ref] [--head ref] [-a assumption]...
@@ -299,20 +305,27 @@ func (a *App) cmdInstall(args []string) error {
 }
 
 type hitJSON struct {
-	ID          string   `json:"id"`
-	Kind        string   `json:"kind"` // entry | doc
-	Project     string   `json:"project,omitempty"`
-	Path        string   `json:"path,omitempty"` // doc hits: repo-relative file
-	Line        int      `json:"line,omitempty"` // doc hits: heading line
-	Type        string   `json:"type,omitempty"`
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	Trust       string   `json:"trust,omitempty"`
-	Stale       bool     `json:"stale,omitempty"`
-	StaleReason string   `json:"stale_reason,omitempty"`
-	Anchored    string   `json:"anchored,omitempty"`
-	Resources   []string `json:"resources,omitempty"`
-	Score       float64  `json:"score"`
+	ID          string `json:"id"`
+	Kind        string `json:"kind"` // entry | doc
+	Project     string `json:"project,omitempty"`
+	Path        string `json:"path,omitempty"` // doc hits: repo-relative file
+	Line        int    `json:"line,omitempty"` // doc hits: heading line
+	Type        string `json:"type,omitempty"`
+	Title       string `json:"title"`
+	Description string `json:"description"`
+	Trust       string `json:"trust,omitempty"`
+	Stale       bool   `json:"stale,omitempty"`
+	StaleReason string `json:"stale_reason,omitempty"`
+	// Absence of "stale" does not mean the code was checked: read
+	// code_freshness (unchanged | changed | unknown | not_applicable).
+	CodeFreshness   string       `json:"code_freshness,omitempty"`
+	FreshnessCode   string       `json:"code_freshness_code,omitempty"`
+	FreshnessReason string       `json:"code_freshness_reason,omitempty"`
+	Overdue         bool         `json:"overdue,omitempty"`
+	Baseline        *kb.Baseline `json:"baseline,omitempty"`
+	Anchored        string       `json:"anchored,omitempty"`
+	Resources       []string     `json:"resources,omitempty"`
+	Score           float64      `json:"score"`
 }
 
 func (a *App) cmdSearch(args []string) error {
@@ -329,6 +342,7 @@ func (a *App) cmdSearch(args []string) error {
 	f.boolean(&q.NoDocs, "skip matching sections of the repo's own docs", "no-docs")
 	f.integer(&q.Limit, 0, "max results", "n", "limit")
 	f.boolean(&asJSON, "JSON output", "json")
+	base := a.baselineFlags(f)
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -341,6 +355,9 @@ func (a *App) cmdSearch(args []string) error {
 	if err != nil {
 		return err
 	}
+	if err := base.apply(s); err != nil {
+		return err
+	}
 	hits, err := s.Search(q)
 	if err != nil {
 		return err
@@ -349,7 +366,9 @@ func (a *App) cmdSearch(args []string) error {
 		out := []hitJSON{}
 		for _, h := range hits {
 			m := h.Node.Meta()
-			out = append(out, hitJSON{ID: h.Node.ID, Kind: "entry", Project: h.Node.Project, Type: h.Node.TypeKey, Title: m.Title, Description: m.Description, Trust: h.Trust.State, Stale: h.Trust.Stale, StaleReason: h.Trust.StaleReason, Anchored: h.PathMatch, Resources: m.Resources, Score: h.Score})
+			out = append(out, hitJSON{ID: h.Node.ID, Kind: "entry", Project: h.Node.Project, Type: h.Node.TypeKey, Title: m.Title, Description: m.Description, Trust: h.Trust.State, Stale: h.Trust.Stale, StaleReason: h.Trust.StaleReason,
+				CodeFreshness: h.Trust.CodeFreshness, FreshnessCode: h.Trust.FreshnessCode, FreshnessReason: h.Trust.FreshnessReason, Overdue: h.Trust.Overdue, Baseline: h.Trust.Baseline,
+				Anchored: h.PathMatch, Resources: m.Resources, Score: h.Score})
 		}
 		if q.Text != "" && !q.NoDocs {
 			for _, d := range s.SearchDocs(q.Text, q.Projects, q.AllProjects, q.DocLimit) {
@@ -367,6 +386,7 @@ func (a *App) cmdShow(args []string) error {
 	a.globals(f)
 	var raw bool
 	f.boolean(&raw, "print the file as stored", "raw")
+	base := a.baselineFlags(f)
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -376,6 +396,9 @@ func (a *App) cmdShow(args []string) error {
 	}
 	s, err := a.store()
 	if err != nil {
+		return err
+	}
+	if err := base.apply(s); err != nil {
 		return err
 	}
 	for i, id := range pos {
@@ -397,6 +420,27 @@ func (a *App) cmdShow(args []string) error {
 		a.out("%s", s.RenderNode(n))
 	}
 	return nil
+}
+
+// baseline holds the explicit baseline override of a read command.
+type baseline struct{ checkout, ref string }
+
+// baselineFlags registers --checkout/--ref: which work tree, and which ref
+// in it, entries' code is compared with instead of the selected checkout's
+// HEAD. Given explicitly, the result does not depend on the directory kb
+// runs in.
+func (a *App) baselineFlags(f *flags) *baseline {
+	b := &baseline{}
+	f.str(&b.checkout, "", "compare code with this work tree (for the repository it belongs to)", "checkout")
+	f.str(&b.ref, "", "compare code with this ref instead of HEAD", "ref")
+	return b
+}
+
+func (b *baseline) apply(s *kb.Store) error {
+	if b.checkout == "" && b.ref == "" {
+		return nil
+	}
+	return s.SetBaseline(b.checkout, b.ref)
 }
 
 func (a *App) readBody(v string) (string, error) {
@@ -502,7 +546,7 @@ func (a *App) cmdVerify(args []string) error {
 	if err != nil {
 		return err
 	}
-	a.out("%s is now %s\n", n.ID, t.Badge())
+	a.out("%s is now %s\n", n.ID, t.Ack())
 	if t.State == kb.StateDisputed {
 		a.out("a human decides: kb resolve %s --keep|--deprecate --as human:<name>\n", n.ID)
 	}
@@ -536,7 +580,7 @@ func (a *App) cmdResolve(args []string) error {
 	if err != nil {
 		return err
 	}
-	a.out("%s is now %s\n", n.ID, t.Badge())
+	a.out("%s is now %s\n", n.ID, t.Ack())
 	return nil
 }
 
@@ -577,11 +621,15 @@ func (a *App) cmdStatus(args []string) error {
 	f.boolean(&asJSON, "JSON output", "json")
 	f.list(&o.Projects, true, "project(s) (hub)", "p", "project")
 	f.boolean(&o.AllProjects, "every project (hub)", "all")
+	base := a.baselineFlags(f)
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
 	s, err := a.store()
 	if err != nil {
+		return err
+	}
+	if err := base.apply(s); err != nil {
 		return err
 	}
 	o.Me, _ = a.actor()

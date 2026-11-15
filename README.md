@@ -21,11 +21,13 @@ knowledge base they all read and write through a small CLI, `kb`:
   (`reviewed`) is a stronger signal, not a gate.
 - **Staleness from git.** If the files an entry depends on change after it was
   last confirmed, it's flagged `stale` automatically, even when you search
-  from another project.
+  from another project. When the code can't be compared on this machine, the
+  entry says `unknown-freshness` instead of passing as fresh.
 - **Rules reach every agent.** Conventions are always-on rules: Claude Code
   gets them at session start, Codex and Antigravity in their user-level
   instructions, MCP clients in the server instructions, and any agent with
-  `kb rules`. Rules you wrote for one agent (`~/.claude/CLAUDE.md`,
+  `kb rules`. Each session gets only the rules of its own project plus the
+  global ones that apply to it. Rules you wrote for one agent (`~/.claude/CLAUDE.md`,
   `.cursor/rules/`, ...) are shared with `kb rules import`.
 - **Agents' memories are shared.** What each agent saved in its private
   memory (Claude Code auto memory, Codex memories, Hermes `MEMORY.md`,
@@ -95,7 +97,7 @@ kb project list                  # every project, entry counts, local checkouts
     kubedl/    ...
     skyfable/  project.yaml (repos: [.../skyfable-backend, .../skyfable-web])
   index.md, log.md         generated / append-only
-  .kb/                     machine-local (checkout registry, lock): gitignored
+  .kb/                     machine-local (checkout registry and preferences, lock): gitignored
 ```
 
 - A project spanning several repos, or a fork: `kb project link <id>` inside
@@ -135,6 +137,8 @@ kb deprecate stream-timeout -m "gateway replaced by envoy"
 
 ```bash
 kb rules                                        # rules for this project + global; proposed ones awaiting confirmation
+kb rules -p kubedl                              # a named project's rules (+ the global ones that apply to it)
+kb rules --all                                  # every project's rules, for inspection
 kb add rule "Use pnpm, never npm" -d "lockfile is pnpm-lock.yaml" -e "user said so"
 kb add rule "Write commit messages in English" -d "team convention" -e "user said so" --global
 kb rules import                                 # ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md (global)
@@ -167,6 +171,21 @@ stray project.
 | MCP clients (Cursor, Hermes) | the server's `instructions` |
 | Hermes | the skill runs `kb rules -p <project>` |
 
+Rules are instructions, so their scope is narrower than search. All of these
+surfaces select rules the same way:
+
+| Where | Rules delivered |
+|---|---|
+| Inside a project's repo (hook, MCP, `kb rules`) | that project's rules + global rules that apply to it |
+| Outside any project (hook, MCP, `kb rules`) | only global rules with no `--for` restriction |
+| User-level blocks (`~/.codex/AGENTS.md`, `~/.gemini/GEMINI.md`) | only global rules with no `--for` restriction |
+| `kb rules -p <project>` | that project's rules + global rules that apply to it |
+| `kb rules --all` | every project's rules, for inspection |
+
+Search, status and review lists keep their wider default (every project when
+run outside one). `kb status` reports both: entry counts for its `scope`, and
+`rules that apply` for the narrower `rules_scope`.
+
 Only evidence-backed rules are delivered (`-e "user said so"`, an imported
 rule file, a memory the agent saved). A rule an agent inferred on its own waits
 as *proposed* until confirmed, so one agent's guess never steers all of them.
@@ -184,6 +203,52 @@ it natively.
 | `disputed` | the latest check on this revision says it's wrong |
 | `deprecated` | retracted, or superseded by a newer decision |
 | `+stale` | past `stale_after`, or its `resources` changed in git since it was last confirmed |
+
+### Code freshness
+
+Trust says who confirmed a claim. Code freshness says whether the code it
+depends on still matches what was checked. It is shown next to the trust
+state (`[verified,code-unchanged]`) and is computed live on each machine,
+never stored.
+
+| Badge | Meaning | Search weight |
+|---|---|---:|
+| `code-unchanged` | compared: no file in `resources` changed since the recorded commit | 1.00 |
+| `code-changed` (+`stale`) | compared: a file in `resources` changed | 0.80 |
+| `unknown-freshness` | could not be compared on this machine; not a pass, not stale | 0.90 |
+| `code-not-applicable` | no `resources`, or a global entry | 1.00 |
+
+An entry past `stale_after` is `stale` (0.80, applied once) whatever its code
+freshness. The weights are starting values, not tuned ones.
+
+`kb show <id>` and `--json` give the reason and the baseline: which repository
+and checkout the code was compared with, at which commit, and why that
+checkout was chosen. kb picks the baseline per repository in this order:
+
+1. `--checkout <work tree>` and/or `--ref <ref>` on `kb search`, `kb show` or
+   `kb status` (the answer then doesn't depend on where you run kb);
+2. the checkout you are in, when it is that repository;
+3. the checkout you chose with `kb project checkout set`;
+4. the primary worktree, when the repository has one clone on this machine.
+
+Otherwise the entry is `unknown-freshness` with the reason. kb never falls
+back to whichever checkout was registered last.
+
+```bash
+kb project checkout list [project]                       # repositories, checkouts and the baseline each resolves to
+kb project checkout set  [project] --repo <id> --path <checkout>
+kb project checkout clear [project] --repo <id>
+```
+
+The choice is stored in the gitignored `.kb/checkouts.json` and stays on this
+machine. In `--json`, the `stale` and `stale_reason` fields keep their old
+meaning; `unknown-freshness` alone does not set `stale`, so read
+`code_freshness` rather than inferring freshness from a missing `stale`.
+
+In a project with several repositories, an entry doesn't record which one it
+belongs to yet. kb infers it from the entry's recorded commit when exactly
+one repository contains it. A fork that shares history is settled by the
+checkout you are in or by `--checkout`; anything else is `unknown-freshness`.
 
 States are **derived** from the append-only `verified` list on every read and
 never stored. Every check records the content revision it looked at, so after
@@ -232,7 +297,7 @@ so the history of a decision stays readable; everything else evolves with
 
 | Agent | Read path | Write path |
 |---|---|---|
-| Claude Code | user-level `CLAUDE.md` imports the pointer; `kb` skill; rules at `SessionStart` | `PreCompact`/`SessionEnd` hooks run `kb extract` in the background, then `kb sync`; `SessionEnd` also imports Claude's own memory files; `SessionStart` prints rules, reviews, disputes and stale entries, and pulls the hub |
+| Claude Code | user-level `CLAUDE.md` imports the pointer; `kb` skill; rules at `SessionStart` | `PreCompact`/`SessionEnd` hooks run `kb extract` in the background, then `kb sync`; `SessionEnd` also imports Claude's own memory files; `SessionStart` prints the session's rules and at most three lines of reviews, disputes, proposed rules and stale or unknown-freshness counts (outside a project: global scope only), and pulls the hub |
 | Codex | `~/.codex/AGENTS.md` pointer + global rules; `kb` skill | `kb add` per the pointer; nightly `kb extract --scan codex` (sessions, routed to their projects) and `kb extract --scan memories` |
 | Hermes (remote) | `kb` skill + `kb hub clone` | `kb add -p <project>`; `kb extract --scan hermes-memory`; `kb sync` on cron |
 | Cursor, Antigravity, GrokBot | pointer | `kb add` optional |
@@ -289,7 +354,7 @@ Reviews by the author's own model family are allowed and labelled as such.
 ## Maintenance
 
 ```bash
-kb status [--all]  # scope, counts, disputes, stale entries, open reviews, unsynced changes
+kb status [--all]  # scope, counts, disputes, stale and unknown-freshness entries, open reviews, unsynced changes
 kb lint            # schema, timestamps, links, footnotes, secrets, retired terms, index drift
 kb lint --staged   # + immutability of decisions (used by the pre-commit hook)
 kb maintain        # index + pointer refresh + lint + status; safe for cron

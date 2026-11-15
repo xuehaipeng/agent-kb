@@ -18,6 +18,8 @@ to be searched. Claude Code receives them at session start; other agents run
 
 ```bash
 kb rules                                   # rules for this project + global, and proposed ones
+                                           # (outside a project: only the global rules that apply everywhere)
+kb rules -p aiproxy                        # a named project's rules; --all lists every project's, for inspection
 kb add rule "Use pnpm, never npm" -d "lockfile is pnpm-lock.yaml" -e "user said so"
 kb add rule "Write commit messages in English" -d "team convention" -e "user said so" --global
 kb rules import                            # share rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md ...)
@@ -47,6 +49,14 @@ States: `verified` (author checked it), `cross-checked` (another model family
 confirmed), `reviewed` (a human confirmed), `unverified` (a lead), `disputed`
 (latest check says wrong), `stale` (past `stale_after`, or the files in
 `resources` changed since it was last confirmed).
+
+The badge also says whether the code was compared: `code-unchanged`,
+`code-changed`, `code-not-applicable` (no `resources`), or
+`unknown-freshness`. Unknown means kb could not compare on this machine (the
+repository is not checked out here, there are several clones and none is
+preferred, or the recorded commit is missing). It is not a pass and not
+stale: check the claim against the code before relying on it. `kb show <id>`
+gives the reason and what the code was compared with.
 
 ## Record
 
@@ -132,6 +142,7 @@ imported automatically at session end; files are only re-read when they change.
 kb project                 # which project this repo maps to
 kb project list            # all projects with counts and local checkouts
 kb project link skyfable   # group this repo (e.g. a frontend or a fork) under a project
+kb project checkout list   # this machine's checkouts and which one code is compared with
 kb status --all            # health across every project
 ```
 

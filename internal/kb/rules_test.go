@@ -1,6 +1,7 @@
 package kb
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -44,7 +45,9 @@ func TestRulesDelivery(t *testing.T) {
 	if strings.Contains(out, "volcano") || strings.Contains(out, "yarn") {
 		t.Fatalf("out-of-scope or deprecated rule delivered:\n%s", out)
 	}
-	if g := s.GlobalRulesText(); !strings.Contains(g, "commit messages in English") || strings.Contains(g, "pnpm") {
+	// User-level files are read in every repository: only rules that apply
+	// everywhere go there, not project rules and not --for restricted ones.
+	if g := s.GlobalRulesText(); !strings.Contains(g, "commit messages in English") || strings.Contains(g, "pnpm") || strings.Contains(g, "volcano") {
 		t.Fatalf("global rules text:\n%s", g)
 	}
 	// Confirming the guess delivers it.
@@ -67,4 +70,106 @@ func ids(ns []*Node) []string {
 		out = append(out, n.ID)
 	}
 	return out
+}
+
+// Rules are instructions, so their scope is narrower than discovery: every
+// surface gets only what applies where the session runs.
+func TestRuleScopeIsNotDiscoveryScope(t *testing.T) {
+	newHub(t)
+	aiproxy := newCodeRepo(t, "git@github.com:AtlasCloudTeam/aiproxy.git")
+	kubedl := newCodeRepo(t, "git@github.com:AtlasCloudTeam/kubedl.git")
+	a, k := openAt(t, aiproxy), openAt(t, kubedl)
+	rule := func(s *Store, title, project string, projects ...string) {
+		t.Helper()
+		if _, err := s.Add(AddInput{Type: "rule", Title: title, Description: "because", Project: project, Projects: projects, Evidence: "user said so", Actor: claude, Force: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rule(a, "Use pnpm, never npm", "")
+	rule(k, "Submit jobs through volcano queues", "")
+	rule(a, "Write commit messages in English", "global")
+	rule(a, "Tag images with the git sha", "global", "kubedl")
+	if _, err := a.Add(AddInput{Type: "rule", Title: "Prefer table-driven tests", Description: "inferred", Actor: claude}); err != nil {
+		t.Fatal(err)
+	}
+	titles := func(rs RuleSet) string {
+		var out []string
+		for _, n := range append(append([]*Node{}, rs.Scoped...), rs.Global...) {
+			out = append(out, n.Meta().Title)
+		}
+		return strings.Join(out, " | ")
+	}
+	check := func(name string, s *Store, projects []string, all bool, scope string, want ...string) RuleSet {
+		t.Helper()
+		rs, err := s.Rules(projects, all)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := titles(rs); got != strings.Join(want, " | ") || rs.Scope != scope {
+			t.Fatalf("%s: scope %q rules %q", name, rs.Scope, got)
+		}
+		return rs
+	}
+	home := openAt(t, t.TempDir())
+	// Outside any project: only what applies everywhere, and no other
+	// project's proposals either.
+	rs := check("no project", home, nil, false, "global only", "Write commit messages in English")
+	if len(rs.Pending) != 0 {
+		t.Fatalf("no project: pending %v", ids(rs.Pending))
+	}
+	if out := home.RenderRules(rs, true); strings.Contains(out, "pnpm") || strings.Contains(out, "volcano") || strings.Contains(out, "git sha") {
+		t.Fatalf("unscoped delivery leaked project rules:\n%s", out)
+	}
+	check("-p global", home, []string{"global"}, false, "global only", "Write commit messages in English")
+	check("in aiproxy", a, nil, false, "aiproxy + global", "Use pnpm, never npm", "Write commit messages in English")
+	// A restricted global rule is delivered where it applies, from anywhere.
+	check("in kubedl", openAt(t, kubedl), nil, false, "kubedl + global", "Submit jobs through volcano queues", "Tag images with the git sha", "Write commit messages in English")
+	check("-p kubedl outside", home, []string{"kubedl"}, false, "kubedl + global", "Submit jobs through volcano queues", "Tag images with the git sha", "Write commit messages in English")
+	rs = check("-p kubedl from aiproxy", a, []string{"kubedl"}, false, "kubedl + global", "Submit jobs through volcano queues", "Tag images with the git sha", "Write commit messages in English")
+	if out := a.RenderRules(rs, false); !strings.Contains(out, "kubedl:\n- Submit jobs") || strings.Contains(out, "aiproxy:") {
+		t.Fatalf("another project's rules must be labelled as its own:\n%s", out)
+	}
+	// All-project inspection stays available and says what it is.
+	rs = check("--all", home, nil, true, "all projects", "Use pnpm, never npm", "Submit jobs through volcano queues", "Tag images with the git sha", "Write commit messages in English")
+	if out := home.RenderRules(rs, true); !strings.Contains(out, "aiproxy:\n- Use pnpm") || !strings.Contains(out, "kubedl:\n- Submit jobs") || !strings.Contains(out, "(only for kubedl)") || !strings.Contains(out, "Prefer table-driven tests") {
+		t.Fatalf("--all render:\n%s", out)
+	}
+	if g := home.GlobalRulesText(); !strings.Contains(g, "commit messages in English") || strings.Contains(g, "git sha") || strings.Contains(g, "pnpm") {
+		t.Fatalf("user-level block:\n%s", g)
+	}
+
+	// Status: entries use the discovery scope (every project outside one),
+	// rules use the applicable scope, and the report says which is which.
+	st, _ := home.StatusFor(StatusOptions{})
+	if st.Scope != "all projects" || st.Total != 5 || st.Rules != 1 || st.RulesScope != "global only" || len(st.PendingRules) != 0 {
+		t.Fatalf("unscoped status: %+v", st)
+	}
+	if out := RenderStatus(st); !strings.Contains(out, "scope: all projects") || !strings.Contains(out, "rules that apply (global only): 1") {
+		t.Fatalf("status text:\n%s", out)
+	}
+	if st, _ := home.StatusFor(StatusOptions{Projects: []string{"kubedl"}}); st.Rules != 3 || st.RulesScope != "kubedl + global" {
+		t.Fatalf("-p kubedl status: %+v", st)
+	}
+	if st, _ := home.StatusFor(StatusOptions{AllProjects: true}); st.Rules != 4 || st.RulesScope != "all projects" || len(st.PendingRules) != 1 {
+		t.Fatalf("--all status: %+v", st)
+	}
+	// The automatic brief outside a project is global-scoped: the proposed
+	// rule of aiproxy is not this session's business.
+	if b := home.SessionBrief(claude); b != "" {
+		t.Fatalf("session brief outside a project: %q", b)
+	}
+	if b := openAt(t, aiproxy).SessionBrief(claude); !strings.Contains(b, "1 proposed rule(s)") {
+		t.Fatalf("session brief in aiproxy: %q", b)
+	}
+
+	// The cap: the count keeps including what the rendering leaves out.
+	for i := 0; i < maxDeliveredRules+2; i++ {
+		rule(a, fmt.Sprintf("Global habit number %03d", i), "global")
+	}
+	home = openAt(t, t.TempDir())
+	rs, _ = home.Rules(nil, false)
+	st, _ = home.StatusFor(StatusOptions{})
+	if len(rs.Global) != maxDeliveredRules || rs.Omitted != 3 || st.Rules != maxDeliveredRules+3 || st.RulesOmitted != 3 {
+		t.Fatalf("cap: delivered %d omitted %d status %d/%d", len(rs.Global), rs.Omitted, st.Rules, st.RulesOmitted)
+	}
 }

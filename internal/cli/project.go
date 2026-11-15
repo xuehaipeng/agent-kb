@@ -62,7 +62,7 @@ func (a *App) cmdUpdate(args []string) error {
 	if err != nil {
 		return err
 	}
-	a.out("%s updated to revision %d [%s]\n", n.ID, t.Revision, t.Badge())
+	a.out("%s updated to revision %d [%s]\n", n.ID, t.Revision, t.Ack())
 	if !t.Trusted() {
 		a.out("pass -e \"<evidence>\" next time to record it as verified, or confirm with 'kb verify %s --confirm -e ...'\n", n.ID)
 	}
@@ -82,6 +82,9 @@ func flagSet(f *flags, name string) bool {
 func (a *App) cmdProject(args []string) error {
 	f := newFlags("project")
 	a.globals(f)
+	var coRepo, coPath string
+	f.str(&coRepo, "", "checkout set/clear: repository identity (e.g. github.com/org/repo)", "repo")
+	f.str(&coPath, "", "checkout set: work tree to use as the baseline (default: the current one)", "path")
 	pos, err := f.parse(args)
 	if err != nil {
 		return err
@@ -152,8 +155,53 @@ func (a *App) cmdProject(args []string) error {
 		}
 		a.out("%s now belongs to project %s\n", s.RepoKey, pos[1])
 		return nil
+	case "checkout", "checkouts":
+		return a.projectCheckout(s, pos[1:], coRepo, coPath)
 	}
-	return fmt.Errorf("unknown project command %q (show|list|link)", sub)
+	return fmt.Errorf("unknown project command %q (show|list|link|checkout)", sub)
+}
+
+// projectCheckout lists a project's checkouts on this machine and sets or
+// clears which one is the baseline for code freshness. The choice is stored
+// in the gitignored registry: it never leaves this machine.
+func (a *App) projectCheckout(s *kb.Store, pos []string, repo, path string) error {
+	const usage = "usage: kb project checkout list [project] | set [project] [--repo <repo-id>] [--path <checkout>] | clear [project] [--repo <repo-id>]"
+	action := "list"
+	if len(pos) > 0 {
+		action, pos = pos[0], pos[1:]
+	}
+	project := s.Project
+	if len(pos) > 0 {
+		project = pos[0]
+	}
+	if project == "" || len(pos) > 1 {
+		return errors.New(usage + "\n(outside a project repository, name the project)")
+	}
+	switch action {
+	case "list", "ls":
+		a.out("%s", s.RenderCheckouts(project))
+		return nil
+	case "set":
+		if path == "" {
+			if path = s.CodeRoot; path == "" {
+				return errors.New("--path <checkout> is required outside a git work tree")
+			}
+		}
+		id, top, err := s.SetPreferredCheckout(project, repo, path)
+		if err != nil {
+			return err
+		}
+		a.out("baseline for %s in project %s on this machine: %s\n", id, project, top)
+		return nil
+	case "clear":
+		id, err := s.ClearPreferredCheckout(project, repo)
+		if err != nil {
+			return err
+		}
+		a.out("cleared the preferred checkout for %s in project %s\n", id, project)
+		return nil
+	}
+	return errors.New(usage)
 }
 
 func (a *App) cmdHub(args []string) error {

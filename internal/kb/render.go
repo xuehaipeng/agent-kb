@@ -91,6 +91,26 @@ func (s *Store) RenderNode(n *Node) string {
 		fmt.Fprintf(&b, " | STALE: %s", t.StaleReason)
 	}
 	b.WriteString("\n")
+	if t.CodeFreshness != "" {
+		fmt.Fprintf(&b, "code freshness: %s", freshnessLabel(t.CodeFreshness))
+		if t.FreshnessReason != "" {
+			fmt.Fprintf(&b, " - %s", t.FreshnessReason)
+		}
+		b.WriteString("\n")
+		if bl := t.Baseline; bl != nil && bl.Path != "" {
+			at := bl.Head
+			if bl.Ref != "" {
+				at = bl.Ref + " = " + bl.Head
+			}
+			fmt.Fprintf(&b, "compared with: %s at %s", bl.Path, at)
+			if bl.Repo != "" {
+				fmt.Fprintf(&b, " (%s; %s)", bl.Repo, bl.Selection)
+			} else {
+				fmt.Fprintf(&b, " (%s)", bl.Selection)
+			}
+			b.WriteString("\n")
+		}
+	}
 	if t.SupersededBy != "" {
 		fmt.Fprintf(&b, "superseded by: %s\n", t.SupersededBy)
 	}
@@ -154,6 +174,8 @@ func (s *Store) RenderNode(n *Node) string {
 		fmt.Fprintf(&b, "\n(disputed: check the code, then fix it with 'kb update %s', re-confirm with 'kb verify %s --confirm -e ...', or 'kb deprecate %s')\n", n.ID, n.ID, n.ID)
 	case t.Stale:
 		fmt.Fprintf(&b, "\n(stale: if it still holds, 'kb verify %s --confirm -e ...'; if not, 'kb update %s' or 'kb deprecate %s')\n", n.ID, n.ID, n.ID)
+	case t.CodeFreshness == FreshUnknown:
+		fmt.Fprintf(&b, "\n(unknown freshness: the code was not compared, so this is neither fresh nor stale; check it against the code before relying on it%s)\n", unknownHint(t, n))
 	case t.State == StateUnverified:
 		fmt.Fprintf(&b, "\n(unverified: treat as a lead; once checked, 'kb verify %s --confirm|--dispute -e ...')\n", n.ID)
 	}
@@ -262,7 +284,19 @@ func RenderStatus(r *StatusReport) string {
 	if len(r.StaleIDs) > 0 {
 		fmt.Fprintf(&b, " (%s)", list3(r.StaleIDs))
 	}
+	if r.Overdue > 0 {
+		fmt.Fprintf(&b, "; %d past stale_after", r.Overdue)
+	}
 	b.WriteString("\n")
+	fmt.Fprintf(&b, "code freshness: unchanged %d, changed %d, unknown %d, not applicable %d\n",
+		r.CodeFreshness[FreshUnchanged], r.CodeFreshness[FreshChanged], r.CodeFreshness[FreshUnknown], r.CodeFreshness[FreshNotApplicable])
+	if r.UnknownFreshness > 0 {
+		var why []string
+		for _, code := range sortedCounts(r.UnknownReasons) {
+			why = append(why, fmt.Sprintf("%d %s", r.UnknownReasons[code], unknownLabel(code)))
+		}
+		fmt.Fprintf(&b, "unknown freshness (not compared, not counted as stale): %s; e.g. %s (kb show <id>, kb project checkout list <project>)\n", strings.Join(why, ", "), list3(r.UnknownIDs))
+	}
 	var prod []string
 	for k, v := range r.ClaimsByProducer {
 		prod = append(prod, fmt.Sprintf("%s %d", k, v))
@@ -271,7 +305,10 @@ func RenderStatus(r *StatusReport) string {
 	if len(prod) > 0 {
 		fmt.Fprintf(&b, "claims by producer: %s\n", strings.Join(prod, ", "))
 	}
-	fmt.Fprintf(&b, "rules delivered at session start: %d", r.Rules)
+	fmt.Fprintf(&b, "rules that apply (%s): %d", r.RulesScope, r.Rules)
+	if r.RulesOmitted > 0 {
+		fmt.Fprintf(&b, " (%d beyond the delivery cap of %d)", r.RulesOmitted, maxDeliveredRules)
+	}
 	if len(r.PendingRules) > 0 {
 		fmt.Fprintf(&b, " (+%d proposed, awaiting confirmation: kb rules)", len(r.PendingRules))
 	}
@@ -312,4 +349,57 @@ func projectList(p string) []string {
 		return nil
 	}
 	return []string{p}
+}
+
+func freshnessLabel(f string) string {
+	switch f {
+	case FreshUnknown:
+		return "unknown"
+	case FreshNotApplicable:
+		return "not applicable (no code resources to compare)"
+	}
+	return f
+}
+
+func unknownLabel(code string) string {
+	switch code {
+	case UnknownNoAnchor:
+		return "without a recorded commit"
+	case UnknownNoCheckout:
+		return "not checked out on this machine"
+	case UnknownAmbiguousCo:
+		return "with several clones and no preferred checkout"
+	case UnknownAmbiguousRep:
+		return "in a multi-repository project with no established owner"
+	case UnknownAnchor:
+		return "whose anchor commit is not in the checkout"
+	case UnknownRef:
+		return "where the given ref does not resolve"
+	}
+	return code
+}
+
+// unknownHint names the one action that would make an entry comparable.
+func unknownHint(t Trust, n *Node) string {
+	switch t.FreshnessCode {
+	case UnknownAmbiguousCo:
+		return "; 'kb project checkout list " + n.Project + "' shows how to choose a baseline"
+	case UnknownNoAnchor, UnknownAnchor:
+		return "; 'kb verify " + n.ID + " --confirm -e ...' inside its repository records a commit to compare from"
+	}
+	return ""
+}
+
+func sortedCounts(m map[string]int) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Slice(keys, func(i, j int) bool {
+		if m[keys[i]] != m[keys[j]] {
+			return m[keys[i]] > m[keys[j]]
+		}
+		return keys[i] < keys[j]
+	})
+	return keys
 }

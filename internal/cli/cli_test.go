@@ -11,9 +11,29 @@ import (
 	"testing"
 )
 
+// TestMain keeps every test away from the developer's real hub and agent
+// configuration: no test may read ~/.kb or write ~/.claude, ~/.codex.
+// Tests that need a hub build one in a temp directory (hubEnv).
+func TestMain(m *testing.M) {
+	home, err := os.MkdirTemp("", "kb-cli-test-home-")
+	if err != nil {
+		panic(err)
+	}
+	os.Setenv("HOME", home)
+	os.Setenv("KB_HOME", filepath.Join(home, "no-hub"))
+	for _, k := range []string{"KB_ROOT", "KB_ACTOR", "KB_EXTRACTING", "CLAUDE_CONFIG_DIR", "CODEX_HOME"} {
+		os.Unsetenv(k)
+	}
+	code := m.Run()
+	os.RemoveAll(home)
+	os.Exit(code)
+}
+
 func setupRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
+	// Repo-mode tests must behave the same whether or not a hub exists.
+	t.Setenv("KB_HOME", filepath.Join(t.TempDir(), "no-hub"))
 	t.Setenv("GIT_AUTHOR_NAME", "t")
 	t.Setenv("GIT_AUTHOR_EMAIL", "t@t")
 	t.Setenv("GIT_COMMITTER_NAME", "t")
@@ -332,7 +352,7 @@ func TestHubEndToEnd(t *testing.T) {
 		t.Fatalf("scoped search from kubedl:\n%s", out)
 	}
 	out = must(t, "codex", "search", "idempotency", "--all")
-	if !strings.Contains(out, "aiproxy/learnings/retries-need-idempotency-keys [verified]") {
+	if !strings.Contains(out, "aiproxy/learnings/retries-need-idempotency-keys [verified,code-unchanged]") {
 		t.Fatalf("--all:\n%s", out)
 	}
 	out = must(t, "codex", "project", "list")
@@ -670,5 +690,238 @@ func TestMemoryScanForParticularProjects(t *testing.T) {
 	out = must(t, "", "extract", "--scan", "claude-memory", "--cmd", cmd)
 	if !strings.Contains(out, "-x-kubedl/memory/MEMORY.md: added 1") {
 		t.Fatalf("full scan after filtered one:\n%s", out)
+	}
+}
+
+// A populated hub: two projects with their own rules and health, a global
+// rule for everyone and one restricted to kubedl.
+func populatedHub(t *testing.T) (base, home, aiproxy, kubedl string) {
+	t.Helper()
+	base, home = hubEnv(t)
+	aiproxy = mkRemoteRepo(t, base, "aiproxy")
+	kubedl = mkRemoteRepo(t, base, "kubedl")
+	must(t, "", "hub", "init")
+	must(t, "", "install", "claude", "codex")
+	os.Chdir(aiproxy)
+	must(t, "claude-code", "add", "rule", "Use pnpm, never npm", "-d", "lockfile is pnpm-lock.yaml", "-e", "user said so")
+	must(t, "claude-code", "add", "rule", "Prefer table-driven tests", "-d", "inferred from the codebase")
+	must(t, "claude-code", "add", "learning", "Retries need idempotency keys", "-d", "Upstream jobs duplicate without keys.", "-r", "pkg/**", "-e", "reproduced in pkg/x_test.go")
+	must(t, "claude-code", "add", "rule", "Write commit messages in English", "-d", "team convention", "-e", "user said so", "--global")
+	must(t, "claude-code", "add", "rule", "Tag images with the git sha", "-d", "deploys are traced by sha", "-e", "user said so", "--global", "--for", "kubedl")
+	os.Chdir(kubedl)
+	must(t, "claude-code", "add", "rule", "Submit jobs through volcano queues", "-d", "the default queue is throttled", "-e", "user said so")
+	// aiproxy's code moves on: its learning is now stale there.
+	os.WriteFile(filepath.Join(aiproxy, "pkg", "x.go"), []byte("package pkg\n// changed\n"), 0o644)
+	git(t, aiproxy, "commit", "-qam", "change")
+	os.Chdir(base)
+	return base, home, aiproxy, kubedl
+}
+
+func TestRuleScopeOnEverySurface(t *testing.T) {
+	base, home, aiproxy, kubedl := populatedHub(t)
+	const (
+		pnpm, volcano, english, sha = "Use pnpm, never npm", "Submit jobs through volcano queues", "Write commit messages in English", "Tag images with the git sha"
+	)
+	expect := func(name, out string, want, not []string) {
+		t.Helper()
+		for _, w := range want {
+			if !strings.Contains(out, w) {
+				t.Errorf("%s: missing %q\n%s", name, w, out)
+			}
+		}
+		for _, n := range not {
+			if strings.Contains(out, n) {
+				t.Errorf("%s: must not contain %q\n%s", name, n, out)
+			}
+		}
+	}
+	hook := func(cwd string) string {
+		out, _, code := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SessionStart","cwd":"`+cwd+`"}`, "hook", "claude")
+		if code != 0 {
+			t.Fatalf("hook exit %d", code)
+		}
+		return out
+	}
+	mcpInstructions := func() string {
+		out, _, code := kbRun(t, "", `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"cursor"}}}`+"\n", "mcp")
+		if code != 0 {
+			t.Fatalf("mcp exit %d", code)
+		}
+		var m struct {
+			Result struct {
+				Instructions string `json:"instructions"`
+			} `json:"result"`
+		}
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("mcp reply: %v\n%s", err, out)
+		}
+		return m.Result.Instructions
+	}
+
+	// No recognized project: only the rules that apply everywhere, on every
+	// surface, and no health news from unrelated projects.
+	os.Chdir(base)
+	projectOnly := []string{pnpm, volcano, sha, "table-driven"}
+	out := hook(base)
+	expect("hook, no project", out, []string{english}, append(projectOnly, "stale entr", "proposed rule", "aiproxy/"))
+	expect("mcp, no project", mcpInstructions(), []string{english}, projectOnly)
+	out = must(t, "codex", "rules")
+	expect("kb rules, no project", out, []string{english, "not inside a project"}, projectOnly)
+	expect("kb rules -q, no project", must(t, "codex", "rules", "-q"), []string{english}, append(projectOnly, "not inside a project"))
+	// Explicit scopes from the same place.
+	expect("kb rules -p kubedl", must(t, "codex", "rules", "-p", "kubedl"), []string{volcano, sha, english, "kubedl:"}, []string{pnpm, "table-driven"})
+	expect("kb rules --all", must(t, "codex", "rules", "--all"), []string{pnpm, volcano, sha, english, "Prefer table-driven tests", "(only for kubedl)", "for inspection"}, nil)
+	// User-level blocks are read in every repository.
+	data, _ := os.ReadFile(filepath.Join(home, ".codex", "AGENTS.md"))
+	expect("~/.codex/AGENTS.md", string(data), []string{english}, projectOnly)
+
+	// Discovery keeps its all-project default; only the rule count narrows.
+	expect("search, no project", must(t, "codex", "search", "idempotency retries"), []string{"aiproxy/learnings/retries-need-idempotency-keys"}, nil)
+	var st struct {
+		Scope        string `json:"scope"`
+		Total        int    `json:"total"`
+		Stale        int    `json:"stale"`
+		Rules        int    `json:"rules_delivered"`
+		RulesScope   string `json:"rules_scope"`
+		RulesOmitted *int   `json:"rules_omitted_by_cap"`
+	}
+	if err := json.Unmarshal([]byte(must(t, "codex", "status", "--json")), &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.Scope != "all projects" || st.Total != 6 || st.Stale != 1 || st.Rules != 1 || st.RulesScope != "global only" || st.RulesOmitted == nil {
+		t.Fatalf("unscoped status: %+v", st)
+	}
+	expect("status, no project", must(t, "codex", "status"), []string{"scope: all projects", "knowledge: 6 active", "rules that apply (global only): 1"}, nil)
+	expect("status -p kubedl", must(t, "codex", "status", "-p", "kubedl"), []string{"rules that apply (kubedl + global): 3"}, nil)
+	expect("status --all", must(t, "codex", "status", "--all"), []string{"rules that apply (all projects): 4"}, nil)
+
+	// Recognized project: its own rules plus the global ones that apply.
+	os.Chdir(aiproxy)
+	expect("hook in aiproxy", hook(aiproxy), []string{pnpm, english, "proposed rule(s) not applied", "1 stale entr(ies) in aiproxy + global"}, []string{volcano, sha})
+	expect("mcp in aiproxy", mcpInstructions(), []string{pnpm, english}, []string{volcano, sha, "table-driven"})
+	expect("kb rules in aiproxy", must(t, "codex", "rules"), []string{pnpm, english, "Prefer table-driven tests"}, []string{volcano, sha, "not inside a project"})
+	os.Chdir(kubedl)
+	expect("hook in kubedl", hook(kubedl), []string{volcano, sha, english}, []string{pnpm, "stale entr", "proposed rule"})
+	expect("mcp in kubedl", mcpInstructions(), []string{volcano, sha, english}, []string{pnpm})
+
+	// No hub at all, outside any repository: every surface is silent.
+	t.Setenv("KB_HOME", filepath.Join(base, "absent"))
+	os.Chdir(base)
+	if out, _, code := kbRun(t, "claude-code", `{"hook_event_name":"SessionStart","cwd":"`+base+`"}`, "hook", "claude"); code != 0 || out != "" {
+		t.Fatalf("hook without a hub: %d %q", code, out)
+	}
+	if _, errs, code := kbRun(t, "codex", "", "rules"); code == 0 || !strings.Contains(errs, "no knowledge base found") {
+		t.Fatalf("kb rules without a hub: %d %q", code, errs)
+	}
+}
+
+func TestCheckoutBaselineCLI(t *testing.T) {
+	base, _, aiproxy, _ := populatedHub(t)
+	const repo = "github.com/atlascloudteam/aiproxy"
+	id := "aiproxy/learnings/retries-need-idempotency-keys"
+	real := func(p string) string { r, _ := filepath.EvalSymlinks(p); return r }
+	aiproxy = real(aiproxy)
+	search := func(args ...string) (hitJSON, map[string]any) {
+		t.Helper()
+		out := must(t, "codex", append([]string{"search", "idempotency retries", "--json", "--no-docs"}, args...)...)
+		var hits []hitJSON
+		var raw []map[string]any
+		if err := json.Unmarshal([]byte(out), &hits); err != nil || len(hits) != 1 {
+			t.Fatalf("search: %v\n%s", err, out)
+		}
+		json.Unmarshal([]byte(out), &raw)
+		return hits[0], raw[0]
+	}
+
+	// A second, independent clone that has not changed pkg/ since the anchor
+	// would give a different answer: kb must not pick between them silently.
+	os.Chdir(base)
+	h, raw := search()
+	if !h.Stale || h.CodeFreshness != "changed" || h.Baseline == nil || h.Baseline.Path != aiproxy || h.Baseline.Repo != repo || h.Baseline.Head == "" || h.Baseline.Selection != "primary worktree" {
+		t.Fatalf("single clone: %+v baseline %+v", h, h.Baseline)
+	}
+	if raw["stale"] != true || raw["stale_reason"] == nil {
+		t.Fatalf("legacy stale fields: %v", raw)
+	}
+	anchor := strings.TrimSpace(git(t, aiproxy, "rev-parse", "HEAD~1"))
+	clone := filepath.Join(base, "aiproxy-at-anchor")
+	git(t, base, "clone", "-q", aiproxy, clone)
+	git(t, clone, "remote", "set-url", "origin", "git@github.com:AtlasCloudTeam/aiproxy.git")
+	git(t, clone, "reset", "-q", "--hard", anchor)
+	clone = real(clone)
+	os.Chdir(clone)
+	must(t, "codex", "project") // running kb in it registers it
+	os.Chdir(base)
+
+	h, raw = search()
+	if h.CodeFreshness != "unknown" || h.FreshnessCode != "ambiguous_checkout" || h.Stale || !strings.Contains(h.FreshnessReason, "kb project checkout set aiproxy") {
+		t.Fatalf("two clones: %+v", h)
+	}
+	// Legacy JSON: unknown alone leaves "stale" false, i.e. absent.
+	if _, present := raw["stale"]; present {
+		t.Fatalf("unknown must not set the legacy stale field: %v", raw)
+	}
+	out := must(t, "codex", "search", "idempotency retries", "--no-docs")
+	if !strings.Contains(out, id+" [verified,unknown-freshness] ") {
+		t.Fatalf("badge:\n%s", out)
+	}
+	out = must(t, "codex", "show", id)
+	if !strings.Contains(out, "trust: verified") || !strings.Contains(out, "code freshness: unknown - 2 independent clones of "+repo) {
+		t.Fatalf("show:\n%s", out)
+	}
+	out = must(t, "codex", "status")
+	if !strings.Contains(out, "stale: 0") || !strings.Contains(out, "unknown 1") || !strings.Contains(out, "1 with several clones and no preferred checkout") {
+		t.Fatalf("status:\n%s", out)
+	}
+	out = must(t, "codex", "project", "checkout", "list", "aiproxy")
+	if !strings.Contains(out, "repo "+repo) || !strings.Contains(out, "baseline: none - 2 independent clones") || !strings.Contains(out, "kb project checkout set aiproxy --repo "+repo+" --path <checkout>") {
+		t.Fatalf("checkout list:\n%s", out)
+	}
+
+	// An explicit baseline answers the same from any directory.
+	for _, dir := range []string{base, aiproxy, clone} {
+		os.Chdir(dir)
+		if h, _ := search("--checkout", clone); h.CodeFreshness != "unchanged" || h.Stale || h.Baseline.Path != clone || h.Baseline.Selection != "explicit --checkout" {
+			t.Fatalf("--checkout clone from %s: %+v baseline %+v", dir, h, h.Baseline)
+		}
+		if h, _ := search("--checkout", aiproxy); h.CodeFreshness != "changed" || !h.Stale {
+			t.Fatalf("--checkout main from %s: %+v", dir, h)
+		}
+		if h, _ := search("--checkout", aiproxy, "--ref", "HEAD~1"); h.CodeFreshness != "unchanged" || h.Baseline.Ref != "HEAD~1" {
+			t.Fatalf("--ref from %s: %+v baseline %+v", dir, h, h.Baseline)
+		}
+	}
+	os.Chdir(base)
+	if _, errs, code := kbRun(t, "codex", "", "search", "idempotency", "--checkout", base); code == 0 || !strings.Contains(errs, "not a git work tree") {
+		t.Fatalf("--checkout outside git: %d %q", code, errs)
+	}
+
+	// A stored preference: local, validated, reversible.
+	if _, errs, code := kbRun(t, "codex", "", "project", "checkout", "set", "aiproxy", "--repo", "github.com/atlascloudteam/kubedl", "--path", clone); code == 0 || !strings.Contains(errs, "is a checkout of "+repo) {
+		t.Fatalf("wrong repo accepted: %d %q", code, errs)
+	}
+	out = must(t, "codex", "project", "checkout", "set", "aiproxy", "--repo", repo, "--path", clone)
+	if !strings.Contains(out, "baseline for "+repo+" in project aiproxy on this machine: "+clone) {
+		t.Fatalf("set: %s", out)
+	}
+	if h, _ := search(); h.CodeFreshness != "unchanged" || h.Baseline.Path != clone || h.Baseline.Selection != "preferred checkout" {
+		t.Fatalf("preferred: %+v baseline %+v", h, h.Baseline)
+	}
+	out = must(t, "codex", "project", "checkout", "list", "aiproxy")
+	if !strings.Contains(out, "(preferred)") || !strings.Contains(out, "baseline: preferred checkout") {
+		t.Fatalf("checkout list with a preference:\n%s", out)
+	}
+	// Inside a checkout, that checkout is the baseline whatever is preferred.
+	os.Chdir(aiproxy)
+	if h, _ := search(); h.CodeFreshness != "changed" || h.Baseline.Selection != "current checkout" {
+		t.Fatalf("current checkout: %+v baseline %+v", h, h.Baseline)
+	}
+	os.Chdir(base)
+	must(t, "codex", "project", "checkout", "clear", "aiproxy")
+	if h, _ := search(); h.CodeFreshness != "unknown" {
+		t.Fatalf("after clear: %+v", h)
+	}
+	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {
+		t.Fatalf("checkout preferences must stay out of the shared hub:\n%s", st)
 	}
 }
