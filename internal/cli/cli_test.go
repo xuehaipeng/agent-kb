@@ -1841,3 +1841,215 @@ func TestNativeRulesAndSubagentDelivery(t *testing.T) {
 		t.Fatalf("refresh hook not removed: %v", h)
 	}
 }
+
+// Item 6B: a memory directory is imported only when its project is
+// established; shared directories need an explicit mapping; subagent memory
+// keeps its scope; and what a scan sees is reported, with retention.
+func TestMemoryDiscoveryAndOwnership(t *testing.T) {
+	base, home := hubEnv(t)
+	aiproxy := mkRemoteRepo(t, base, "aiproxy")
+	kubedl := mkRemoteRepo(t, base, "kubedl")
+	must(t, "", "hub", "init")
+	for _, repo := range []string{aiproxy, kubedl} { // register both projects
+		os.Chdir(repo)
+		must(t, "claude-code", "add", "fact", "Seed fact for "+filepath.Base(repo), "-d", "so the project exists")
+	}
+	topic := func(name, desc, typ, body string) string {
+		return "---\nname: " + name + "\ndescription: " + desc + "\ntype: " + typ + "\n---\n\n" + body + "\n"
+	}
+	put := func(dir, name, content string) {
+		t.Helper()
+		os.MkdirAll(dir, 0o755)
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	transcript := func(dir, name, cwd string) {
+		put(dir, name, `{"type":"user","cwd":"`+cwd+`","sessionId":"`+name+`","message":{"role":"user","content":"hi"}}`+"\n")
+	}
+	claude := filepath.Join(home, ".claude")
+	// One project's directory, and one whose transcripts ran in two projects
+	// (a shared project directory name).
+	own := filepath.Join(claude, "projects", "-x-aiproxy")
+	transcript(own, "a.jsonl", aiproxy)
+	put(filepath.Join(own, "memory"), "project_one.md", topic("one", "Aiproxy deploys on Tuesdays", "project", "Releases go out every Tuesday."))
+	shared := filepath.Join(claude, "projects", "work")
+	transcript(shared, "a.jsonl", aiproxy)
+	transcript(shared, "b.jsonl", kubedl)
+	put(filepath.Join(shared, "memory"), "project_two.md", topic("two", "Shared directory note", "project", "A note from a directory two projects wrote to."))
+	// A directory a repository's own settings name; one the user-level
+	// settings name; one a session got through --settings.
+	repoMem := filepath.Join(base, "mem-kubedl")
+	put(repoMem, "project_three.md", topic("three", "Kubedl queues are per team", "project", "Each team has its own queue."))
+	put(filepath.Join(kubedl, ".claude"), "settings.json", `{"autoMemoryDirectory":"`+repoMem+`"}`)
+	userMem := filepath.Join(base, "mem-user")
+	put(userMem, "project_four.md", topic("four", "User-level directory note", "project", "A note in the directory user settings name."))
+	put(claude, "settings.json", `{"autoMemoryDirectory":"`+userMem+`","cleanupPeriodDays":210}`)
+	extraMem := filepath.Join(base, "mem-extra")
+	put(extraMem, "project_five.md", topic("five", "Extra settings directory note", "project", "A note in a directory an extra settings file names."))
+	extraSettings := filepath.Join(base, "extra-settings.json")
+	os.WriteFile(extraSettings, []byte(`{"autoMemoryDirectory":"`+extraMem+`"}`), 0o644)
+	// Subagent memory: project scope under a checkout, and user scope.
+	put(filepath.Join(aiproxy, ".claude", "agent-memory", "reviewer"), "feedback_agent.md", topic("agent", "Reviewer checks error wrapping", "feedback", "Flag errors returned without context."))
+	put(filepath.Join(claude, "agent-memory", "reviewer"), "feedback_user_agent.md", topic("user-agent", "Reviewer prefers small diffs", "feedback", "Ask for a split when a diff is large."))
+
+	os.Chdir(base)
+	scan := func(extra ...string) string {
+		t.Helper()
+		os.Chdir(base)
+		return must(t, "", append([]string{"extract", "--scan", "claude-memory", "--cmd", "/nonexistent/model"}, extra...)...)
+	}
+	out := scan()
+	for _, want := range []string{
+		"-x-aiproxy/memory [aiproxy]: 1 imported",
+		"mem-kubedl [kubedl]: 1 imported",
+		"agent-memory/reviewer [aiproxy]: 1 imported",
+		"projects/work/memory: skipped (its transcripts ran in several projects (aiproxy, kubedl), so whose memory it holds is not known",
+		"mem-user: skipped (autoMemoryDirectory in ~/.claude/settings.json is shared by every project that runs with it",
+		"~/.claude/agent-memory/reviewer: skipped (a user-level subagent's memory spans projects and is not imported as global knowledge on its own",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("scan lacks %q:\n%s", want, out)
+		}
+	}
+	for _, not := range []string{"mem-extra", "Shared directory note"} {
+		if strings.Contains(out, not) {
+			t.Errorf("scan must not mention %q yet:\n%s", not, out)
+		}
+	}
+	search := func(q string) string { os.Chdir(base); return must(t, "codex", "search", q, "--all", "--no-docs") }
+	if got := search("shared directory note user-level extra settings small diffs"); strings.Contains(got, "/facts/") || strings.Contains(got, "/conventions/") {
+		t.Errorf("a directory without an established project was imported:\n%s", got)
+	}
+	if got := search("reviewer checks error wrapping"); !strings.Contains(got, "aiproxy/conventions/reviewer-checks-error-wrapping") {
+		t.Errorf("project-scope subagent memory:\n%s", got)
+	}
+	// The directory an extra settings file names is seen only when given.
+	if out := scan("--settings", extraSettings); !strings.Contains(out, "mem-extra: skipped (autoMemoryDirectory in ") {
+		t.Errorf("--settings:\n%s", out)
+	}
+	// An explicit mapping settles ownership, on this machine only.
+	if _, errs, code := kbRun(t, "", "", "extract", "--map-root", filepath.Join(shared, "memory")+"=nosuchproject"); code == 0 || !strings.Contains(errs, "unknown project") {
+		t.Errorf("mapping to an unknown project: %d %s", code, errs)
+	}
+	if out := must(t, "", "extract", "--map-root", filepath.Join(shared, "memory")+"=kubedl", "--map-root", userMem+"=aiproxy", "--map-root", filepath.Join(claude, "agent-memory", "reviewer")+"=global"); !strings.Contains(out, "now belongs to kubedl (on this machine)") {
+		t.Errorf("--map-root:\n%s", out)
+	}
+	out = scan()
+	for _, want := range []string{"projects/work/memory [kubedl]: 1 imported", "mem-user [aiproxy]: 1 imported", "agent-memory/reviewer [global]: 1 imported"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("scan after mapping lacks %q:\n%s", want, out)
+		}
+	}
+	if got := search("shared directory note"); !strings.Contains(got, "kubedl/facts/shared-directory-note") {
+		t.Errorf("mapped directory:\n%s", got)
+	}
+	// What a scan sees, whose it is, and how far back transcripts go.
+	os.Chdir(base)
+	report := must(t, "", "extract", "--sources", "--settings", extraSettings)
+	for _, want := range []string{
+		"Claude Code config directory: ~/.claude",
+		"memory directories: 7 found, 6 with an established project, 1 not imported",
+		"-x-aiproxy/memory [auto memory, 1 file(s)] -> aiproxy: its transcripts ran in this project",
+		"mem-kubedl [auto memory, 1 file(s)] -> kubedl: named by autoMemoryDirectory in ",
+		"projects/work/memory [auto memory, 1 file(s)] -> kubedl: mapped by hand (--map-root)",
+		".claude/agent-memory/reviewer [subagent memory (project), 1 file(s)] -> aiproxy: under a checkout of aiproxy",
+		"~/.claude/agent-memory/reviewer [subagent memory (user), 1 file(s)] -> global: mapped by hand",
+		"mem-extra [auto memory, 1 file(s)] NOT IMPORTED: autoMemoryDirectory in ",
+		"transcript retention: 210 day(s) (cleanupPeriodDays in ~/.claude/settings.json)",
+		"transcripts on disk: 3, the oldest last written 0 day(s) ago",
+	} {
+		if !strings.Contains(report, want) {
+			t.Errorf("sources report lacks %q:\n%s", want, report)
+		}
+	}
+	// Removing a mapping makes the directory unowned again; its entries stay.
+	must(t, "", "extract", "--map-root", userMem+"=")
+	if out := scan(); !strings.Contains(out, "mem-user: skipped (autoMemoryDirectory in") {
+		t.Errorf("after removing a mapping:\n%s", out)
+	}
+	// Another config directory is a different set of directories.
+	alt := filepath.Join(base, "alt-config")
+	put(filepath.Join(alt, "projects", "-x-kubedl", "memory"), "project_six.md", topic("six", "Alt config note", "project", "A note under another config directory."))
+	transcript(filepath.Join(alt, "projects", "-x-kubedl"), "c.jsonl", kubedl)
+	t.Setenv("CLAUDE_CONFIG_DIR", alt)
+	if out := scan(); !strings.Contains(out, "-x-kubedl/memory [kubedl]: 1 imported") || strings.Contains(out, "-x-aiproxy") {
+		t.Errorf("CLAUDE_CONFIG_DIR:\n%s", out)
+	}
+	if rep := must(t, "", "extract", "--sources"); !strings.Contains(rep, "transcript retention: 30 day(s) (the default)") {
+		t.Errorf("default retention:\n%s", rep)
+	}
+	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {
+		t.Errorf("mappings leaked into the shared hub:\n%s", st)
+	}
+}
+
+// Local access statistics are a maintenance signal: they tell listed from
+// shown from delivered, and never change trust or remove anything.
+func TestAccessStatisticsAreOnlyASignal(t *testing.T) {
+	base, _, aiproxy, _ := populatedHub(t)
+	const learning = "aiproxy/learnings/retries-need-idempotency-keys"
+	os.Chdir(aiproxy)
+	before := must(t, "codex", "show", "--raw", learning)
+	// populatedHub's own shows and hooks aside, start from a clean record.
+	os.Remove(filepath.Join(os.Getenv("KB_HOME"), ".kb", "access.json"))
+
+	must(t, "codex", "search", "idempotency retries")
+	must(t, "codex", "search", "idempotency retries")
+	must(t, "codex", "show", learning)
+	kbRun(t, "claude-code", `{"session_id":"acc","hook_event_name":"SessionStart","cwd":"`+aiproxy+`"}`, "hook", "claude")
+	t.Setenv("KB_NO_ACCESS_LOG", "1")
+	must(t, "codex", "search", "idempotency retries") // not counted
+	t.Setenv("KB_NO_ACCESS_LOG", "")
+
+	data, _ := os.ReadFile(filepath.Join(os.Getenv("KB_HOME"), ".kb", "access.json"))
+	var acc struct {
+		Since   string `json:"since"`
+		Entries map[string]struct {
+			Listed, Shown, Delivered int
+		} `json:"entries"`
+	}
+	if err := json.Unmarshal(data, &acc); err != nil || acc.Since == "" {
+		t.Fatalf("access record: %v\n%s", err, data)
+	}
+	if e := acc.Entries[learning]; e.Listed != 2 || e.Shown != 1 || e.Delivered != 0 {
+		t.Errorf("a searched and shown learning: %+v", e)
+	}
+	if e := acc.Entries["aiproxy/conventions/use-pnpm-never-npm"]; e.Delivered != 1 || e.Shown != 0 {
+		t.Errorf("a rule pushed by the hook is delivered, not shown: %+v", e)
+	}
+	out := must(t, "codex", "status", "--access")
+	for _, want := range []string{"a maintenance signal for this machine only", "never retrieved on this machine", learning + ": last ", "listed 2, shown 1, delivered 0"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("status --access lacks %q:\n%s", want, out)
+		}
+	}
+	var st struct {
+		Total  int `json:"total"`
+		Access struct {
+			Retrieved      int      `json:"retrieved"`
+			NeverRetrieved int      `json:"never_retrieved"`
+			NeverIDs       []string `json:"never_retrieved_ids"`
+		} `json:"access"`
+		ByState map[string]int `json:"by_state"`
+	}
+	json.Unmarshal([]byte(must(t, "codex", "status", "--json")), &st)
+	if st.Access.Retrieved+st.Access.NeverRetrieved != st.Total || st.Access.NeverRetrieved == 0 || len(st.Access.NeverIDs) != st.Access.NeverRetrieved {
+		t.Errorf("status access summary: %+v", st)
+	}
+	if out := must(t, "codex", "status"); !strings.Contains(out, "never retrieved on this machine since") || !strings.Contains(out, "a maintenance hint only") {
+		t.Errorf("status text:\n%s", out)
+	}
+	// Nothing about the knowledge changed: same file, same trust, nothing
+	// expired or removed, and nothing reached the shared hub.
+	if after := must(t, "codex", "show", "--raw", learning); after != before {
+		t.Errorf("an entry changed because it was retrieved:\n%s", after)
+	}
+	os.Chdir(base)
+	if all := must(t, "codex", "status", "--all"); !strings.Contains(all, "knowledge: 6 active") || !strings.Contains(all, "deprecated 0") {
+		t.Errorf("access statistics must not retire anything:\n%s", all)
+	}
+	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {
+		t.Errorf("access statistics leaked into the shared hub:\n%s", st)
+	}
+}

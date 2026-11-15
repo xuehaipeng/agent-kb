@@ -56,6 +56,9 @@ type ImportOptions struct {
 	// AcceptConflicts settles import conflicts after a merge by hand: the
 	// entries as they are now become the baseline for their sources.
 	AcceptConflicts bool
+	// Settings names extra Claude Code settings files to read for a memory
+	// directory override (what a session got through --settings).
+	Settings []string
 }
 
 func (o ImportOptions) wants(project string) bool {
@@ -393,46 +396,6 @@ func globalOrCurrent(s *kb.Store) string {
 		return kb.GlobalProject
 	}
 	return ""
-}
-
-// claudeMemoryProject maps a ~/.claude/projects/<dir> folder to a project:
-// first from a transcript's cwd, then by matching registered checkouts.
-func claudeMemoryProject(s *kb.Store, projectDir string) (string, bool) {
-	cwd := ""
-	if ts, _ := filepath.Glob(filepath.Join(projectDir, "*.jsonl")); len(ts) > 0 {
-		for _, t := range ts {
-			if tr, err := ReadMeta(t); err == nil && tr.CWD != "" {
-				cwd = tr.CWD
-				break
-			}
-		}
-	}
-	name := filepath.Base(projectDir)
-	if cwd == "" {
-		if s.Hub {
-			// Any registered checkout of a project (a worktree has its own
-			// Claude project directory), not just the baseline one.
-			for id := range s.ProjectFiles() {
-				for _, c := range s.Checkouts(id) {
-					if claudeProjectDirName(c.Path) == name {
-						return id, true
-					}
-				}
-			}
-		} else if s.CodeRoot != "" && claudeProjectDirName(s.CodeRoot) == name {
-			return "", true
-		}
-		return "", false
-	}
-	if !s.Hub {
-		root := s.GitTop()
-		if root == "" {
-			root = s.CodeRoot
-		}
-		return "", within(root, cwd)
-	}
-	t := s.ForDir(cwd)
-	return t.Project, t.Project != ""
 }
 
 // ImportAll imports a list of sources and returns one report line each.

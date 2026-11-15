@@ -36,7 +36,7 @@ Retrieve (in a hub: current repo's project + global by default):
   kb search [query] [-f path]... [-p project] [--all] [--type t] [--trusted] [--deprecated] [--no-docs] [-n N] [--json]
                  (also lists matching sections of the repo's own docs: they are the source of truth)
   kb show <id>... [--raw]
-  kb status [--brief] [-p project] [--all] [--json]
+  kb status [--brief] [-p project] [--all] [--json] [--access]
                  search/show/status compare code with a baseline checkout: [--checkout <work tree>] [--ref <ref>] override it
   Badges: <evidence>[,code-unchanged|code-changed|unknown-freshness|code-not-applicable][,stale]
           unknown-freshness = the code could not be compared on this machine (not a pass, not stale)
@@ -96,6 +96,8 @@ Capture and integration:
                               import what agents saved in their own memory (only changed files). Claude Code's
                               typed memory files are imported without a model and tracked: an edit updates the
                               same entry, a deleted file is flagged; [--accept-conflicts] after merging by hand
+  kb extract --sources        which memory directories a scan sees, whose they are, and how far back transcripts go
+  kb extract --map-root <dir>=<project>   say whose a shared memory directory is (local; <dir>= removes it)
   kb hook claude              Claude Code hook entry point (reads hook JSON on stdin)
   kb mcp [--as actor]         stdio MCP server (kb_search, kb_show, kb_add, kb_verify, kb_review)
 
@@ -378,6 +380,7 @@ func (a *App) cmdSearch(args []string) error {
 	if err != nil {
 		return err
 	}
+	s.NoteHits(hits)
 	if asJSON {
 		out := []hitJSON{}
 		for _, h := range hits {
@@ -431,9 +434,11 @@ func (a *App) cmdShow(args []string) error {
 				return err
 			}
 			a.out("%s", data)
+			s.NoteAccess(kb.AccessShown, []string{n.ID})
 			continue
 		}
 		a.out("%s", s.RenderNode(n))
+		s.NoteAccess(kb.AccessShown, []string{n.ID})
 	}
 	return nil
 }
@@ -636,9 +641,10 @@ func (a *App) cmdDeprecate(args []string) error {
 func (a *App) cmdStatus(args []string) error {
 	f := newFlags("status")
 	a.globals(f)
-	var brief, asJSON bool
+	var brief, asJSON, access bool
 	var o kb.StatusOptions
 	f.boolean(&brief, "only what needs attention", "brief")
+	f.boolean(&access, "local access statistics: what was never or least recently retrieved here", "access")
 	f.boolean(&asJSON, "JSON output", "json")
 	f.list(&o.Projects, true, "project(s) (hub)", "p", "project")
 	f.boolean(&o.AllProjects, "every project (hub)", "all")
@@ -654,6 +660,14 @@ func (a *App) cmdStatus(args []string) error {
 		return err
 	}
 	o.Me, _ = a.actor()
+	if access {
+		out, err := s.RenderAccess(o, 20)
+		if err != nil {
+			return err
+		}
+		a.out("%s", out)
+		return nil
+	}
 	r, err := s.StatusFor(o)
 	if err != nil {
 		return err
@@ -847,6 +861,11 @@ func (a *App) cmdExtract(args []string) error {
 	f.boolean(&acceptConflicts, "memory scans: after merging a conflict by hand, take the entries as they are now", "accept-conflicts")
 	var scanProjects []string
 	f.list(&scanProjects, true, "memory scans: only these projects (hub)", "p", "project")
+	var mapRoots, settingsFiles []string
+	var sources bool
+	f.list(&mapRoots, false, "memory scans: <directory>=<project>, record whose a shared memory directory is (local)", "map-root")
+	f.list(&settingsFiles, false, "memory scans: also read this Claude Code settings file (what --settings gave a session)", "settings")
+	f.boolean(&sources, "report the memory directories a scan sees, whose they are, and transcript retention", "sources")
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
@@ -865,12 +884,26 @@ func (a *App) cmdExtract(args []string) error {
 	if cmdStr != "" {
 		command = strings.Fields(cmdStr)
 	}
+	for _, spec := range mapRoots {
+		msg, err := extract.MapRoot(s, spec)
+		if err != nil {
+			return err
+		}
+		a.out("%s\n", msg)
+	}
+	if sources {
+		a.out("%s\n", strings.Join(extract.SourcesReport(s, extract.ImportOptions{Settings: settingsFiles}), "\n"))
+		return nil
+	}
+	if len(mapRoots) > 0 && scan == "" && o.Path == "" {
+		return nil
+	}
 	if scan == "memories" || strings.HasSuffix(scan, "-memory") {
 		which := strings.TrimSuffix(scan, "-memory")
 		if scan == "memories" {
 			which = "all"
 		}
-		report := extract.ScanMemories(s, which, extract.ImportOptions{Command: command, DryRun: o.DryRun, Force: forceImport, Projects: scanProjects, Out: a.Stderr, AcceptConflicts: acceptConflicts})
+		report := extract.ScanMemories(s, which, extract.ImportOptions{Command: command, DryRun: o.DryRun, Force: forceImport, Projects: scanProjects, Out: a.Stderr, AcceptConflicts: acceptConflicts, Settings: settingsFiles})
 		a.out("%s\n", strings.Join(report, "\n"))
 		return nil
 	}

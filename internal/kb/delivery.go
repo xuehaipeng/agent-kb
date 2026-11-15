@@ -58,19 +58,20 @@ func ContextLen(s string) int {
 // Delivery is the plan for one push of rules (and brief) to one surface:
 // what is rendered, what was left out and why, against which budget.
 type Delivery struct {
-	Surface        string `json:"surface"`
-	Scope          string `json:"scope"`               // rule scope the plan was made for
-	Unit           string `json:"unit"`                // what Budget and Size count
-	Budget         int    `json:"budget"`              // ceiling for the complete payload
-	Size           int    `json:"size"`                // size of the rendered payload
-	Applicable     int    `json:"applicable"`          // trusted rules in scope, before any cap
-	Rendered       int    `json:"rendered"`            // rules in the payload
-	OmittedByCount int    `json:"omitted_by_count"`    // left out by the rule-count cap
-	OmittedBySize  int    `json:"omitted_by_size"`     // left out to fit the budget
-	Native         int    `json:"native"`              // not in this payload: delivered by the managed rules file
-	BriefLines     int    `json:"brief_lines"`         // health lines in the payload
-	BriefOmitted   int    `json:"brief_lines_omitted"` // health lines left out to fit the budget
-	Text           string `json:"-"`                   // the payload itself
+	Surface        string   `json:"surface"`
+	Scope          string   `json:"scope"`               // rule scope the plan was made for
+	Unit           string   `json:"unit"`                // what Budget and Size count
+	Budget         int      `json:"budget"`              // ceiling for the complete payload
+	Size           int      `json:"size"`                // size of the rendered payload
+	Applicable     int      `json:"applicable"`          // trusted rules in scope, before any cap
+	Rendered       int      `json:"rendered"`            // rules in the payload
+	OmittedByCount int      `json:"omitted_by_count"`    // left out by the rule-count cap
+	OmittedBySize  int      `json:"omitted_by_size"`     // left out to fit the budget
+	Native         int      `json:"native"`              // not in this payload: delivered by the managed rules file
+	BriefLines     int      `json:"brief_lines"`         // health lines in the payload
+	BriefOmitted   int      `json:"brief_lines_omitted"` // health lines left out to fit the budget
+	Text           string   `json:"-"`                   // the payload itself
+	IDs            []string `json:"-"`                   // the rules in the payload
 }
 
 // Omitted is the number of applicable rules that are not in the payload.
@@ -139,6 +140,9 @@ func (s *Store) planDelivery(surface string, budget int, prefix string, rs RuleS
 	}
 	d.Text, d.Size = text, ContextLen(text)
 	d.Rendered = nS + nG
+	for _, n := range append(append([]*Node{}, rs.Scoped[:nS]...), rs.Global[:nG]...) {
+		d.IDs = append(d.IDs, n.ID)
+	}
 	d.OmittedBySize = len(rs.Scoped) + len(rs.Global) - d.Rendered
 	d.BriefLines, d.BriefOmitted = nB, len(brief)-nB
 	return d

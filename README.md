@@ -164,6 +164,17 @@ not checked against the code. Their deadline counts from the source's own
 date, so an old note is due for a look at once, and `kb show` says what the
 date is based on.
 
+A memory directory is imported only when its project is established: from
+the project its transcripts ran in, from a repository's own settings, or from
+a subagent memory under a checkout. A shared directory (a user-level
+`autoMemoryDirectory`, user-level subagent memory, a directory several
+projects wrote to) is listed and skipped until you say whose it is:
+
+```bash
+kb extract --sources                                  # directories found, whose they are, transcript retention
+kb extract --map-root ~/shared-memory=aiproxy         # recorded on this machine only
+```
+
 An agent can also seed what it remembers about particular projects itself, in
 one call. Each item goes through the usual duplicate, doc-overlap and
 project-name checks, and is reported individually:
@@ -398,6 +409,7 @@ Reviews by the author's own model family are allowed and labelled as such.
 
 ```bash
 kb status [--all]  # scope, counts, disputes, stale and unknown-freshness entries, open reviews, unsynced changes
+kb status --access # what was never or least recently retrieved on this machine (a hint, not a verdict)
 kb lint            # schema, timestamps, links, footnotes, secrets, retired terms, index drift
 kb lint --staged   # + immutability of decisions (used by the pre-commit hook)
 kb maintain        # index + pointer refresh + lint + status; safe for cron

@@ -211,6 +211,7 @@ func (s *Store) RecordDelivery(session, agent, agentType, event string, d Delive
 		_, _ = WriteFileIfChanged(s.deliveryPath(session), data)
 	}
 	s.pruneDeliveries()
+	s.NoteAccess(AccessDelivered, d.IDs)
 }
 
 // pruneDeliveries drops session records not touched for 30 days.

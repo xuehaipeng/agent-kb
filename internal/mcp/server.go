@@ -238,6 +238,7 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 		if err != nil {
 			return "", err
 		}
+		s.Store.NoteHits(hits)
 		return s.Store.RenderHits(hits, q), nil
 	case "kb_show":
 		var a struct {
@@ -258,6 +259,7 @@ func (s *Server) call(name string, raw json.RawMessage) (string, error) {
 				continue
 			}
 			parts = append(parts, s.Store.RenderNode(n))
+			s.Store.NoteAccess(kb.AccessShown, []string{n.ID})
 		}
 		return strings.Join(parts, "\n---\n"), nil
 	case "kb_add":

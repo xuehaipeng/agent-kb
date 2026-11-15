@@ -2,6 +2,7 @@ package kb
 
 import (
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"unicode/utf8"
@@ -101,7 +102,7 @@ func TestSessionStartBudget(t *testing.T) {
 
 	// Pure: the same inputs give the same payload and the same diagnostics.
 	again, _ := openAt(t, repo).SessionStartDelivery(claude)
-	if again != d {
+	if !reflect.DeepEqual(again, d) {
 		t.Fatalf("delivery is not deterministic:\n%+v\n%+v", d, again)
 	}
 	st, err := openAt(t, repo).StatusFor(StatusOptions{Me: claude})
@@ -109,8 +110,8 @@ func TestSessionStartBudget(t *testing.T) {
 		t.Fatal(err)
 	}
 	want := d
-	want.Text = ""
-	if st.Delivery == nil || *st.Delivery != want {
+	want.Text, want.IDs = "", nil
+	if st.Delivery == nil || !reflect.DeepEqual(*st.Delivery, want) {
 		t.Fatalf("status diagnostics differ from the hook's plan:\n%+v\n%+v", st.Delivery, want)
 	}
 	// rules_delivered keeps counting applicable rules before any cap.
@@ -136,8 +137,8 @@ func TestSessionStartBudget(t *testing.T) {
 	}
 	hst, _ := home.StatusFor(StatusOptions{Me: claude})
 	hwant := hd
-	hwant.Text = ""
-	if hst.Scope != "all projects" || len(hst.PendingRules) != 0 || hst.Delivery == nil || *hst.Delivery != hwant {
+	hwant.Text, hwant.IDs = "", nil
+	if hst.Scope != "all projects" || len(hst.PendingRules) != 0 || hst.Delivery == nil || !reflect.DeepEqual(*hst.Delivery, hwant) {
 		t.Fatalf("no-project status diagnostics:\n%+v\n%+v", hst.Delivery, hwant)
 	}
 	// An explicit scope plans for that scope.

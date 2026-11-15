@@ -39,10 +39,12 @@ type StatusReport struct {
 	RulesOmitted     int            `json:"rules_omitted_by_cap"` // applicable rules the session-start delivery leaves out (count cap or size budget)
 	RulesConditional int            `json:"rules_conditional"`    // trusted rules that apply only to matching files; never in rules_delivered
 	Delivery         *Delivery      `json:"rules_delivery,omitempty"`
-	PendingRules     []string       `json:"rules_pending"`
-	Uncommitted      int            `json:"uncommitted_files"`
-	Unpushed         int            `json:"unpushed_commits"`
-	Upstream         string         `json:"upstream,omitempty"`
+	// Access is a local maintenance signal; it never affects trust.
+	Access       *AccessSummary `json:"access,omitempty"`
+	PendingRules []string       `json:"rules_pending"`
+	Uncommitted  int            `json:"uncommitted_files"`
+	Unpushed     int            `json:"unpushed_commits"`
+	Upstream     string         `json:"upstream,omitempty"`
 }
 
 // StatusOptions scopes the report.
@@ -160,6 +162,24 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 			}
 		}
 	}
+	if !o.noDelivery {
+		acc := s.LoadAccess()
+		sum := &AccessSummary{Since: acc.Since}
+		for _, n := range nodes {
+			if n.TypeKey == "review" || !inScope(n) || s.TrustStatic(n, sup).State == StateDeprecated {
+				continue
+			}
+			if acc.Entries[n.ID] != nil {
+				sum.Retrieved++
+			} else {
+				sum.NeverRetrieved++
+				sum.NeverIDs = append(sum.NeverIDs, n.ID)
+			}
+		}
+		if acc.Since != "" {
+			r.Access = sum
+		}
+	}
 	// What the SessionStart hook delivers for this rule scope, planned with
 	// the same helper and budget the hook uses. In the default scope the
 	// brief is the session's own, so the numbers are exactly the hook's.
@@ -171,7 +191,7 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 		_, native := s.NativeRulesActive()
 		native = native && len(o.Projects) == 0 && !o.AllProjects
 		d := s.planDelivery(SurfaceSessionStart, SessionStartBudget, "", *planRules, brief, native)
-		d.Text = ""
+		d.Text, d.IDs = "", nil
 		r.Delivery, r.RulesOmitted = &d, d.Omitted()
 	}
 	return r, nil

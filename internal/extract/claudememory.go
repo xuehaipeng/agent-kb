@@ -43,29 +43,6 @@ const (
 	maxTopicBytes = 6000
 )
 
-// MemoryRoot is one auto-memory directory and the project it belongs to.
-type MemoryRoot struct {
-	Dir     string
-	Agent   kb.Actor
-	Project string // hub: project id; repo mode: ""
-	Mapped  bool   // false when no project could be established for the directory
-}
-
-// ClaudeMemoryRoots lists Claude Code's auto-memory directories.
-func ClaudeMemoryRoots(s *kb.Store) []MemoryRoot {
-	var out []MemoryRoot
-	dirs, _ := filepath.Glob(filepath.Join(claudeDir(), "projects", "*", "memory"))
-	sort.Strings(dirs)
-	for _, d := range dirs {
-		if st, err := os.Stat(d); err != nil || !st.IsDir() {
-			continue
-		}
-		project, ok := claudeMemoryProject(s, filepath.Dir(d))
-		out = append(out, MemoryRoot{Dir: d, Agent: kb.Actor{Producer: "claude-code"}, Project: project, Mapped: ok})
-	}
-	return out
-}
-
 // ledger is the machine-local record of what each source file became.
 type ledger struct {
 	Version int                     `json:"version"`
@@ -303,7 +280,7 @@ func (r *rootReport) line(root MemoryRoot, dry bool) string {
 // ImportClaudeMemory imports every auto-memory directory and returns one
 // report block per directory.
 func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
-	roots := ClaudeMemoryRoots(s)
+	roots := ClaudeMemoryRoots(s, o)
 	if len(roots) == 0 {
 		return nil
 	}
@@ -320,7 +297,7 @@ func ImportClaudeMemory(s *kb.Store, o ImportOptions) []string {
 	for _, root := range roots {
 		switch {
 		case !root.Mapped:
-			report = append(report, fmt.Sprintf("%s: skipped (no project could be established for this directory; run kb inside its repository once)", displayPath(root.Dir)))
+			report = append(report, fmt.Sprintf("%s: skipped (%s)", displayPath(root.Dir), root.Why))
 			continue
 		case len(o.Projects) > 0 && !o.wants(projectOr(s, root.Project)):
 			report = append(report, fmt.Sprintf("%s: skipped (not in the selected projects)", displayPath(root.Dir)))
