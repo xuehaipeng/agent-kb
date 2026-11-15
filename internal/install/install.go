@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -429,7 +430,47 @@ var (
 	claudeDeliveryEvents = []string{"SessionStart", "SubagentStart"}
 	claudeCaptureEvents  = []string{"PreCompact", "SessionEnd"}
 	claudeRefreshEvent   = "PreToolUse"
+	claudeSummaryEvent   = "PostCompact"
 )
+
+// minSummaryVersion is the first Claude Code version whose compaction hooks
+// say which agent compacted.
+const minSummaryVersion = "2.1.323"
+
+// claudeVersion returns the installed Claude Code version: KB_CLAUDE_VERSION
+// when set, else what 'claude --version' prints.
+func claudeVersion() (string, error) {
+	if v := strings.TrimSpace(os.Getenv("KB_CLAUDE_VERSION")); v != "" {
+		return v, nil
+	}
+	out, err := exec.Command("claude", "--version").Output()
+	if err != nil {
+		return "", err
+	}
+	f := strings.Fields(string(out))
+	if len(f) == 0 {
+		return "", errors.New("'claude --version' printed nothing")
+	}
+	return f[0], nil
+}
+
+// versionAtLeast compares dotted numeric versions.
+func versionAtLeast(v, min string) bool {
+	a, b := strings.Split(v, "."), strings.Split(min, ".")
+	for i := 0; i < len(b); i++ {
+		var x, y int
+		if i < len(a) {
+			if _, err := fmt.Sscanf(a[i], "%d", &x); err != nil {
+				return false
+			}
+		}
+		fmt.Sscanf(b[i], "%d", &y)
+		if x != y {
+			return x > y
+		}
+	}
+	return true
+}
 
 const claudeHookCmd = "kb hook claude"
 
@@ -497,6 +538,7 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 	native := filepath.Join(base, "rules", "kb.md")
 	if recorded {
 		in.Capture, in.RuleRefresh, in.FileContext = cur.Capture, cur.RuleRefresh, cur.FileContext
+		in.SummaryCapture, in.SummarySteering, in.ClaudeVersion = cur.SummaryCapture, cur.SummarySteering, cur.ClaudeVersion
 		// The choice is remembered, not the place: this install writes the
 		// settings of the current Claude configuration directory, so that is
 		// where its rules file belongs. A file left in the directory of an
@@ -551,6 +593,34 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 	default:
 		return nil, fmt.Errorf("--file-context must be off, %s or %s", kb.FileContextPost, kb.FileContextPre)
 	}
+	switch opts["summary-capture"] {
+	case "on":
+		// Before 2.1.323 a subagent's compaction hooks carried no agent id,
+		// so its summary could not be told from the main session's and
+		// would be attributed to the wrong conversation.
+		v, err := claudeVersion()
+		if err != nil {
+			return nil, fmt.Errorf("summary capture needs Claude Code %s or later, and its version could not be determined (%v). Set KB_CLAUDE_VERSION if kb cannot run 'claude --version' here", minSummaryVersion, err)
+		}
+		if !versionAtLeast(v, minSummaryVersion) {
+			return nil, fmt.Errorf("summary capture needs Claude Code %s or later (found %s): earlier versions do not say whether a compaction belongs to a subagent", minSummaryVersion, v)
+		}
+		in.SummaryCapture, in.ClaudeVersion = true, v
+	case "off":
+		in.SummaryCapture, in.SummarySteering = false, false
+	}
+	switch opts["summary-steering"] {
+	case "on":
+		if !in.SummaryCapture {
+			return nil, errors.New("summary steering changes what Claude Code writes in its compaction summaries; it is only for use with --summary-capture on")
+		}
+		in.SummarySteering = true
+	case "off":
+		in.SummarySteering = false
+	}
+	if in.SummaryCapture && in.Capture != kb.CaptureFull {
+		return nil, errors.New("summary capture is capture: it cannot be on in manual capture mode (--capture full, or --summary-capture off)")
+	}
 	// The record first: RefreshPointer writes the managed rules file from it.
 	in.Updated = s.Now().UTC().Format("2006-01-02T15:04:05Z07:00")
 	rec.Claude[scope] = in
@@ -585,6 +655,11 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 		want = append(want, generic(claudeRefreshEvent)...)
 	} else {
 		drop = append(drop, generic(claudeRefreshEvent)...)
+	}
+	if in.SummaryCapture {
+		want = append(want, generic(claudeSummaryEvent)...)
+	} else {
+		drop = append(drop, generic(claudeSummaryEvent)...)
 	}
 	fc := fileContextSpecs(in.FileContext)
 	want = append(want, fc...)
@@ -621,6 +696,13 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 	}
 	if in.RuleRefresh {
 		res.Notes = append(res.Notes, "Rule refresh is on: a PreToolUse hook re-delivers the rules to an agent when they changed since it received them. It runs kb before every tool call.")
+	}
+	if in.SummaryCapture {
+		note := "Compaction summaries are captured for main sessions: PreCompact records how far the transcript goes, the summary is extracted after compaction, and it stands for that part of the transcript. If a summary does not arrive or cannot be extracted, the transcript is read at session end as before."
+		if in.SummarySteering {
+			note += " Steering is on: PreCompact asks Claude Code to keep a list of durable learnings in the summary, which changes your summaries."
+		}
+		res.Notes = append(res.Notes, note)
 	}
 	switch in.FileContext {
 	case kb.FileContextPost:

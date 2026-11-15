@@ -282,6 +282,18 @@ type Options struct {
 	Final     bool     // advance the offset even if too little content (session end)
 	DryRun    bool     // print the prompt instead of running the model
 	Out       io.Writer
+	// Resource overrides how the source is named on the entries (default
+	// "<source> session <id>"); NoMinimum extracts however short the input
+	// is. Both are for inputs that are already distilled, such as a
+	// compaction summary.
+	Resource  string
+	NoMinimum bool
+	// Whole: the input is already a distilled text (a compaction summary)
+	// and stands for something else. It reaches the model complete or not
+	// at all: it is never shortened in the middle, and one too long for a
+	// single prompt is an error, so that nothing is marked as covered by a
+	// text the model only saw part of.
+	Whole bool
 }
 
 // Result summarises an extraction run.
@@ -302,10 +314,14 @@ type Result struct {
 }
 
 type state struct {
-	Path    string `json:"path"`
-	Offset  int64  `json:"offset,omitempty"` // transcripts: bytes consumed
-	Hash    string `json:"hash,omitempty"`   // memory/rule files: content imported
-	Updated string `json:"updated"`
+	Path   string `json:"path"`
+	Offset int64  `json:"offset,omitempty"` // transcripts: bytes consumed
+	Hash   string `json:"hash,omitempty"`   // memory/rule files: content imported
+	// Covered lists ranges of a transcript taken over by another
+	// representation of the same conversation (a compaction summary), so
+	// the raw range is not sent to the model as well.
+	Covered []coveredRange `json:"covered,omitempty"`
+	Updated string         `json:"updated"`
 	// ReliesOn: entries that already said what this file says, so nothing
 	// was added for it. When one of them is narrowed or retired because
 	// its own file changed, this file has to be imported again.
@@ -330,9 +346,26 @@ func saveState(s *kb.Store, path string, off int64) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	data, _ := json.Marshal(state{Path: path, Offset: off, Updated: time.Now().UTC().Format(time.RFC3339)})
+	st := loadState(s, path) // keep what else is recorded about the source
+	st.Path, st.Offset, st.Updated = path, off, time.Now().UTC().Format(time.RFC3339)
+	data, _ := json.Marshal(st)
 	return os.WriteFile(p, data, 0o644)
 }
+
+func sourceLock(abs string) string {
+	h := sha1.Sum([]byte(abs))
+	return "extract-" + hex.EncodeToString(h[:8]) + ".lock"
+}
+
+func sourceResource(o Options) string {
+	if o.Resource != "" {
+		return o.Resource
+	}
+	return fmt.Sprintf("%s session %s", o.Source, o.SessionID)
+}
+
+// MaxWholeChars is the most a text that must be taken whole may hold.
+const MaxWholeChars = 60000
 
 // Run extracts claims from the new part of a transcript and adds them.
 func Run(s *kb.Store, o Options) (*Result, error) {
@@ -344,6 +377,16 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// One extraction at a time per source: a run that takes over part of a
+	// transcript (from a compaction summary) and the run that reads the
+	// transcript itself must not both send the same range to the model.
+	// Without the lock nothing is read: going on would let two runs send
+	// the same range to the model and overwrite each other's position.
+	unlock, lerr := s.LockLocal(sourceLock(abs))
+	if lerr != nil {
+		return nil, fmt.Errorf("another extraction of this source may be running, and its lock could not be taken (%v): nothing was read, and the next run starts where this one would have", lerr)
+	}
+	defer unlock()
 	st := loadState(s, abs)
 	var tr *Transcript
 	if strings.HasSuffix(abs, ".jsonl") {
@@ -364,8 +407,19 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 	if o.SessionID == "" {
 		o.SessionID = tr.SessionID
 	}
-	condensed := Condense(tr.Messages, 2500, 60000)
-	if len(condensed) < s.Cfg.Extract.MinChars {
+	var condensed string
+	if o.Whole {
+		for _, m := range tr.Messages {
+			condensed += strings.ToUpper(m.Role) + ": " + m.Text + "\n\n"
+		}
+		condensed = strings.TrimSpace(condensed)
+		if n := len([]rune(condensed)); n > MaxWholeChars {
+			return nil, fmt.Errorf("the text is %d characters, more than the %d one prompt takes, and it is not taken in part", n, MaxWholeChars)
+		}
+	} else {
+		condensed = Condense(tr.Messages, 2500, 60000)
+	}
+	if len(condensed) < s.Cfg.Extract.MinChars && !o.NoMinimum {
 		res.Skipped = fmt.Sprintf("only %d chars of new transcript (min %d)", len(condensed), s.Cfg.Extract.MinChars)
 		if o.Final && !o.DryRun {
 			return res, saveState(s, abs, tr.NewOffset)
@@ -436,7 +490,7 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 			Type: c.Type, Title: c.Title, Description: c.Description, Body: body,
 			Tags: c.Tags, Resources: c.Resources, Actor: o.Actor,
 			Sources: []okf.Source{{
-				ID: srcID, Resource: fmt.Sprintf("%s session %s", o.Source, o.SessionID),
+				ID: srcID, Resource: sourceResource(o),
 				Author: o.Actor.String(), LastModified: time.Now().UTC().Format(time.RFC3339),
 			}},
 		})

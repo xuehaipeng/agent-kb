@@ -213,6 +213,13 @@ also does so before an edit. Measure it first on your own cases with
 `kb bench file-context --cases cases.json`: it reports precision, recall,
 context cost and lookup time, and injects nothing.
 
+`--summary-capture on` (off by default, Claude Code 2.1.323 or later) captures
+from the summary Claude Code writes when it compacts, instead of from the
+part of the transcript before it. If a summary does not arrive or cannot be
+extracted, the transcript is read at session end as before. `--summary-steering
+on` additionally asks Claude Code to keep a list of durable learnings in its
+summaries, which changes them.
+
 Rules are instructions, so their scope is narrower than search. All of these
 surfaces select rules the same way:
 

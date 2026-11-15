@@ -41,7 +41,12 @@ type ClaudeInstall struct {
 	NativeRules string `json:"native_rules,omitempty"` // managed rules file Claude Code loads itself ("" = not used)
 	RuleRefresh bool   `json:"rule_refresh,omitempty"` // PreToolUse hook that re-delivers changed rules
 	FileContext string `json:"file_context,omitempty"` // "", FileContextPost or FileContextPre
-	Updated     string `json:"updated"`
+	// Compaction summaries as a capture source, and whether PreCompact asks
+	// Claude Code to keep durable learnings in them. Two separate choices.
+	SummaryCapture  bool   `json:"summary_capture,omitempty"`
+	SummarySteering bool   `json:"summary_steering,omitempty"`
+	ClaudeVersion   string `json:"claude_version,omitempty"` // as found when summary capture was turned on
+	Updated         string `json:"updated"`
 }
 
 func (s *Store) installPath() string { return s.LocalPath("install.json") }
@@ -87,6 +92,15 @@ func (s *Store) FileContextMode() string {
 		return in.FileContext
 	}
 	return ""
+}
+
+// SummaryCapture reports whether compaction summaries are a capture source
+// for this session's installation, and whether PreCompact steers them.
+func (s *Store) SummaryCapture() (capture, steering bool) {
+	if in := s.claudeInstallHere(); in != nil && in.Capture == CaptureFull {
+		return in.SummaryCapture, in.SummaryCapture && in.SummarySteering
+	}
+	return false, false
 }
 
 // NativeRulesText is the content of the managed rules file Claude Code
@@ -328,6 +342,11 @@ func (s *Store) RenderDeliveryDiagnostics() string {
 			fc = "off"
 		}
 		fmt.Fprintf(&b, "claude installation: capture %s; rule refresh hook %s; file context %s; hooks in %s\n", in.Capture, onOff(in.RuleRefresh), fc, in.Settings)
+		if in.SummaryCapture {
+			fmt.Fprintf(&b, "compaction summaries: captured for main sessions (Claude Code %s when turned on); steering %s. A summary stands for the part of the transcript before the compaction; subagent compactions are not captured\n", in.ClaudeVersion, onOff(in.SummarySteering))
+		} else {
+			b.WriteString("compaction summaries: not captured; PreCompact extracts from the transcript and prints nothing\n")
+		}
 	}
 	switch path, active := s.NativeRulesActive(); {
 	case path == "":

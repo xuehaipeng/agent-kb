@@ -3276,3 +3276,283 @@ func TestFileContextHook(t *testing.T) {
 		t.Errorf("off must inject nothing:\n%s", out)
 	}
 }
+
+// Item 5: compaction summaries are an opt-in capture source. A summary
+// stands for the part of the transcript before its compaction, and that
+// range is never sent to the model twice, nor lost when a summary fails.
+func TestCompactionSummaryCapture(t *testing.T) {
+	base, home := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	t.Setenv("KB_CLAUDE_VERSION", "")
+	t.Setenv("PATH", filepath.Join(base, "nobin")+string(os.PathListSeparator)+"/usr/bin"+string(os.PathListSeparator)+"/bin"+string(os.PathListSeparator)+filepath.Dir(must2(exec.LookPath("git"))))
+	must(t, "", "install", "claude")
+	t.Setenv("KB_EXTRACTING", "1") // hooks do their bookkeeping but start no background process
+	settings := filepath.Join(home, ".claude", "settings.json")
+	local := filepath.Join(os.Getenv("KB_HOME"), ".kb")
+	transcript := filepath.Join(base, "session.jsonl")
+	line := func(text string) string {
+		return `{"type":"assistant","cwd":"` + repo + `","sessionId":"s-1","message":{"role":"assistant","content":[{"type":"text","text":"` + text + `"}]}}` + "\n"
+	}
+	early := strings.Repeat("EARLY: the retry storm came from a missing jitter in the backoff helper. ", 40)
+	os.WriteFile(transcript, []byte(line(early)), 0o644)
+	hook := func(event, extra string) string {
+		t.Helper()
+		os.Chdir(repo)
+		out, _, code := kbRun(t, "claude-code", `{"session_id":"s-1","hook_event_name":"`+event+`","transcript_path":"`+transcript+`","cwd":"`+repo+`"`+extra+`}`, "hook", "claude")
+		if code != 0 {
+			t.Fatalf("hook exit %d", code)
+		}
+		return out
+	}
+	summaries := func() []string { m, _ := filepath.Glob(filepath.Join(local, "extract", "summaries", "*.md")); return m }
+	summary1 := "Durable learnings: " + strings.Repeat("the backoff helper needs jitter, see pkg/retry.go. ", 8)
+
+	// Off by default: PreCompact prints nothing (its stdout would become
+	// instructions for the summary) and a summary is not taken.
+	if out := hook("PreCompact", ""); out != "" {
+		t.Fatalf("PreCompact must print nothing by default:\n%s", out)
+	}
+	hook("PostCompact", `,"compact_summary":"`+summary1+`"`)
+	if len(summaries()) != 0 {
+		t.Fatal("a summary was queued although summary capture is off")
+	}
+
+	// Turning it on needs a Claude Code that says which agent compacted.
+	os.Chdir(base)
+	if _, errs, code := kbRun(t, "", "", "install", "claude", "--summary-steering", "on"); code == 0 || !strings.Contains(errs, "only for use with --summary-capture on") {
+		t.Fatalf("steering without capture: %d %s", code, errs)
+	}
+	if _, errs, code := kbRun(t, "", "", "install", "claude", "--summary-capture", "on"); code == 0 || !strings.Contains(errs, "its version could not be determined") {
+		t.Fatalf("unknown version must be refused: %d %s", code, errs)
+	}
+	os.MkdirAll(filepath.Join(base, "nobin"), 0o755)
+	fake := filepath.Join(base, "nobin", "claude")
+	os.WriteFile(fake, []byte("#!/bin/sh\necho '2.1.309 (Claude Code)'\n"), 0o755)
+	if _, errs, code := kbRun(t, "", "", "install", "claude", "--summary-capture", "on"); code == 0 || !strings.Contains(errs, "needs Claude Code 2.1.323 or later (found 2.1.309)") {
+		t.Fatalf("an old version must be refused: %d %s", code, errs)
+	}
+	os.WriteFile(fake, []byte("#!/bin/sh\necho '2.1.325 (Claude Code)'\n"), 0o755)
+	if _, errs, code := kbRun(t, "", "", "install", "claude", "--capture", "manual", "--summary-capture", "on"); code == 0 || !strings.Contains(errs, "cannot be on in manual capture mode") {
+		t.Fatalf("summary capture in manual mode: %d %s", code, errs)
+	}
+	out := must(t, "", "install", "claude", "--summary-capture", "on")
+	if !strings.Contains(out, "Compaction summaries are captured for main sessions") || strings.Contains(out, "Steering is on") {
+		t.Errorf("install notes:\n%s", out)
+	}
+	if data, _ := os.ReadFile(settings); !strings.Contains(string(data), "PostCompact") {
+		t.Fatalf("PostCompact hook not installed:\n%s", data)
+	}
+
+	// Capture on, steering off: PreCompact still prints nothing, and records
+	// where the compaction begins instead of extracting from the transcript.
+	if out := hook("PreCompact", ""); out != "" {
+		t.Fatalf("PreCompact must print nothing without steering:\n%s", out)
+	}
+	if _, err := os.Stat(filepath.Join(local, "extract", "compactions", "s-1.json")); err != nil {
+		t.Fatalf("compaction not recorded: %v", err)
+	}
+	must(t, "", "install", "claude", "--summary-steering", "on")
+	steer := hook("PreCompact", "")
+	if !strings.Contains(steer, "Durable learnings") || len(steer) > 600 || strings.Count(strings.TrimSpace(steer), "\n") != 0 {
+		t.Fatalf("steering must be one bounded instruction:\n%s", steer)
+	}
+	must(t, "", "install", "claude", "--summary-steering", "off")
+	must(t, "", "install", "claude") // a bare install keeps both choices
+	if out := hook("PreCompact", ""); out != "" {
+		t.Fatalf("steering off again:\n%s", out)
+	}
+	size := func() int64 { st, _ := os.Stat(transcript); return st.Size() }
+	upto1 := size()
+
+	// A subagent's summary and a summary with no recorded compaction are
+	// not taken, and say why in the log.
+	hook("PostCompact", `,"agent_id":"agent-9","agent_type":"Explore","compact_summary":"`+summary1+`"`)
+	os.Chdir(repo)
+	kbRun(t, "claude-code", `{"session_id":"other","hook_event_name":"PostCompact","transcript_path":"`+transcript+`","cwd":"`+repo+`","compact_summary":"`+summary1+`"}`, "hook", "claude")
+	if len(summaries()) != 0 {
+		t.Fatalf("unattributed summaries were queued: %v", summaries())
+	}
+	if log, _ := os.ReadFile(filepath.Join(local, "extract.log")); !strings.Contains(string(log), "subagent agent-9 not captured (main sessions only)") || !strings.Contains(string(log), "no compaction was recorded for this session before the summary arrived") {
+		t.Errorf("log:\n%s", log)
+	}
+	// The main session's summary is stored for extraction.
+	hook("PostCompact", `,"compact_summary":"`+summary1+`"`)
+	queued := summaries()
+	if len(queued) != 1 || !strings.HasSuffix(queued[0], "s-1-3.md") {
+		t.Fatalf("queued summaries: %v", queued)
+	}
+	// A model stand-in that keeps each prompt and counts its calls.
+	calls := filepath.Join(base, "calls")
+	os.MkdirAll(calls, 0o755)
+	model := filepath.Join(base, "model.sh")
+	os.WriteFile(model, []byte("#!/bin/sh\nN=$(ls '"+calls+"' | wc -l | tr -d ' ')\ncat > '"+calls+"'/$N.txt\nprintf '[{\"type\":\"learning\",\"title\":\"Learning %s from the model\",\"description\":\"Found while working on retries and backoff.\"}]' \"$N\"\n"), 0o755)
+	count := func() int { m, _ := filepath.Glob(filepath.Join(calls, "*.txt")); return len(m) }
+	extractSummary := func(file string, upto int64, n string, cmd string) (string, string, int) {
+		os.Chdir(repo)
+		return kbRun(t, "claude-code", "", "extract", "--summary", file, "--session", "s-1", "--covers", transcript, "--upto", fmt.Sprint(upto), "--compaction", n, "--cmd", cmd)
+	}
+	out, errs, code := extractSummary(queued[0], upto1, "3", model)
+	if code != 0 || !strings.Contains(out, "added 1 claim(s) from compaction summary 3") || count() != 1 {
+		t.Fatalf("summary extraction: %d\n%s\n%s", code, out, errs)
+	}
+	if p, _ := os.ReadFile(filepath.Join(calls, "0.txt")); !strings.Contains(string(p), "needs jitter") || strings.Contains(string(p), "EARLY:") {
+		t.Fatalf("the model should have seen the summary, not the transcript:\n%s", p)
+	}
+	// The entry names a summary as its source, not the conversation.
+	if show := must(t, "codex", "show", "aiproxy/learnings/learning-0-from-the-model"); !strings.Contains(show, "compaction summary 3 (a summary of part of the session, not the conversation itself)") {
+		t.Errorf("summary provenance:\n%s", show)
+	}
+	// The same summary is not extracted twice.
+	if out, _, _ := extractSummary(queued[0], upto1, "3", model); !strings.Contains(out, "skipped: this summary was already extracted") || count() != 1 {
+		t.Fatalf("repeat:\n%s", out)
+	}
+	// The transcript range the summary stands for is not sent to the model
+	// as well: its own extraction finds nothing new.
+	raw := func(cmd string) (string, string, int) {
+		os.Chdir(repo)
+		return kbRun(t, "claude-code", "", "extract", "--transcript", transcript, "--source", "claude", "--session", "s-1", "--final", "--cmd", cmd)
+	}
+	if out, _, _ := raw(model); !strings.Contains(out, "skipped") || count() != 1 {
+		t.Fatalf("the summarised range was extracted again from the transcript (%d calls):\n%s", count(), out)
+	}
+	// What comes after the compaction is still captured from the transcript.
+	late := strings.Repeat("LATE: the queue consumer must ack only after the write commits. ", 40)
+	f, _ := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.WriteString(line(late))
+	f.Close()
+	if out, _, _ := raw(model); !strings.Contains(out, "added 1 claim") || count() != 2 {
+		t.Fatalf("the part after the compaction:\n%s", out)
+	}
+	if p, _ := os.ReadFile(filepath.Join(calls, "1.txt")); !strings.Contains(string(p), "LATE:") || strings.Contains(string(p), "EARLY:") {
+		t.Fatalf("only the part after the compaction should be read:\n%s", p)
+	}
+
+	// A summary that cannot be extracted moves nothing: the transcript's own
+	// extraction then covers the range, so nothing is lost.
+	f, _ = os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+	f.WriteString(line(strings.Repeat("MIDDLE: the migration tool locks the jobs table for the whole run. ", 40)))
+	f.Close()
+	hook("PreCompact", "")
+	upto2 := size()
+	summary2 := "Durable learnings: " + strings.Repeat("the migration tool locks the jobs table, see db/migrate.go. ", 8)
+	hook("PostCompact", `,"compact_summary":"`+summary2+`"`)
+	second := filepath.Join(local, "extract", "summaries", "s-1-4.md")
+	if out, errs, code := extractSummary(second, upto2, "4", "/nonexistent/model"); code == 0 || !strings.Contains(errs, "the transcript keeps its position") {
+		t.Fatalf("a failed summary extraction must fail loudly: %d\n%s\n%s", code, out, errs)
+	}
+	if out, _, _ := raw(model); !strings.Contains(out, "added 1 claim") || count() != 3 {
+		t.Fatalf("after a failed summary the transcript must cover the range:\n%s", out)
+	}
+	if p, _ := os.ReadFile(filepath.Join(calls, "2.txt")); !strings.Contains(string(p), "MIDDLE:") {
+		t.Fatalf("the range of the failed summary was lost:\n%s", p)
+	}
+	// And once the transcript covered it, the summary is not taken as well.
+	if out, _, _ := extractSummary(second, upto2, "4", model); !strings.Contains(out, "skipped: the range this summary stands for was already extracted from the transcript") || count() != 3 {
+		t.Fatalf("raw-then-summary overlap:\n%s", out)
+	}
+	// A long summary reaches the model whole. It stands for a range of the
+	// transcript, so what is in its middle must not be dropped the way a
+	// long transcript message is shortened.
+	appendLine := func(text string) {
+		f, _ := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+		f.WriteString(line(text))
+		f.Close()
+	}
+	appendLine(strings.Repeat("THIRD: the cache was keyed without the tenant. ", 40))
+	hook("PreCompact", "")
+	upto3 := size()
+	summary3 := "Durable learnings: " + strings.Repeat("the first part talks about the deploy pipeline. ", 40) + "MIDDLEMARK the cache key must include the tenant id, see pkg/cache.go. " + strings.Repeat("the last part talks about the release notes. ", 40)
+	hook("PostCompact", `,"compact_summary":"`+summary3+`"`)
+	third := filepath.Join(local, "extract", "summaries", "s-1-5.md")
+	before := count()
+	if out, errs, code := extractSummary(third, upto3, "5", model); code != 0 || count() != before+1 {
+		t.Fatalf("long summary: %d\n%s\n%s", code, out, errs)
+	}
+	if p, _ := os.ReadFile(filepath.Join(calls, fmt.Sprint(before)+".txt")); !strings.Contains(string(p), "MIDDLEMARK the cache key must include the tenant id") || strings.Contains(string(p), "[...]") || strings.Count(string(p), "the first part talks about") != 40 {
+		t.Fatalf("the middle of a long summary did not reach the model:\n%.400s", p)
+	}
+	// One too long for a single prompt is not taken in part: it is not
+	// queued, and the transcript covers the range itself.
+	appendLine(strings.Repeat("FOURTH: the importer double-counts refunds. ", 40))
+	hook("PreCompact", "")
+	hook("PostCompact", `,"compact_summary":"`+strings.Repeat("An enormous summary that goes on and on about the refunds. ", 1100)+`"`)
+	if _, err := os.Stat(filepath.Join(local, "extract", "summaries", "s-1-6.md")); err == nil {
+		t.Fatal("a summary too long for one prompt was queued")
+	}
+	if log, _ := os.ReadFile(filepath.Join(local, "extract.log")); !strings.Contains(string(log), "the summary is longer than one prompt takes") {
+		t.Errorf("log:\n%s", log)
+	}
+	before = count()
+	if out, _, _ := raw(model); !strings.Contains(out, "added 1 claim") || count() != before+1 {
+		t.Fatalf("the range of an oversized summary must come from the transcript:\n%s", out)
+	}
+	if p, _ := os.ReadFile(filepath.Join(calls, fmt.Sprint(before)+".txt")); !strings.Contains(string(p), "FOURTH:") {
+		t.Fatalf("the range of an oversized summary was lost:\n%.300s", p)
+	}
+
+	// The next compaction can begin while a summary is still with the
+	// model. Finishing that summary must not put back the record it read
+	// before: the newer compaction's number and boundary stay.
+	appendLine(strings.Repeat("FIFTH: webhooks are retried without a signature check. ", 40))
+	hook("PreCompact", "")
+	upto5 := size()
+	summary5 := "Durable learnings: " + strings.Repeat("webhook retries must verify the signature again, see pkg/hooks.go. ", 8)
+	hook("PostCompact", `,"compact_summary":"`+summary5+`"`)
+	record := filepath.Join(local, "extract", "compactions", "s-1.json")
+	slow := filepath.Join(base, "slow-model.sh")
+	// While "the model" works, another compaction is recorded: number 99.
+	os.WriteFile(slow, []byte("#!/bin/sh\ncat > /dev/null\nsed -i.bak -e 's/\"n\": [0-9]*/\"n\": 99/' -e 's/\"upto\": [0-9]*/\"upto\": 123456789/' '"+record+"'\nprintf '[{\"type\":\"learning\",\"title\":\"Webhook retries verify the signature again\",\"description\":\"Found while working on webhooks.\"}]'\n"), 0o755)
+	if out, errs, code := extractSummary(filepath.Join(local, "extract", "summaries", "s-1-7.md"), upto5, "7", slow); code != 0 || !strings.Contains(out, "added 1 claim(s) from compaction summary 7") {
+		t.Fatalf("summary extraction during another compaction: %d\n%s\n%s", code, out, errs)
+	}
+	var rec struct {
+		N    int             `json:"n"`
+		Upto int64           `json:"upto"`
+		Done map[string]bool `json:"done"`
+	}
+	data, _ := os.ReadFile(record)
+	json.Unmarshal(data, &rec)
+	if rec.N != 99 || rec.Upto != 123456789 {
+		t.Errorf("finishing a summary overwrote a newer compaction record: n=%d upto=%d\n%s", rec.N, rec.Upto, data)
+	}
+	if len(rec.Done) < 3 {
+		t.Errorf("the finished summary was not recorded in the latest record: %v", rec.Done)
+	}
+
+	// An extraction that cannot take its source's lock reads nothing: it
+	// does not go on unsynchronised next to a run that may hold it.
+	appendLine(strings.Repeat("SIXTH: the exporter truncates timestamps to seconds. ", 40))
+	sum := sha1.Sum([]byte(transcript))
+	lock := filepath.Join(local, "extract-"+hex.EncodeToString(sum[:8])+".lock")
+	os.Remove(lock)
+	os.Mkdir(lock, 0o755) // a lock that cannot be opened
+	before = count()
+	if out, errs, code := raw(model); code == 0 || !strings.Contains(errs, "its lock could not be taken") || count() != before {
+		t.Fatalf("an extraction without its lock must stop: %d (%d model calls)\n%s\n%s", code, count()-before, out, errs)
+	}
+	os.Remove(lock)
+	if out, _, _ := raw(model); !strings.Contains(out, "added 1 claim") || count() != before+1 {
+		t.Fatalf("with the lock available again, the range is read:\n%s", out)
+	}
+	if p, _ := os.ReadFile(filepath.Join(calls, fmt.Sprint(before)+".txt")); !strings.Contains(string(p), "SIXTH:") {
+		t.Fatalf("the range of the stopped run was lost:\n%.300s", p)
+	}
+
+	os.Chdir(repo)
+	if d := must(t, "codex", "rules", "--delivery"); !strings.Contains(d, "compaction summaries: captured for main sessions (Claude Code 2.1.325 when turned on); steering off") {
+		t.Errorf("diagnostics:\n%s", d)
+	}
+	// Off again: the hook goes and PreCompact is back to the transcript.
+	must(t, "", "install", "claude", "--summary-capture", "off")
+	if data, _ := os.ReadFile(settings); strings.Contains(string(data), "PostCompact") {
+		t.Fatalf("PostCompact hook not removed:\n%s", data)
+	}
+}
+
+func must2(v string, err error) string {
+	if err != nil {
+		panic(err)
+	}
+	return v
+}

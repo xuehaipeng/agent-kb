@@ -722,6 +722,57 @@ hook-side equivalent, without writing anything into a repository.
   judged data set ships with kb, so no claim is made here that file context
   helps.
 
+### 2.18 Compaction summaries as a capture source *(issue #3 item 5, opt-in)*
+
+When Claude Code compacts, it has the whole conversation in context and
+writes a summary. Extracting from that summary avoids the problem of the
+transcript path, which keeps only a tail window of a long session. But a
+summary is a lossy, derived representation: it never replaces the
+transcript, and the same range must not reach the model twice.
+
+- **Off by default**, and two separate choices recorded per machine:
+  `--summary-capture on|off` (take summaries as a source) and
+  `--summary-steering on|off` (ask Claude Code to keep durable learnings in
+  its summaries). Steering changes the user's summaries, so it is never
+  implied by capture, and it requires capture. With both off, `PreCompact`
+  prints nothing and extracts from the transcript, exactly as before.
+- **Flow (main session).** `PreCompact` records how far the transcript goes
+  and extracts nothing. `PostCompact` stores the summary and starts
+  `kb extract --summary`. Only if that extraction succeeds is the
+  transcript's read position moved to the recorded point, with a `covered`
+  range saying a compaction summary stands for it. The entries name the
+  summary as their source and say it is a summary of part of the session.
+- **Nothing is lost, nothing is read twice.** A summary that never arrives,
+  is too short, or fails to extract moves nothing: the transcript's own
+  extraction (at session end) reads the range. A summary whose range the
+  transcript already covered is skipped. A summary already extracted is
+  skipped by its hash. Extractions of one source take a lock, so a summary
+  run and a transcript run cannot overlap; a run that cannot take the lock
+  stops without reading anything, and the next run picks the range up. A session that never compacts is
+  captured as before.
+- **Whole or not at all.** A summary is given to the model complete. It is
+  not shortened in the middle the way a long transcript message is, because
+  it stands for a range the transcript extraction will then skip. One too
+  long for a single prompt (60,000 characters) is not taken: the transcript
+  covers the range.
+- **One record per session, changed under a lock.** The next compaction can
+  begin while a summary is still with the model. Every change to the
+  session's record starts from what is on disk, so finishing a summary
+  never puts back an older compaction number or boundary.
+- **Subagents are not captured.** A subagent's summary belongs to another
+  conversation than the session's transcript. Telling the two apart needs
+  the agent id on compaction hooks, which Claude Code sends from 2.1.323.
+  Turning summary capture on is refused below that version, or when the
+  version cannot be determined (`KB_CLAUDE_VERSION` overrides detection).
+  A summary without a recorded `PreCompact` for its session is not taken
+  either. Both cases are logged.
+- **Not done here.** Issue #1 stage 3A (chunked transcript capture, a retry
+  journal) does not exist yet, so a failed summary is not retried by
+  itself: the transcript covers its range instead. Stage 3B's general
+  coverage model is not built; what is recorded is the one relation this
+  needs (a summary standing for a transcript range). None of this was
+  tested against a live compaction.
+
 ## 3. Doc C (ChatGPT plan) review
 
 **Adopted in rev 2** (also: §2.9, repo docs as the source of truth):
