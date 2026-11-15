@@ -277,9 +277,20 @@ func (s *Store) Add(in AddInput) (*AddResult, error) {
 	}
 
 	if len(supIDs) == 0 {
-		related := s.similar(in.Title+" "+in.Description, tk, project)
-		if len(related) > 0 && related[0].Score >= 0.85 && !in.Force {
-			return nil, &DuplicateError{Match: related[0]}
+		related := s.similarAll(in.Title+" "+in.Description, tk, project)
+		for _, r := range related {
+			if r.Score < 0.85 || in.Force {
+				break
+			}
+			// The same instruction for other files is not a repeat: a rule
+			// repeats one that is already delivered wherever it would be.
+			if m, err := s.Get(r.ID); err == nil && !AppliesCovers(m.Meta().AppliesTo, in.AppliesTo) {
+				continue
+			}
+			return nil, &DuplicateError{Match: r}
+		}
+		if len(related) > 3 {
+			related = related[:3]
 		}
 		for _, r := range related {
 			if r.Score >= 0.4 {
@@ -451,6 +462,10 @@ type UpdateInput struct {
 	SourceOnly      bool
 	SourceDate      time.Time
 	SourceDateBasis string
+	// AppliesTo replaces which files a rule is for when SetAppliesTo; nil
+	// makes the rule unconditional.
+	AppliesTo    *okf.Applicability
+	SetAppliesTo bool
 }
 
 // Update rewrites an entry's content as a new revision. Knowledge evolves:
@@ -467,7 +482,7 @@ func (s *Store) Update(in UpdateInput) (*Node, Trust, error) {
 	if in.Reason == "" {
 		return nil, Trust{}, errors.New("say why it changed: -m \"<reason>\"")
 	}
-	if in.Title == nil && in.Description == nil && in.Body == nil && !in.SetResources && !in.SetTags {
+	if in.Title == nil && in.Description == nil && in.Body == nil && !in.SetResources && !in.SetTags && !in.SetAppliesTo {
 		return nil, Trust{}, errors.New("nothing to update: pass -t/--title, -d, -b, -r or --tags")
 	}
 	unlock, err := s.Lock()
@@ -525,6 +540,19 @@ func (s *Store) Update(in UpdateInput) (*Node, Trust, error) {
 	}
 	if in.SetSources {
 		n.Doc.Set("sources", okf.SourcesNode(in.Sources))
+	}
+	if in.SetAppliesTo {
+		if in.AppliesTo == nil || len(in.AppliesTo.Paths) == 0 {
+			n.Doc.Delete("applies_to")
+		} else {
+			if !s.Cfg.AlwaysOn(n.TypeKey) {
+				return nil, Trust{}, fmt.Errorf("only rules can be limited to matching files; %s is a %s", n.ID, n.TypeKey)
+			}
+			if err := ValidateApplies(in.AppliesTo); err != nil {
+				return nil, Trust{}, fmt.Errorf("applies_to: %w", err)
+			}
+			n.Doc.Set("applies_to", okf.AppliesNode(in.AppliesTo))
+		}
 	}
 	rev := n.Meta().Rev() + 1
 	head := s.headFor(n.Project)
@@ -762,6 +790,15 @@ func cleanList(in []string) []string {
 // similar finds existing claims of the same type whose title+description
 // overlap the proposal (Jaccard over tokens).
 func (s *Store) similar(text, typeKey, project string) []Similar {
+	out := s.similarAll(text, typeKey, project)
+	if len(out) > 3 {
+		out = out[:3]
+	}
+	return out
+}
+
+// similarAll is similar without the cut to the closest three.
+func (s *Store) similarAll(text, typeKey, project string) []Similar {
 	q := tokenSet(text)
 	if len(q) == 0 {
 		return nil
@@ -786,9 +823,6 @@ func (s *Store) similar(text, typeKey, project string) []Similar {
 		out = append(out, Similar{ID: n.ID, Title: n.Meta().Title, Score: float64(inter) / float64(union)})
 	}
 	sortSimilar(out)
-	if len(out) > 3 {
-		out = out[:3]
-	}
 	return out
 }
 

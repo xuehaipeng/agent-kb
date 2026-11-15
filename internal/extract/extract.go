@@ -291,6 +291,9 @@ type Result struct {
 	Dupes      int
 	Documented int // claims dropped because the repo's docs already say them
 	Prompt     string
+	// Rescoped: rules from a file whose condition changed, now limited the
+	// way the file says.
+	Rescoped []string
 }
 
 type state struct {
