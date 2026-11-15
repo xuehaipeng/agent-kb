@@ -598,6 +598,43 @@ This is a maintenance signal only: it never changes trust, never expires or
 deletes anything, and says nothing about use on other machines.
 `KB_NO_ACCESS_LOG=1` turns it off.
 
+### 2.17 File context: anchored knowledge at the point of use *(issue #3 item 4, opt-in)*
+
+Entries with `resources` and conditional rules are found only if an agent
+searches by file. Claude Code's path-scoped rules solve the same problem for
+instructions by loading when a matching file is touched. File context is the
+hook-side equivalent, without writing anything into a repository.
+
+- **Off by default.** `kb install claude --file-context post|pre|off`,
+  recorded per machine. Nothing is injected, and no hook is installed,
+  unless it is turned on. It adds context to every first touch of an
+  anchored file, and that cost has to be measured before it is recommended.
+- **`post`:** a `PostToolUse` hook on Read, Edit and Write hands the agent
+  the headers of the entries anchored to the file and the rules that apply
+  only to it. It informs the work that follows. It is not a precondition of
+  the tool call that triggered it.
+- **`pre`:** additionally a `PreToolUse` hook on Edit and Write gives the
+  same context before the change. It runs kb before every edit.
+- **Context only.** Neither hook returns a permission decision.
+- **Once per agent, revision and compaction.** What an agent was given is
+  recorded with its delivery state. A second touch adds nothing; a rewritten
+  entry is given again; after the agent compacts it starts over, because its
+  summary may have dropped the headers. Another agent of the same session is
+  independent in both directions.
+- **Bounded.** One injection is at most 2,000 units, whole lines only, with a
+  count of what was left out; the next touch brings those. The lookup runs
+  synchronously under a 1.5 s limit, after which the hook says nothing.
+  Headers carry the usual badges, so stale and unknown-freshness entries are
+  labelled. Scope is the session's project plus applicable global entries.
+- **Not covered:** files reached through shell commands (`cat`, `sed`), other
+  tools, and files outside the repository. There is no asynchronous mode:
+  such context can arrive a turn late or be lost when the process ends.
+- **Benchmark first.** `kb bench file-context --cases <file>` takes judged
+  cases (`[{"file": ..., "relevant": [ids]}]`) and reports precision,
+  recall, context per injection and lookup time, without injecting or
+  recording anything. No judged data set ships with kb, so no claim is made
+  here that file context helps.
+
 ## 3. Doc C (ChatGPT plan) review
 
 **Adopted in rev 2** (also: §2.9, repo docs as the source of truth):

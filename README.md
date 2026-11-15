@@ -207,6 +207,12 @@ installs rule delivery without any capture hooks, and a later bare
 every rule itself; `--rule-refresh on` re-delivers rules that change during
 a session, at the cost of running kb before every tool call.
 
+`--file-context post` (off by default) hands Claude the headers of entries
+anchored to a file after it reads or edits that file, once per agent; `pre`
+also does so before an edit. Measure it first on your own cases with
+`kb bench file-context --cases cases.json`: it reports precision, recall,
+context cost and lookup time, and injects nothing.
+
 Rules are instructions, so their scope is narrower than search. All of these
 surfaces select rules the same way:
 

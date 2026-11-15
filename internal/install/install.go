@@ -439,6 +439,40 @@ var (
 
 const claudeHookCmd = "kb hook claude"
 
+// claudeFileHookCmd is the opt-in file-context hook. It is a command of its
+// own so that it can sit beside kb's other hook on the same event and be
+// added or removed without touching it.
+const claudeFileHookCmd = "kb hook claude file"
+
+// hookSpec is one hook entry kb owns in Claude Code's settings.
+type hookSpec struct {
+	Event, Matcher, Command string
+	Timeout                 int
+}
+
+func generic(events ...string) []hookSpec {
+	var out []hookSpec
+	for _, ev := range events {
+		out = append(out, hookSpec{Event: ev, Command: claudeHookCmd, Timeout: 30})
+	}
+	return out
+}
+
+// fileContextSpecs are the hooks of a file-context mode: after a successful
+// Read, Edit or Write ("post"), and additionally before an Edit or Write
+// ("pre"). Shell access to a file (cat, sed) goes through Bash and is not
+// covered.
+func fileContextSpecs(mode string) []hookSpec {
+	var out []hookSpec
+	if mode == kb.FileContextPost || mode == kb.FileContextPre {
+		out = append(out, hookSpec{Event: "PostToolUse", Matcher: "Read|Edit|Write", Command: claudeFileHookCmd, Timeout: 5})
+	}
+	if mode == kb.FileContextPre {
+		out = append(out, hookSpec{Event: "PreToolUse", Matcher: "Edit|Write", Command: claudeFileHookCmd, Timeout: 5})
+	}
+	return out
+}
+
 var claudeAllow = []string{"Bash(kb search:*)", "Bash(kb show:*)", "Bash(kb status:*)", "Bash(kb add:*)", "Bash(kb update:*)", "Bash(kb verify:*)", "Bash(kb deprecate:*)", "Bash(kb review:*)", "Bash(kb project:*)", "Bash(kb rules:*)"}
 
 // Claude wires Claude Code: CLAUDE.md import, skill, hooks, permissions and,
@@ -467,7 +501,7 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 	in := &kb.ClaudeInstall{Capture: kb.CaptureFull, Settings: settings}
 	recorded := cur != nil
 	if recorded {
-		in.Capture, in.NativeRules, in.RuleRefresh = cur.Capture, cur.NativeRules, cur.RuleRefresh
+		in.Capture, in.NativeRules, in.RuleRefresh, in.FileContext = cur.Capture, cur.NativeRules, cur.RuleRefresh, cur.FileContext
 	} else if s.Hub && global {
 		in.NativeRules = filepath.Join(base, "rules", "kb.md")
 	}
@@ -501,6 +535,15 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 	case "off":
 		in.RuleRefresh = false
 	}
+	switch opts["file-context"] {
+	case "":
+	case "off":
+		in.FileContext = ""
+	case kb.FileContextPost, kb.FileContextPre:
+		in.FileContext = opts["file-context"]
+	default:
+		return nil, fmt.Errorf("--file-context must be off, %s or %s", kb.FileContextPost, kb.FileContextPre)
+	}
 	// The record first: RefreshPointer writes the managed rules file from it.
 	in.Updated = s.Now().UTC().Format("2006-01-02T15:04:05Z07:00")
 	rec.Claude[scope] = in
@@ -524,17 +567,28 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 		return nil, err
 	}
 	res.changed(skill, did)
-	want := append([]string{}, claudeDeliveryEvents...)
-	var drop []string
+	want := generic(claudeDeliveryEvents...)
+	var drop []hookSpec
 	if in.Capture == kb.CaptureFull {
-		want = append(want, claudeCaptureEvents...)
+		want = append(want, generic(claudeCaptureEvents...)...)
 	} else {
-		drop = append(drop, claudeCaptureEvents...)
+		drop = append(drop, generic(claudeCaptureEvents...)...)
 	}
 	if in.RuleRefresh {
-		want = append(want, claudeRefreshEvent)
+		want = append(want, generic(claudeRefreshEvent)...)
 	} else {
-		drop = append(drop, claudeRefreshEvent)
+		drop = append(drop, generic(claudeRefreshEvent)...)
+	}
+	fc := fileContextSpecs(in.FileContext)
+	want = append(want, fc...)
+	for _, sp := range fileContextSpecs(kb.FileContextPre) { // every file-context hook not wanted now
+		wanted := false
+		for _, w := range fc {
+			wanted = wanted || w.Event == sp.Event
+		}
+		if !wanted {
+			drop = append(drop, sp)
+		}
 	}
 	did, err = mergeClaudeSettings(settings, want, drop)
 	if err != nil {
@@ -560,6 +614,12 @@ func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 	}
 	if in.RuleRefresh {
 		res.Notes = append(res.Notes, "Rule refresh is on: a PreToolUse hook re-delivers the rules to an agent when they changed since it received them. It runs kb before every tool call.")
+	}
+	switch in.FileContext {
+	case kb.FileContextPost:
+		res.Notes = append(res.Notes, "File context is on (post): after Claude reads or edits a file, kb adds the headers of entries anchored to it and the rules that apply to it, once per agent. It informs the work that follows, not the edit that triggered it. Files reached through shell commands are not covered.")
+	case kb.FileContextPre:
+		res.Notes = append(res.Notes, "File context is on (pre): as 'post', and kb also adds that context before an Edit or Write. It runs kb before every edit. Files reached through shell commands are not covered.")
 	}
 	res.Notes = append(res.Notes, "Optional MCP instead of the CLI: claude mcp add kb -- kb mcp --as claude-code")
 	return res, nil
@@ -610,10 +670,10 @@ func removeNativeRules(s *kb.Store, path string) (bool, error) {
 	return true, os.Remove(path)
 }
 
-// mergeClaudeSettings makes sure kb's hook is registered for the wanted
-// events and removes it from the dropped ones. Only entries that run kb's
-// own hook command are touched: other hooks and settings stay as they are.
-func mergeClaudeSettings(path string, want, drop []string) (bool, error) {
+// mergeClaudeSettings makes sure each wanted kb hook is registered and
+// removes each dropped one. A hook is kb's when it runs exactly that kb
+// command: other hooks and settings stay as they are.
+func mergeClaudeSettings(path string, want, drop []hookSpec) (bool, error) {
 	root := map[string]any{}
 	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) > 0 {
 		if err := json.Unmarshal(data, &root); err != nil {
@@ -624,30 +684,37 @@ func mergeClaudeSettings(path string, want, drop []string) (bool, error) {
 	if hooks == nil {
 		hooks = map[string]any{}
 	}
-	ours := func(h any) bool {
+	is := func(h any, cmd string) bool {
 		hm, _ := h.(map[string]any)
 		c, _ := hm["command"].(string)
-		return strings.HasPrefix(c, claudeHookCmd)
+		return strings.TrimSpace(c) == cmd
 	}
-	for _, ev := range want {
-		groups, _ := hooks[ev].([]any)
+	for _, sp := range want {
+		groups, _ := hooks[sp.Event].([]any)
 		present := false
 		for _, g := range groups {
 			gm, _ := g.(map[string]any)
 			hs, _ := gm["hooks"].([]any)
 			for _, h := range hs {
-				if ours(h) {
+				if is(h, sp.Command) {
 					present = true
+					if sp.Matcher != "" {
+						gm["matcher"] = sp.Matcher
+					}
 				}
 			}
 		}
 		if !present {
-			groups = append(groups, map[string]any{"hooks": []any{map[string]any{"type": "command", "command": claudeHookCmd, "timeout": 30}}})
+			g := map[string]any{"hooks": []any{map[string]any{"type": "command", "command": sp.Command, "timeout": sp.Timeout}}}
+			if sp.Matcher != "" {
+				g["matcher"] = sp.Matcher
+			}
+			groups = append(groups, g)
 		}
-		hooks[ev] = groups
+		hooks[sp.Event] = groups
 	}
-	for _, ev := range drop {
-		groups, ok := hooks[ev].([]any)
+	for _, sp := range drop {
+		groups, ok := hooks[sp.Event].([]any)
 		if !ok {
 			continue
 		}
@@ -662,14 +729,14 @@ func mergeClaudeSettings(path string, want, drop []string) (bool, error) {
 			var kept []any
 			removed := false
 			for _, h := range hs {
-				if ours(h) {
+				if is(h, sp.Command) {
 					removed = true
 					continue
 				}
 				kept = append(kept, h)
 			}
 			if removed && len(kept) == 0 {
-				continue // the group held only kb's hook
+				continue // the group held only this kb hook
 			}
 			if removed {
 				gm["hooks"] = kept
@@ -677,9 +744,9 @@ func mergeClaudeSettings(path string, want, drop []string) (bool, error) {
 			keptGroups = append(keptGroups, gm)
 		}
 		if len(keptGroups) == 0 {
-			delete(hooks, ev)
+			delete(hooks, sp.Event)
 		} else {
-			hooks[ev] = keptGroups
+			hooks[sp.Event] = keptGroups
 		}
 	}
 	root["hooks"] = hooks
