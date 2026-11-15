@@ -23,6 +23,9 @@ import (
 // FileContextBudget is the ceiling for one injection.
 const FileContextBudget = 2000
 
+// fileContextTitle bounds a title in a header line (characters).
+const fileContextTitle = 160
+
 // FileContext is one planned injection.
 type FileContext struct {
 	File    string
@@ -48,7 +51,11 @@ func (s *Store) fileMatches(rel string) ([]fileMatch, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A rule limited to the file may also be anchored to it: it is listed
+	// once, as the rule it is.
+	listed := map[string]bool{}
 	for _, n := range rules {
+		listed[n.ID] = true
 		out = append(out, fileMatch{n.ID, n.Meta().Rev(), fmt.Sprintf("- rule for this file: %s [%s]", ruleText(n), n.ID)})
 	}
 	// Every entry anchored to the file, not the first few: what was given
@@ -60,11 +67,15 @@ func (s *Store) fileMatches(rel string) ([]fileMatch, error) {
 		return nil, err
 	}
 	for _, h := range hits {
-		if h.PathMatch == "" {
+		if h.PathMatch == "" || listed[h.Node.ID] {
 			continue
 		}
+		listed[h.Node.ID] = true
 		m := h.Node.Meta()
-		out = append(out, fileMatch{h.Node.ID, m.Rev(), fmt.Sprintf("- %s [%s] %s - %s", h.Node.ID, h.Trust.Badge(), m.Title, oneLine(m.Description, 110))})
+		// A header is a pointer, not the entry: a title of any length is
+		// cut, so one line can never use up the budget and hold back
+		// itself and everything ranked after it.
+		out = append(out, fileMatch{h.Node.ID, m.Rev(), fmt.Sprintf("- %s [%s] %s - %s", h.Node.ID, h.Trust.Badge(), oneLine(m.Title, fileContextTitle), oneLine(m.Description, 110))})
 	}
 	return out, nil
 }
@@ -94,17 +105,20 @@ func renderFileContext(rel string, pre bool, ms []fileMatch) (text string, ids [
 		head = fmt.Sprintf("kb: recorded about %s, before you change it (kb show <id> for details; entries marked stale or unknown-freshness are leads to check):\n", rel)
 	}
 	more := func(n int) string { return fmt.Sprintf("(+%d more: kb search -f %s)\n", n, rel) }
+	// Lines are taken in ranked order while they fit. One that does not fit
+	// is left for a later touch and the next ones are still tried, so a
+	// long line never holds back the shorter ones behind it. Room is kept
+	// for the "+N more" line whenever something stays behind.
 	body := ""
 	for i, m := range ms {
 		next := body + m.line + "\n"
-		rest := len(ms) - i - 1
 		tail := ""
-		if rest > 0 {
+		if rest := omitted + len(ms) - i - 1; rest > 0 {
 			tail = more(rest)
 		}
 		if ContextLen(head+next+tail) > FileContextBudget {
-			omitted = len(ms) - i
-			break
+			omitted++
+			continue
 		}
 		body = next
 		ids = append(ids, m.id)

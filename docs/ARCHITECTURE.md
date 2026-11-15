@@ -680,6 +680,10 @@ hook-side equivalent, without writing anything into a repository.
   every entry anchored to the file and removes what was already given
   before the budget is applied, so repeated touches reach all of them. It
   runs synchronously under a 1.5 s limit, after which the hook says nothing.
+  A header is a pointer, not the entry: a long title is cut, and a line that
+  does not fit is left for a later touch while the ones after it are still
+  tried, so no entry can hold back the rest. A rule that is limited to the
+  file and also anchored to it is listed once, as a rule.
 - **Recorded only once handed over.** The timed lookup records nothing.
   What was given is recorded after it has been printed, so a lookup dropped
   for taking too long leaves no trace and the next touch tries again. The

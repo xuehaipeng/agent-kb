@@ -2835,8 +2835,14 @@ func TestFileContextHook(t *testing.T) {
 		}
 	}
 	// What was left out comes with the next touch, not never.
-	if next := read("s7", ""); !strings.Contains(next, "Package pitfall number") || strings.Contains(next, learning+" [") {
+	next := read("s7", "")
+	if !strings.Contains(next, "Package pitfall number") {
 		t.Errorf("the next touch should bring entries not yet given:\n%s", next)
+	}
+	for _, l := range strings.Split(next, "\n") {
+		if strings.HasPrefix(l, "- ") && strings.Contains(out, l) {
+			t.Errorf("the next touch repeated a line already given: %s", l)
+		}
 	}
 	// Repeated touches drain everything anchored to the file: the lookup
 	// is not cut to a first few that have all been given already.
@@ -2875,6 +2881,42 @@ func TestFileContextHook(t *testing.T) {
 	t.Setenv("KB_FILE_CONTEXT_TIMEOUT_MS", "")
 	if out := read("s10", ""); !strings.Contains(out, "Package pitfall number") && !strings.Contains(out, learning) {
 		t.Errorf("entries of a dropped lookup were recorded as delivered and never arrived:\n%s", out)
+	}
+
+	// A rule limited to the file that is also anchored to it is one match,
+	// listed once as the rule it is; the benchmark counts it once too.
+	must(t, "claude-code", "add", "rule", "Wrap errors with context in pkg", "-d", "callers log them", "-e", "user said so", "--when", "pkg/**", "-r", "pkg/**")
+	const wrapRule = "aiproxy/conventions/wrap-errors-with-context-in-pkg"
+	if out := read("s11", ""); strings.Count(out, wrapRule) != 1 || !strings.Contains(out, "- rule for this file: Wrap errors with context in pkg") {
+		t.Errorf("a rule that is also anchored to the file must appear once, as a rule:\n%s", out)
+	}
+	os.WriteFile(cases, []byte(`[{"file":"pkg/x.go","relevant":["`+wrapRule+`"]}]`), 0o644)
+	if bench := must(t, "codex", "bench", "file-context", "--cases", cases); !strings.Contains(bench, "relevant 1 of 1") || !strings.Contains(bench, "recall 1.00 (1 of 1 judged relevant were injected)") {
+		t.Errorf("the benchmark counted one entry twice:\n%s", bench)
+	}
+	// A title of any length is cut in a header: it cannot use up the
+	// budget and hold back itself and everything ranked after it.
+	must(t, "claude-code", "add", "learning", "Oversized "+strings.Repeat("title about the retry queue ", 120), "-d", "An entry whose title alone is longer than one injection.", "-r", "pkg/**", "-e", "read the code", "--force")
+	seen, bigLine := map[string]bool{}, ""
+	for i := 0; i < 15; i++ {
+		out := read("s12", "")
+		if out == "" {
+			break
+		}
+		for _, l := range strings.Split(out, "\n") {
+			if j := strings.Index(l, "Package pitfall number "); j >= 0 {
+				seen[l[j+len("Package pitfall number "):][:2]] = true
+			}
+			if strings.Contains(l, "] Oversized title about") {
+				bigLine = l
+			}
+		}
+	}
+	if bigLine == "" || !strings.Contains(bigLine, "…") || len(bigLine) > 600 {
+		t.Errorf("an oversized title must be delivered, cut to a header (%d bytes):\n%.200s", len(bigLine), bigLine)
+	}
+	if len(seen) != 30 || read("s12", "") != "" {
+		t.Errorf("an oversized entry held back the rest: %d of 30 delivered", len(seen))
 	}
 
 	if d := must(t, "codex", "rules", "--delivery"); !strings.Contains(d, "file context pre") {
