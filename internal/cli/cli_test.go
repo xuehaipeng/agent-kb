@@ -1651,7 +1651,11 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	file(".cursor/rules/attached.mdc", "---\ndescription: only when attached\nglobs: src/**/*.go\n---\nPrefer table-driven tests in Go files.\n")
 	file("docs/extra.md", "Run the linter before every commit.\n\n@../CLAUDE.md\n")
 	file("AGENTS.md", "Agents file content that Codex reads natively.\n")
-	file("CLAUDE.md", "# Project\n\n<!-- maintainer note: do not\n   ship this comment -->\nAlways write a changelog entry.\n\nSee @docs/extra.md and @AGENTS.md, and @types/node is a package, not a file.\n\n```html\n<!-- kept: this comment is inside a code block -->\n```\n\nSecrets: @~/outside.md\n")
+	file("CLAUDE.md", "# Project\n\n<!-- maintainer note: do not\n   ship this comment -->\nAlways write a changelog entry.\n\nSee @docs/extra.md and @AGENTS.md, and @types/node is a package, not a file.\n\n```html\n<!-- kept: this comment is inside a code block -->\n```\n\nSecrets: @~/outside.md\n\nMine: @CLAUDE.local.md and @notes/private.md\n")
+	// Personal files inside the repository: the local instruction file, and
+	// one git is told to ignore. An import must not pull them in.
+	file("notes/private.md", "My staging password hint lives in my head.\n")
+	file(".gitignore", "notes/\nCLAUDE.local.md\n")
 	// A four-backtick block showing Markdown with its own fences: the inner
 	// fences do not end it, so nothing inside is an import or a comment.
 	file("docs/example.md", "Example content that is only an illustration.\n")
@@ -1691,6 +1695,8 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 		".claude/rules/linked.md: not imported (a link to a location outside",
 		"packages/api/CLAUDE.md: not imported (a link to a location outside",
 		"CLAUDE.md: @AGENTS.md was not followed (other agents read AGENTS.md natively); @~/outside.md was not followed (it is outside",
+		"@CLAUDE.local.md was not followed (personal instructions that are not committed stay private)",
+		"@notes/private.md was not followed (git ignores it: instructions that are not committed stay private)",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("import report lacks %q:\n%s", want, out)
@@ -1716,7 +1722,7 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 			t.Errorf("CLAUDE.md prompt lacks %q:\n%s", want, p)
 		}
 	}
-	for _, not := range []string{"maintainer note", "must not be imported", "Codex reads natively", "sandbox URL"} {
+	for _, not := range []string{"maintainer note", "must not be imported", "Codex reads natively", "sandbox URL", "password hint"} {
 		if strings.Contains(p, not) {
 			t.Errorf("CLAUDE.md prompt must not contain %q:\n%s", not, p)
 		}

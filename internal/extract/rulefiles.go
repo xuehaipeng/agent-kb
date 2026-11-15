@@ -461,6 +461,10 @@ func expandImports(s *kb.Store, text, dir, boundary string, seen map[string]bool
 				*notes = append(*notes, "@"+ref+" was not followed (other agents read AGENTS.md natively)")
 			case !within(boundary, target):
 				*notes = append(*notes, "@"+ref+" was not followed (it is outside "+displayPath(boundary)+")")
+			case personalFile(ref, target) != "":
+				// Left out of discovery, so left out here too: what an
+				// import pulls in is shared like the file that imports it.
+				*notes = append(*notes, "@"+ref+" was not followed ("+personalFile(ref, target)+")")
 			case seen[target]:
 				// already included, or an import cycle
 			case depth >= maxImportDepth:
@@ -486,6 +490,19 @@ func expandImports(s *kb.Store, text, dir, boundary string, seen map[string]bool
 		return text
 	}
 	return strings.TrimRight(text, "\n") + "\n\n" + strings.Join(extra, "\n\n")
+}
+
+// personalFile says why a file holds personal instructions that must not be
+// shared, or "" when it does not: Claude Code's local instruction file, or
+// a file git is told to ignore (never committed, so never the team's).
+func personalFile(ref, target string) string {
+	if filepath.Base(target) == "CLAUDE.local.md" || filepath.Base(ref) == "CLAUDE.local.md" {
+		return "personal instructions that are not committed stay private"
+	}
+	if _, err := kb.Git(filepath.Dir(target), "check-ignore", "-q", "--", target); err == nil {
+		return "git ignores it: instructions that are not committed stay private"
+	}
+	return ""
 }
 
 // resolveImport returns the real path of an imported file, or "".

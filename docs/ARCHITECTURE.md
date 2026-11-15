@@ -502,6 +502,7 @@ applies_to:
 | a pattern kb cannot match exactly | not imported |
 | Cursor rule that is not `alwaysApply: true`, other agents' `globs`/`trigger` | not imported: kb cannot reproduce that condition |
 | `CLAUDE.local.md` | not imported: personal, uncommitted instructions stay private |
+| an `@path` import of `CLAUDE.local.md`, or of a file git ignores | not followed, for the same reason |
 | a link or `@path` import leaving the repository (or `~/.claude` for user files) | not followed |
 | a repository instruction file that is itself a link to somewhere outside it (a nested `CLAUDE.md` included) | not imported |
 | `@AGENTS.md` | not followed: other agents read it natively |
