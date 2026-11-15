@@ -2008,6 +2008,36 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 		t.Errorf("a rule another file still states was lost when its first source became unsupported:\n%s", got)
 	}
 
+	// A file drops its condition and replaces what it says. The rule it
+	// no longer states keeps its condition: it does not become always-on
+	// because the file's new, unrelated text applies everywhere. (This
+	// stand-in names a rule after the file's last line.)
+	echo := filepath.Join(base, "echo-model.sh")
+	os.WriteFile(echo, []byte("#!/bin/sh\nT=$(cat | sed '/^$/d' | tail -1)\nprintf '[{\"title\":\"%s\",\"description\":\"taken from the file\"}]' \"$T\"\n"), 0o755)
+	file(".claude/rules/swap.md", "---\npaths: \"src/payments/**\"\n---\nRound payment amounts with the bankers rule.\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", echo); !strings.Contains(out, ".claude/rules/swap.md: added 1") {
+		t.Fatalf("first import of the swapped file:\n%s", out)
+	}
+	file(".claude/rules/swap.md", "Prefer small pull requests over large ones.\n")
+	out = must(t, "", "rules", "import", "--repo", "--cmd", echo)
+	if !strings.Contains(out, ".claude/rules/swap.md: added 1") || strings.Contains(out, "swap.md: its condition changed") {
+		t.Errorf("a file that drops its condition and replaces its text:\n%s", out)
+	}
+	always := must(t, "codex", "rules", "-q")
+	if strings.Contains(always, "Round payment amounts") || !strings.Contains(always, "Prefer small pull requests over large ones") {
+		t.Errorf("a rule the file no longer states was made always-on, or the new one is missing:\n%s", always)
+	}
+	if got := forFile("src/payments/charge.go"); !strings.Contains(got, "Round payment amounts with the bankers rule") {
+		t.Errorf("the earlier rule should keep the condition it had:\n%s", got)
+	}
+	// The same file narrowed again while still stating its rule: the rule
+	// it states follows, and the prompt asks for it by name.
+	file(".claude/rules/swap.md", "---\npaths: \"docs/**\"\n---\nPrefer small pull requests over large ones.\n")
+	must(t, "", "rules", "import", "--repo", "--cmd", script)
+	if p := read("rules-swap.md"); !strings.Contains(p, "This file gave these rules earlier, when it applied to other files than it does now.") || !strings.Contains(p, "- Prefer small pull requests over large ones\n") {
+		t.Errorf("the prompt must name the rules whose condition has to follow the file:\n%s", p)
+	}
+
 	// A path-scoped file named on the command line has no known base.
 	if out := must(t, "", "rules", "import", filepath.Join(repo, ".claude", "rules", "api.md"), "--cmd", script); !strings.Contains(out, "its base directory is unknown here") {
 		t.Errorf("explicit path-scoped file:\n%s", out)

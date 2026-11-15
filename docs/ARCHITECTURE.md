@@ -489,7 +489,8 @@ applies_to:
   directories; a bare name matches at any depth; a leading `/` anchors to the
   base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work,
   and a bracket expression, negated or not, stays within one path segment
-  (one whose range takes in `/`, such as `[.-0]`, is refused). A
+  (one whose range takes in `/`, such as `[.-0]`, is refused), and `\`
+  inside brackets makes the next character literal (`[a\-z]`). A
   pattern that cannot be matched exactly is an error and matches nothing. It
   is never widened.
 
@@ -520,9 +521,12 @@ stays one block. Everything left out is listed as a `note:` line.
 
 **The condition is part of what was imported.** A file's condition lives in
 frontmatter (or in where the file is), not in the text sent to the model, so
-the import's change detection covers both. When only the condition changes,
-the rules the file gave earlier (found by their `sources`) take the new
-condition as a new revision; a rule that was in force stays in force.
+the import's change detection covers both. When the condition changes, the
+rules the file gave earlier (found by their `sources`) are named in the
+prompt, and each one the file still states takes the new condition as a new
+revision; a rule that was in force stays in force. A rule the file no longer
+states keeps the condition it has: a file that drops its `paths` and
+replaces its text does not make its old, narrower rule apply everywhere.
 Two cases never widen a rule. A file that was emptied states no condition,
 so the rules it gave keep theirs. A file whose condition becomes one kb
 cannot reproduce (an always-on Cursor rule given `globs`, a pattern that

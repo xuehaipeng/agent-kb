@@ -149,17 +149,26 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		}
 		return res, nil
 	}
-	if src.Kind == KindRules && !o.DryRun {
-		// The file says which files its rules are for. Rules it gave
-		// earlier follow a changed condition before anything is added.
-		rescoped, err := reconcileApplies(s, src, srcID, o)
+	// Rules this file gave earlier under another condition than it has now.
+	// A changed condition applies to what the file still states, and only
+	// to that: a rule the file no longer contains keeps the condition it
+	// has, so dropping a file's condition while replacing its text cannot
+	// turn the old, narrower rule into one that applies everywhere. Which
+	// rules it still states is known once the model has read the file, so
+	// they are named in the prompt and matched against what comes back.
+	var moved []*kb.Node
+	if src.Kind == KindRules {
+		own, err := rulesFrom(s, src, o)
 		if err != nil {
 			return nil, err
 		}
-		res.Rescoped = rescoped
-		res.Reimport = forgetDependents(s, rescoped, abs)
+		for _, n := range own {
+			if !kb.SameApplies(n.Meta().AppliesTo, src.Applies) {
+				moved = append(moved, n)
+			}
+		}
 	}
-	prompt := importPrompt(s, src, content)
+	prompt := importPrompt(s, src, content, moved)
 	if filtered {
 		prompt = strings.Replace(prompt, "\nFile ", fmt.Sprintf("\nOnly extract notes about these projects: %s. Ignore everything else.\n\nFile ", strings.Join(o.Projects, ", ")), 1)
 	}
@@ -237,6 +246,23 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		} else {
 			in.Body = in.Description + fmt.Sprintf(" [^%s]", srcID)
 		}
+		// The file still states a rule it gave earlier: that rule takes
+		// the file's present condition, and nothing new is added for it.
+		if n := stillStated(moved, in.Title+" "+in.Description); n != nil {
+			if err := rescope(s, src, n, sourceDate); err != nil {
+				return nil, err
+			}
+			res.Dupes++
+			res.Rescoped = append(res.Rescoped, n.ID)
+			var rest []*kb.Node
+			for _, m := range moved {
+				if m != n {
+					rest = append(rest, m)
+				}
+			}
+			moved = rest
+			continue
+		}
 		if src.Kind == KindMemory {
 			if ms := s.DocCoverage(projectOr(s, project), c.Title+" "+c.Description); len(ms) > 0 && ms[0].Coverage >= kb.DocWarnCoverage {
 				res.Documented++
@@ -263,6 +289,9 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 			res.Added = append(res.Added, r.Node.ID)
 		}
 	}
+	// Files that relied on a rule this file just re-scoped state it too,
+	// perhaps for other files: they are read again.
+	res.Reimport = forgetDependents(s, res.Rescoped, abs)
 	if filtered {
 		return res, nil
 	}
@@ -328,44 +357,38 @@ func retireFrom(s *kb.Store, src FileSource, o ImportOptions) ([]string, error) 
 	return out, nil
 }
 
-// reconcileApplies gives the rules a file produced earlier the condition
-// the file has now. It returns the entries it changed.
-func reconcileApplies(s *kb.Store, src FileSource, srcID string, o ImportOptions) ([]string, error) {
-	rules, err := rulesFrom(s, src, o)
-	if err != nil {
-		return nil, err
-	}
-	resource := displayPath(src.Path)
-	var stale []*kb.Node
-	for _, n := range rules {
-		if !kb.SameApplies(n.Meta().AppliesTo, src.Applies) {
-			stale = append(stale, n)
+// stillStated finds, among the rules a file gave earlier, the one a claim
+// from the file as it is now restates.
+func stillStated(earlier []*kb.Node, text string) *kb.Node {
+	var best *kb.Node
+	score := 0.85 // the same bar a duplicate has to pass
+	for _, n := range earlier {
+		m := n.Meta()
+		if sim := kb.Similarity(text, m.Title+" "+m.Description); sim >= score {
+			best, score = n, sim
 		}
 	}
-	var date time.Time
-	if st, err := os.Stat(src.Path); err == nil {
-		date = st.ModTime().UTC()
+	return best
+}
+
+// rescope gives a rule the condition its file has now.
+func rescope(s *kb.Store, src FileSource, n *kb.Node, date time.Time) error {
+	reason := "its rule file no longer limits it to particular files"
+	if src.Applies != nil && len(src.Applies.Paths) > 0 {
+		reason = "its rule file now applies " + kb.AppliesNote(src.Applies)
 	}
-	var out []string
-	for _, n := range stale {
-		reason := "its rule file no longer limits it to particular files"
-		if src.Applies != nil && len(src.Applies.Paths) > 0 {
-			reason = "its rule file now applies " + kb.AppliesNote(src.Applies)
-		}
-		// The condition is the user's own, like the rule: a rule in force
-		// stays in force instead of waiting for a confirmation. One that was
-		// not trusted before is not confirmed by a change of its condition.
-		evidence := ""
-		if s.Trust(n).Trusted() {
-			evidence = fmt.Sprintf("user rule written for %s in %s", src.Agent.Producer, resource)
-		}
-		if _, _, err := s.Update(kb.UpdateInput{Ref: n.ID, Reason: reason, Actor: src.Agent, AppliesTo: src.Applies, SetAppliesTo: true, Evidence: evidence,
-			SourceOnly: true, SourceDate: date, SourceDateBasis: kb.BasisSourceMtime}); err != nil {
-			return out, fmt.Errorf("%s: %w", n.ID, err)
-		}
-		out = append(out, n.ID)
+	// The condition is the user's own, like the rule: a rule in force
+	// stays in force instead of waiting for a confirmation. One that was
+	// not trusted before is not confirmed by a change of its condition.
+	evidence := ""
+	if s.Trust(n).Trusted() {
+		evidence = fmt.Sprintf("user rule written for %s in %s", src.Agent.Producer, displayPath(src.Path))
 	}
-	return out, nil
+	if _, _, err := s.Update(kb.UpdateInput{Ref: n.ID, Reason: reason, Actor: src.Agent, AppliesTo: src.Applies, SetAppliesTo: true, Evidence: evidence,
+		SourceOnly: true, SourceDate: date, SourceDateBasis: kb.BasisSourceMtime}); err != nil {
+		return fmt.Errorf("%s: %w", n.ID, err)
+	}
+	return nil
 }
 
 func projectOr(s *kb.Store, p string) string {
@@ -375,7 +398,7 @@ func projectOr(s *kb.Store, p string) string {
 	return p
 }
 
-func importPrompt(s *kb.Store, src FileSource, content string) string {
+func importPrompt(s *kb.Store, src FileSource, content string, moved []*kb.Node) string {
 	var b strings.Builder
 	agent := src.Agent.Producer
 	projectField := ""
@@ -426,6 +449,14 @@ Return ONLY a JSON array (no prose, no code fence) of at most %d objects shaped 
 		b.WriteString("\nExisting entries:\n")
 		for _, t := range titles {
 			b.WriteString("- " + t + "\n")
+		}
+	}
+	if len(moved) > 0 {
+		// Without this the "do not repeat" rule above would hide exactly
+		// the rules whose condition has to follow the file.
+		b.WriteString("\nThis file gave these rules earlier, when it applied to other files than it does now. Return every one of them that the file still states, with its title unchanged; leave out the ones it no longer states:\n")
+		for _, n := range moved {
+			b.WriteString("- " + n.Meta().Title + "\n")
 		}
 	}
 	fmt.Fprintf(&b, "\nFile %s:\n\n%s\n", displayPath(src.Path), content)
