@@ -260,13 +260,13 @@ func prepareRuleFile(s *kb.Store, p rulePrep) (*FileSource, string) {
 			paths, cond, why := ruleCondition(p.agent, fm)
 			switch {
 			case why != "":
-				return nil, label + ": not imported (" + why + ")"
+				return unsupported(p, why), label + ": not imported (" + why + ")"
 			case cond && p.base == "\x00unknown":
 				return nil, label + ": not imported (it is path-scoped, and its base directory is unknown here: import it from its repository with 'kb rules import --repo')"
 			case cond:
 				applies = &okf.Applicability{Paths: paths, Base: p.base, Origin: kb.OriginClaudeRules}
 				if err := kb.ValidateApplies(applies); err != nil {
-					return nil, fmt.Sprintf("%s: not imported (%v; importing it without the condition would widen it)", label, err)
+					return unsupported(p, err.Error()), fmt.Sprintf("%s: not imported (%v; importing it without the condition would widen it)", label, err)
 				}
 			}
 			text = body
@@ -283,6 +283,13 @@ func prepareRuleFile(s *kb.Store, p rulePrep) (*FileSource, string) {
 		note = label + ": " + strings.Join(uniqueStrings(notes), "; ")
 	}
 	return src, note
+}
+
+// unsupported is a rule file that is not imported because of a condition kb
+// cannot reproduce. It stays a source so that what it gave before can be
+// retired (see ImportFile).
+func unsupported(p rulePrep, why string) *FileSource {
+	return &FileSource{Path: p.path, Kind: KindRules, Agent: kb.Actor{Producer: p.agent}, Project: p.project, Unsupported: why}
 }
 
 // splitFrontmatter separates YAML frontmatter from the body.
@@ -431,10 +438,51 @@ func stripBlockComments(text string) string {
 	return strings.Join(out, "\n")
 }
 
-var (
-	importRe   = regexp.MustCompile("(?:^|[\\s(])@((?:\\\\ |[^\\s`'\"()<>])+)")
-	codeSpanRe = regexp.MustCompile("`[^`]*`")
-)
+var importRe = regexp.MustCompile("(?:^|[\\s(])@((?:\\\\ |[^\\s`'\"()<>])+)")
+
+// stripCodeSpans removes inline code from a line, as Markdown delimits it:
+// a run of backticks opens a span that ends at the next run of the same
+// length, so a span opened by two backticks may hold single ones. A run
+// with no matching run after it is ordinary text.
+func stripCodeSpans(l string) string {
+	var out strings.Builder
+	for i := 0; i < len(l); {
+		if l[i] != '`' {
+			out.WriteByte(l[i])
+			i++
+			continue
+		}
+		n := 0
+		for i+n < len(l) && l[i+n] == '`' {
+			n++
+		}
+		// Look for a closing run of exactly n backticks.
+		end := -1
+		for j := i + n; j < len(l); {
+			if l[j] != '`' {
+				j++
+				continue
+			}
+			m := 0
+			for j+m < len(l) && l[j+m] == '`' {
+				m++
+			}
+			if m == n {
+				end = j + m
+				break
+			}
+			j += m
+		}
+		if end < 0 {
+			out.WriteString(l[i : i+n])
+			i += n
+			continue
+		}
+		out.WriteByte(' ')
+		i = end
+	}
+	return out.String()
+}
 
 // expandImports appends the files a text imports with @path, the way Claude
 // Code loads them next to the importing file. Only existing files inside the
@@ -446,7 +494,7 @@ func expandImports(s *kb.Store, text, dir, boundary string, seen map[string]bool
 		if fence.line(l) || fence.open() {
 			continue
 		}
-		for _, m := range importRe.FindAllStringSubmatch(codeSpanRe.ReplaceAllString(l, ""), -1) {
+		for _, m := range importRe.FindAllStringSubmatch(stripCodeSpans(l), -1) {
 			ref := strings.ReplaceAll(m[1], `\ `, " ")
 			target := resolveImport(ref, dir)
 			if target == "" {
@@ -464,6 +512,10 @@ func expandImports(s *kb.Store, text, dir, boundary string, seen map[string]bool
 				*notes = append(*notes, "@"+ref+" was not followed (other agents read AGENTS.md natively)")
 			case !within(boundary, target):
 				*notes = append(*notes, "@"+ref+" was not followed (it is outside "+displayPath(boundary)+")")
+			case personalFile(ref, target) != "":
+				// Left out of discovery, so left out here too: what an
+				// import pulls in is shared like the file that imports it.
+				*notes = append(*notes, "@"+ref+" was not followed ("+personalFile(ref, target)+")")
 			case seen[target]:
 				// already included, or an import cycle
 			case depth >= maxImportDepth:
@@ -489,6 +541,19 @@ func expandImports(s *kb.Store, text, dir, boundary string, seen map[string]bool
 		return text
 	}
 	return strings.TrimRight(text, "\n") + "\n\n" + strings.Join(extra, "\n\n")
+}
+
+// personalFile says why a file holds personal instructions that must not be
+// shared, or "" when it does not: Claude Code's local instruction file, or
+// a file git is told to ignore (never committed, so never the team's).
+func personalFile(ref, target string) string {
+	if filepath.Base(target) == "CLAUDE.local.md" || filepath.Base(ref) == "CLAUDE.local.md" {
+		return "personal instructions that are not committed stay private"
+	}
+	if _, err := kb.Git(filepath.Dir(target), "check-ignore", "-q", "--", target); err == nil {
+		return "git ignores it: instructions that are not committed stay private"
+	}
+	return ""
 }
 
 // resolveImport returns the real path of an imported file, or "".

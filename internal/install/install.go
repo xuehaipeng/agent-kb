@@ -784,13 +784,30 @@ func mergeClaudeSettings(path string, want, drop []hookSpec) (bool, error) {
 		for _, g := range groups {
 			gm, _ := g.(map[string]any)
 			hs, _ := gm["hooks"].([]any)
+			var others []any
+			ours := false
 			for _, h := range hs {
 				if is(h, sp.Command) {
-					present = true
-					if sp.Matcher != "" {
-						gm["matcher"] = sp.Matcher
-					}
+					ours = true
+				} else {
+					others = append(others, h)
 				}
+			}
+			if !ours {
+				continue
+			}
+			cur, _ := gm["matcher"].(string)
+			switch {
+			case sp.Matcher == "" || cur == sp.Matcher:
+				present = true
+			case len(others) == 0:
+				gm["matcher"] = sp.Matcher // kb's own group: its matcher is kb's to set
+				present = true
+			default:
+				// The group is shared with someone else's command, and its
+				// matcher is theirs too. kb's hook moves out into a group of
+				// its own (added below); theirs stays exactly as it was.
+				gm["hooks"] = others
 			}
 		}
 		if !present {

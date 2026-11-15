@@ -1064,7 +1064,7 @@ func (a *App) cmdBench(args []string) error {
 	if err != nil {
 		return err
 	}
-	b, err := s.BenchFileContext(cases)
+	b, err := s.BenchFileContext(cases, fileContextWait())
 	if err != nil {
 		return err
 	}
@@ -1076,6 +1076,9 @@ func (a *App) cmdBench(args []string) error {
 	}
 	a.out("cases %d, injections %d: precision %.2f (%d of %d injected were judged relevant), recall %.2f (%d of %d judged relevant were injected)\n", b.Cases, b.Injected, b.Precision, b.Hits, b.Returned, b.Recall, b.Hits, b.Relevant)
 	a.out("context per injection: mean %.0f, max %d units (budget %d); lookup: median %.1f ms, max %.1f ms\n", b.MeanUnits, b.MaxUnits, kb.FileContextBudget, b.MedianMillis, b.MaxMillis)
+	if b.TimedOut > 0 {
+		a.out("timed out: %d of %d cases took longer than the %.0f ms the hook waits; the hook would have injected nothing for them, and they are scored that way\n", b.TimedOut, b.Cases, b.DeadlineMS)
+	}
 	a.out("These numbers describe the judged cases only. File context stays off until they say it helps.\n")
 	return nil
 }

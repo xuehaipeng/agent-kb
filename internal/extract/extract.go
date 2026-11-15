@@ -306,6 +306,11 @@ type Result struct {
 	// Rescoped: rules from a file whose condition changed, now limited the
 	// way the file says.
 	Rescoped []string
+	// Retired: rules from a file that can no longer be imported.
+	Retired []string
+	// Reimport: files whose rules relied on an entry this import narrowed
+	// or retired; their saved import no longer stands.
+	Reimport []string
 }
 
 type state struct {
@@ -317,6 +322,10 @@ type state struct {
 	// the raw range is not sent to the model as well.
 	Covered []coveredRange `json:"covered,omitempty"`
 	Updated string         `json:"updated"`
+	// ReliesOn: entries that already said what this file says, so nothing
+	// was added for it. When one of them is narrowed or retired because
+	// its own file changed, this file has to be imported again.
+	ReliesOn []string `json:"relies_on,omitempty"`
 }
 
 func statePath(s *kb.Store, path string) string {
