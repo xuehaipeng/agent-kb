@@ -73,6 +73,21 @@ func saveCompaction(s *kb.Store, c *compaction) error {
 	return err
 }
 
+// updateCompaction changes a session's record under its lock, starting
+// from what is on disk now. The hooks of one session can overlap (a summary
+// still being extracted when the next compaction begins), and none of them
+// may write back a copy it read earlier.
+func updateCompaction(s *kb.Store, session string, change func(c *compaction)) error {
+	unlock, err := s.LockLocal("compaction-" + kb.Slugify(session) + ".lock")
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	c := loadCompaction(s, session)
+	change(c)
+	return saveCompaction(s, c)
+}
+
 // NoteCompaction records, when a main session is about to compact, how far
 // its transcript goes. Nothing is extracted here.
 func NoteCompaction(s *kb.Store, session, transcript string) error {
@@ -83,9 +98,9 @@ func NoteCompaction(s *kb.Store, session, transcript string) error {
 	if err != nil {
 		return err
 	}
-	c := loadCompaction(s, session)
-	c.Transcript, c.Upto, c.N, c.At = transcript, st.Size(), c.N+1, time.Now().UTC().Format(time.RFC3339)
-	return saveCompaction(s, c)
+	return updateCompaction(s, session, func(c *compaction) {
+		c.Transcript, c.Upto, c.N, c.At = transcript, st.Size(), c.N+1, time.Now().UTC().Format(time.RFC3339)
+	})
 }
 
 // QueuedSummary is a compaction summary ready to be extracted.
@@ -108,6 +123,10 @@ func QueueSummary(s *kb.Store, session, summary string) (q QueuedSummary, skip s
 		return q, "no session id"
 	case len(summary) < 200:
 		return q, "the summary is too short to hold anything"
+	case len([]rune(summary)) > MaxWholeChars-100:
+		// It would have to be cut to fit one prompt, and a summary the
+		// model saw part of must not stand for the whole range.
+		return q, fmt.Sprintf("the summary is longer than one prompt takes (%d characters)", len([]rune(summary)))
 	case c.Transcript == "" || c.N == 0:
 		// Without the point the compaction began at, the range the summary
 		// stands for is unknown, and taking it would send that range to
@@ -169,7 +188,7 @@ func RunSummary(s *kb.Store, o SummaryOptions) (*Result, error) {
 	}
 	res, err := Run(s, Options{
 		Path: o.File, Source: "claude", SessionID: o.Session, Actor: o.Actor, Command: o.Command, DryRun: o.DryRun, Out: outWriter(o.Out),
-		Final: true, NoMinimum: true,
+		Final: true, NoMinimum: true, Whole: true,
 		Resource: fmt.Sprintf("claude session %s, compaction summary %d (a summary of part of the session, not the conversation itself)", o.Session, o.N),
 	})
 	if err != nil || o.DryRun {
@@ -181,8 +200,9 @@ func RunSummary(s *kb.Store, o SummaryOptions) (*Result, error) {
 	if err := os.WriteFile(statePath(s, covers), raw, 0o644); err != nil {
 		return res, err
 	}
-	c.Done[hash] = true
-	return res, saveCompaction(s, c)
+	// Into the record as it is now: another compaction may have begun
+	// while the model was working, and its number and boundary must stay.
+	return res, updateCompaction(s, o.Session, func(c *compaction) { c.Done[hash] = true })
 }
 
 func outWriter(w interface{ Write([]byte) (int, error) }) interface {

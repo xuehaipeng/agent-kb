@@ -726,6 +726,15 @@ transcript, and the same range must not reach the model twice.
   skipped by its hash. Extractions of one source take a lock, so a summary
   run and a transcript run cannot overlap. A session that never compacts is
   captured as before.
+- **Whole or not at all.** A summary is given to the model complete. It is
+  not shortened in the middle the way a long transcript message is, because
+  it stands for a range the transcript extraction will then skip. One too
+  long for a single prompt (60,000 characters) is not taken: the transcript
+  covers the range.
+- **One record per session, changed under a lock.** The next compaction can
+  begin while a summary is still with the model. Every change to the
+  session's record starts from what is on disk, so finishing a summary
+  never puts back an older compaction number or boundary.
 - **Subagents are not captured.** A subagent's summary belongs to another
   conversation than the session's transcript. Telling the two apart needs
   the agent id on compaction hooks, which Claude Code sends from 2.1.323.

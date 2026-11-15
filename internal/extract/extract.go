@@ -288,6 +288,12 @@ type Options struct {
 	// compaction summary.
 	Resource  string
 	NoMinimum bool
+	// Whole: the input is already a distilled text (a compaction summary)
+	// and stands for something else. It reaches the model complete or not
+	// at all: it is never shortened in the middle, and one too long for a
+	// single prompt is an error, so that nothing is marked as covered by a
+	// text the model only saw part of.
+	Whole bool
 }
 
 // Result summarises an extraction run.
@@ -349,6 +355,9 @@ func sourceResource(o Options) string {
 	return fmt.Sprintf("%s session %s", o.Source, o.SessionID)
 }
 
+// MaxWholeChars is the most a text that must be taken whole may hold.
+const MaxWholeChars = 60000
+
 // Run extracts claims from the new part of a transcript and adds them.
 func Run(s *kb.Store, o Options) (*Result, error) {
 	if o.Actor.Zero() {
@@ -385,7 +394,18 @@ func Run(s *kb.Store, o Options) (*Result, error) {
 	if o.SessionID == "" {
 		o.SessionID = tr.SessionID
 	}
-	condensed := Condense(tr.Messages, 2500, 60000)
+	var condensed string
+	if o.Whole {
+		for _, m := range tr.Messages {
+			condensed += strings.ToUpper(m.Role) + ": " + m.Text + "\n\n"
+		}
+		condensed = strings.TrimSpace(condensed)
+		if n := len([]rune(condensed)); n > MaxWholeChars {
+			return nil, fmt.Errorf("the text is %d characters, more than the %d one prompt takes, and it is not taken in part", n, MaxWholeChars)
+		}
+	} else {
+		condensed = Condense(tr.Messages, 2500, 60000)
+	}
 	if len(condensed) < s.Cfg.Extract.MinChars && !o.NoMinimum {
 		res.Skipped = fmt.Sprintf("only %d chars of new transcript (min %d)", len(condensed), s.Cfg.Extract.MinChars)
 		if o.Final && !o.DryRun {

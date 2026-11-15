@@ -3135,6 +3135,75 @@ func TestCompactionSummaryCapture(t *testing.T) {
 	if out, _, _ := extractSummary(second, upto2, "4", model); !strings.Contains(out, "skipped: the range this summary stands for was already extracted from the transcript") || count() != 3 {
 		t.Fatalf("raw-then-summary overlap:\n%s", out)
 	}
+	// A long summary reaches the model whole. It stands for a range of the
+	// transcript, so what is in its middle must not be dropped the way a
+	// long transcript message is shortened.
+	appendLine := func(text string) {
+		f, _ := os.OpenFile(transcript, os.O_APPEND|os.O_WRONLY, 0o644)
+		f.WriteString(line(text))
+		f.Close()
+	}
+	appendLine(strings.Repeat("THIRD: the cache was keyed without the tenant. ", 40))
+	hook("PreCompact", "")
+	upto3 := size()
+	summary3 := "Durable learnings: " + strings.Repeat("the first part talks about the deploy pipeline. ", 40) + "MIDDLEMARK the cache key must include the tenant id, see pkg/cache.go. " + strings.Repeat("the last part talks about the release notes. ", 40)
+	hook("PostCompact", `,"compact_summary":"`+summary3+`"`)
+	third := filepath.Join(local, "extract", "summaries", "s-1-5.md")
+	before := count()
+	if out, errs, code := extractSummary(third, upto3, "5", model); code != 0 || count() != before+1 {
+		t.Fatalf("long summary: %d\n%s\n%s", code, out, errs)
+	}
+	if p, _ := os.ReadFile(filepath.Join(calls, fmt.Sprint(before)+".txt")); !strings.Contains(string(p), "MIDDLEMARK the cache key must include the tenant id") || strings.Contains(string(p), "[...]") || strings.Count(string(p), "the first part talks about") != 40 {
+		t.Fatalf("the middle of a long summary did not reach the model:\n%.400s", p)
+	}
+	// One too long for a single prompt is not taken in part: it is not
+	// queued, and the transcript covers the range itself.
+	appendLine(strings.Repeat("FOURTH: the importer double-counts refunds. ", 40))
+	hook("PreCompact", "")
+	hook("PostCompact", `,"compact_summary":"`+strings.Repeat("An enormous summary that goes on and on about the refunds. ", 1100)+`"`)
+	if _, err := os.Stat(filepath.Join(local, "extract", "summaries", "s-1-6.md")); err == nil {
+		t.Fatal("a summary too long for one prompt was queued")
+	}
+	if log, _ := os.ReadFile(filepath.Join(local, "extract.log")); !strings.Contains(string(log), "the summary is longer than one prompt takes") {
+		t.Errorf("log:\n%s", log)
+	}
+	before = count()
+	if out, _, _ := raw(model); !strings.Contains(out, "added 1 claim") || count() != before+1 {
+		t.Fatalf("the range of an oversized summary must come from the transcript:\n%s", out)
+	}
+	if p, _ := os.ReadFile(filepath.Join(calls, fmt.Sprint(before)+".txt")); !strings.Contains(string(p), "FOURTH:") {
+		t.Fatalf("the range of an oversized summary was lost:\n%.300s", p)
+	}
+
+	// The next compaction can begin while a summary is still with the
+	// model. Finishing that summary must not put back the record it read
+	// before: the newer compaction's number and boundary stay.
+	appendLine(strings.Repeat("FIFTH: webhooks are retried without a signature check. ", 40))
+	hook("PreCompact", "")
+	upto5 := size()
+	summary5 := "Durable learnings: " + strings.Repeat("webhook retries must verify the signature again, see pkg/hooks.go. ", 8)
+	hook("PostCompact", `,"compact_summary":"`+summary5+`"`)
+	record := filepath.Join(local, "extract", "compactions", "s-1.json")
+	slow := filepath.Join(base, "slow-model.sh")
+	// While "the model" works, another compaction is recorded: number 99.
+	os.WriteFile(slow, []byte("#!/bin/sh\ncat > /dev/null\nsed -i.bak -e 's/\"n\": [0-9]*/\"n\": 99/' -e 's/\"upto\": [0-9]*/\"upto\": 123456789/' '"+record+"'\nprintf '[{\"type\":\"learning\",\"title\":\"Webhook retries verify the signature again\",\"description\":\"Found while working on webhooks.\"}]'\n"), 0o755)
+	if out, errs, code := extractSummary(filepath.Join(local, "extract", "summaries", "s-1-7.md"), upto5, "7", slow); code != 0 || !strings.Contains(out, "added 1 claim(s) from compaction summary 7") {
+		t.Fatalf("summary extraction during another compaction: %d\n%s\n%s", code, out, errs)
+	}
+	var rec struct {
+		N    int             `json:"n"`
+		Upto int64           `json:"upto"`
+		Done map[string]bool `json:"done"`
+	}
+	data, _ := os.ReadFile(record)
+	json.Unmarshal(data, &rec)
+	if rec.N != 99 || rec.Upto != 123456789 {
+		t.Errorf("finishing a summary overwrote a newer compaction record: n=%d upto=%d\n%s", rec.N, rec.Upto, data)
+	}
+	if len(rec.Done) < 3 {
+		t.Errorf("the finished summary was not recorded in the latest record: %v", rec.Done)
+	}
+
 	os.Chdir(repo)
 	if d := must(t, "codex", "rules", "--delivery"); !strings.Contains(d, "compaction summaries: captured for main sessions (Claude Code 2.1.325 when turned on); steering off") {
 		t.Errorf("diagnostics:\n%s", d)
