@@ -236,12 +236,14 @@ func (a *App) hookFileContext(s *kb.Store, in hookInput) {
 
 // fileContextDeadline is when a lookup is given up. KB_FILE_CONTEXT_TIMEOUT_MS
 // overrides it (tests, slow disks).
-func fileContextDeadline() <-chan time.Time {
-	d := fileContextTimeout
+func fileContextDeadline() <-chan time.Time { return time.After(fileContextWait()) }
+
+// fileContextWait is how long the hook waits for a lookup.
+func fileContextWait() time.Duration {
 	if v, err := strconv.Atoi(os.Getenv("KB_FILE_CONTEXT_TIMEOUT_MS")); err == nil && v >= 0 {
-		d = time.Duration(v) * time.Millisecond
+		return time.Duration(v) * time.Millisecond
 	}
-	return time.After(d)
+	return fileContextTimeout
 }
 
 func orMain(agent string) string {

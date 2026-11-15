@@ -2789,6 +2789,16 @@ func TestFileContextHookRepoMode(t *testing.T) {
 			t.Errorf("repo-mode benchmark lacks %q:\n%s", want, bench)
 		}
 	}
+	// A lookup slower than the hook waits is scored as the hook would
+	// behave: nothing injected, its judged entries still counted.
+	t.Setenv("KB_FILE_CONTEXT_TIMEOUT_MS", "0")
+	slow := must(t, "codex", "bench", "file-context", "--cases", cases)
+	t.Setenv("KB_FILE_CONTEXT_TIMEOUT_MS", "")
+	for _, want := range []string{"src/app.go: timed out (the lookup took ", "injected 0, relevant 0 of 2", "cases 3, injections 0: precision 0.00 (0 of 0 injected were judged relevant), recall 0.00 (0 of 3 judged relevant were injected)", "timed out: 3 of 3 cases took longer than the 0 ms the hook waits"} {
+		if !strings.Contains(slow, want) {
+			t.Errorf("benchmark past the hook's deadline lacks %q:\n%s", want, slow)
+		}
+	}
 	// The local state is not part of the bundle that gets committed.
 	if st := git(t, repo, "status", "--porcelain", "--", "knowledge"); strings.Contains(st, ".kb/") {
 		t.Errorf("local state shows up as a change to the bundle:\n%s", st)

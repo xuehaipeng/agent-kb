@@ -247,14 +247,21 @@ type FileContextBench struct {
 	MaxUnits     int      `json:"max_context_units"`
 	MedianMillis float64  `json:"median_lookup_ms"`
 	MaxMillis    float64  `json:"max_lookup_ms"`
+	TimedOut     int      `json:"timed_out"`   // cases whose lookup took longer than the hook waits
+	DeadlineMS   float64  `json:"deadline_ms"` // how long the hook waits
 	Lines        []string `json:"-"`
 }
 
 // BenchFileContext measures what file context would inject for judged
 // cases: precision and recall against the judgments, the context it costs,
 // and how long the lookup takes. It injects nothing and records nothing.
-func (s *Store) BenchFileContext(cases []FileContextCase) (FileContextBench, error) {
-	b := FileContextBench{Cases: len(cases)}
+//
+// deadline is how long the hook waits for a lookup. A lookup that takes
+// longer is dropped by the hook, so here it counts as nothing injected:
+// its judged entries stay in the denominator and the case is reported as
+// timed out.
+func (s *Store) BenchFileContext(cases []FileContextCase, deadline time.Duration) (FileContextBench, error) {
+	b := FileContextBench{Cases: len(cases), DeadlineMS: float64(deadline.Microseconds()) / 1000}
 	var millis []float64
 	units := 0
 	for _, c := range cases {
@@ -272,8 +279,15 @@ func (s *Store) BenchFileContext(cases []FileContextCase) (FileContextBench, err
 			return b, err
 		}
 		text, ids, _ := renderFileContext(rel, false, ms)
-		ms1 := float64(time.Since(start).Microseconds()) / 1000
+		took := time.Since(start)
+		ms1 := float64(took.Microseconds()) / 1000
 		millis = append(millis, ms1)
+		if took > deadline {
+			b.TimedOut++
+			b.Relevant += len(c.Relevant)
+			b.Lines = append(b.Lines, fmt.Sprintf("%s: timed out (the lookup took %.1f ms, the hook waits %.0f ms): injected 0, relevant 0 of %d", rel, ms1, b.DeadlineMS, len(c.Relevant)))
+			continue
+		}
 		want := map[string]bool{}
 		for _, id := range c.Relevant {
 			if n, err := s.Get(id); err == nil {

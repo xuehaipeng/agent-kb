@@ -696,8 +696,11 @@ hook-side equivalent, without writing anything into a repository.
 - **Benchmark first.** `kb bench file-context --cases <file>` takes judged
   cases (`[{"file": ..., "relevant": [ids]}]`) and reports precision,
   recall, context per injection and lookup time, without injecting or
-  recording anything. No judged data set ships with kb, so no claim is made
-  here that file context helps.
+  recording anything. It scores what the hook would do: a file the hook
+  does not cover, or a lookup slower than the hook waits, counts as nothing
+  injected while its judged entries stay in the recall denominator. No
+  judged data set ships with kb, so no claim is made here that file context
+  helps.
 
 ## 3. Doc C (ChatGPT plan) review
 
