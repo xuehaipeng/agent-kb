@@ -356,6 +356,11 @@ type hitJSON struct {
 	Anchored        string       `json:"anchored,omitempty"`
 	Resources       []string     `json:"resources,omitempty"`
 	Score           float64      `json:"score"`
+	// A conditional rule: the files it is limited to, and which of the
+	// files asked about (-f) it governs. kind is "rule" when it is listed
+	// because it applies to one of those files.
+	AppliesTo *okf.Applicability `json:"applies_to,omitempty"`
+	RuleFor   []string           `json:"rule_for,omitempty"`
 }
 
 func (a *App) cmdSearch(args []string) error {
@@ -394,12 +399,44 @@ func (a *App) cmdSearch(args []string) error {
 	}
 	s.NoteHits(hits)
 	if asJSON {
+		// The rules that apply only to the files asked about, as the text
+		// output lists them: a conditional rule has no resources, so the
+		// search itself does not find it by file.
+		var rel []string
+		for _, p := range q.Files {
+			rel = append(rel, s.RelToCode(p))
+		}
+		var fileRules []*kb.Node
+		if len(rel) > 0 {
+			if fileRules, err = s.RulesForFiles(rel, q.Projects, q.AllProjects); err != nil {
+				return err
+			}
+		}
+		governs := map[string][]string{}
+		for _, n := range fileRules {
+			governs[n.ID] = kb.FilesGoverned(n, rel)
+		}
 		out := []hitJSON{}
+		listed := map[string]bool{}
 		for _, h := range hits {
 			m := h.Node.Meta()
-			out = append(out, hitJSON{ID: h.Node.ID, Kind: "entry", Project: h.Node.Project, Type: h.Node.TypeKey, Title: m.Title, Description: m.Description, Trust: h.Trust.State, Stale: h.Trust.Stale, StaleReason: h.Trust.StaleReason,
+			item := hitJSON{ID: h.Node.ID, Kind: "entry", Project: h.Node.Project, Type: h.Node.TypeKey, Title: m.Title, Description: m.Description, Trust: h.Trust.State, Stale: h.Trust.Stale, StaleReason: h.Trust.StaleReason,
 				CodeFreshness: h.Trust.CodeFreshness, FreshnessCode: h.Trust.FreshnessCode, FreshnessReason: h.Trust.FreshnessReason, Overdue: h.Trust.Overdue, Baseline: h.Trust.Baseline,
-				Anchored: h.PathMatch, Resources: m.Resources, Score: h.Score})
+				Anchored: h.PathMatch, Resources: m.Resources, Score: h.Score}
+			if kb.Conditional(m) {
+				item.AppliesTo, item.RuleFor = m.AppliesTo, governs[h.Node.ID]
+			}
+			listed[h.Node.ID] = true
+			out = append(out, item)
+		}
+		for _, n := range fileRules {
+			if listed[n.ID] {
+				continue
+			}
+			m, t := n.Meta(), s.Trust(n)
+			out = append(out, hitJSON{ID: n.ID, Kind: "rule", Project: n.Project, Type: n.TypeKey, Title: m.Title, Description: m.Description, Trust: t.State, Stale: t.Stale, StaleReason: t.StaleReason,
+				CodeFreshness: t.CodeFreshness, FreshnessCode: t.FreshnessCode, FreshnessReason: t.FreshnessReason, Overdue: t.Overdue,
+				Resources: m.Resources, AppliesTo: m.AppliesTo, RuleFor: governs[n.ID]})
 		}
 		if q.Text != "" && !q.NoDocs {
 			for _, d := range s.SearchDocs(q.Text, q.Projects, q.AllProjects, q.DocLimit) {
@@ -499,7 +536,7 @@ func (a *App) cmdAdd(args []string) error {
 	f.str(&in.Project, "", "target project (hub)", "p", "project")
 	f.list(&in.Projects, true, "with --global: projects it applies to", "for")
 	var when []string
-	f.list(&when, true, "rule only: apply it only when working on files matching this glob", "when")
+	f.list(&when, false, "rule only: apply it only when working on files matching this glob", "when")
 	var global bool
 	var from string
 	f.boolean(&global, "store in the global scope shared by all projects (hub)", "global")
@@ -514,7 +551,13 @@ func (a *App) cmdAdd(args []string) error {
 		in.Project = kb.GlobalProject
 	}
 	if len(when) > 0 {
-		in.AppliesTo = &okf.Applicability{Paths: when}
+		// Several patterns may share one flag, but a comma inside {a,b}
+		// belongs to its pattern.
+		var paths []string
+		for _, w := range when {
+			paths = append(paths, kb.SplitPatterns(w)...)
+		}
+		in.AppliesTo = &okf.Applicability{Paths: paths}
 	}
 	if from != "" {
 		if len(pos) > 0 {

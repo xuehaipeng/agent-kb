@@ -188,10 +188,12 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 		if len(o.Projects) == 0 && !o.AllProjects && s.Hub && s.Project == "" {
 			brief = s.sessionBriefLines(me)
 		}
-		_, native := s.NativeRulesActive()
-		native = native && len(o.Projects) == 0 && !o.AllProjects
+		var native planOpts
+		if len(o.Projects) == 0 && !o.AllProjects {
+			native.native = s.nativeRuleIDs()
+		}
 		d := s.planDelivery(SurfaceSessionStart, SessionStartBudget, "", *planRules, brief, native)
-		d.Text, d.IDs = "", nil
+		d.Text, d.IDs, d.NativeIDs = "", nil, nil
 		r.Delivery, r.RulesOmitted = &d, d.Omitted()
 	}
 	return r, nil

@@ -29,7 +29,9 @@ import (
 //     memory, a directory several projects wrote to): only through an
 //     explicit mapping recorded with --map-root.
 //
-// Everything found is reported, including what is not imported and why.
+// A directory reached several ways is judged on all of it together (see
+// ClaudeMemoryRoots). Everything found is reported, including what is not
+// imported and why.
 
 // MemoryRoot is one memory directory and the project it belongs to.
 type MemoryRoot struct {
@@ -142,73 +144,64 @@ func knownCheckouts(s *kb.Store) map[string]string {
 	return out
 }
 
+// What one place says about whose a memory directory is.
+const (
+	ownerUnknown = iota // nothing establishes a project
+	ownerOne            // it belongs to one project
+	ownerShared         // it is written to from several projects, or may be
+)
+
+type ownerClaim struct {
+	kind, project, why string
+	level              int
+}
+
 // ClaudeMemoryRoots finds Claude Code's memory directories and establishes
-// which project each belongs to.
+// which project each belongs to. The same directory can be reached several
+// ways (its default location, a repository's settings, user settings, a
+// settings file given on the command line), and each says something about
+// its owner. Everything said about a directory is collected first and
+// weighed together: a mapping made by hand settles it; otherwise anything
+// that makes it shared keeps it out, however firmly something else names
+// one project; otherwise the projects named must agree.
 func ClaudeMemoryRoots(s *kb.Store, o ImportOptions) []MemoryRoot {
 	agent := kb.Actor{Producer: "claude-code"}
 	mapped := loadRootMap(s)
 	checkouts := knownCheckouts(s)
-	seen := map[string]bool{}
-	var out []MemoryRoot
-	add := func(dir, kind, project string, ok bool, why string) {
+	claims := map[string][]ownerClaim{}
+	found := map[string]string{} // resolved directory -> the path it was first found by
+	var order []string
+	add := func(dir, kind string, level int, project, why string) {
 		st, err := os.Stat(dir)
 		if err != nil || !st.IsDir() {
 			return
 		}
 		real := kb.RealPath(dir)
-		if seen[real] {
-			return
+		if _, ok := found[real]; !ok {
+			found[real] = dir
+			order = append(order, real)
 		}
-		seen[real] = true
-		r := MemoryRoot{Dir: dir, Agent: agent, Kind: kind, Project: project, Mapped: ok, Why: why}
-		// A mapping made by hand settles ownership, whatever else is known.
-		if p, has := mapped.Roots[real]; has {
-			r.Project, r.Mapped, r.Why = p, true, "mapped by hand (--map-root)"
-		}
-		out = append(out, r)
+		claims[real] = append(claims[real], ownerClaim{kind: kind, project: project, why: why, level: level})
 	}
 
 	// 1. The default per-project directories under the effective config dir.
 	dirs, _ := filepath.Glob(filepath.Join(claudeDir(), "projects", "*", "memory"))
 	sort.Strings(dirs)
 	for _, d := range dirs {
-		project, ok, why := claudeMemoryOwner(s, filepath.Dir(d))
-		add(d, "auto memory", project, ok, why)
+		project, level, why := claudeMemoryOwner(s, filepath.Dir(d))
+		add(d, "auto memory", level, project, why)
 	}
 	// 2. A directory a repository's own settings name belongs to that
 	// repository. Local settings outrank project settings, as in Claude Code.
-	owners := map[string]map[string]bool{}
-	named := map[string]string{}
-	for co, project := range checkouts {
+	for _, co := range sortedStrings(checkouts) {
 		for _, f := range []string{".claude/settings.local.json", ".claude/settings.json"} {
 			v, ok := claudeSetting(filepath.Join(co, filepath.FromSlash(f)), "autoMemoryDirectory")
 			dir, isStr := v.(string)
 			if !ok || !isStr || strings.TrimSpace(dir) == "" {
 				continue
 			}
-			dir = kb.RealPath(expandHome(dir))
-			if owners[dir] == nil {
-				owners[dir] = map[string]bool{}
-			}
-			owners[dir][project] = true
-			named[dir] = displayPath(filepath.Join(co, filepath.FromSlash(f)))
+			add(expandHome(dir), "auto memory", ownerOne, checkouts[co], "named by autoMemoryDirectory in "+displayPath(filepath.Join(co, filepath.FromSlash(f))))
 			break
-		}
-	}
-	for _, dir := range sortedStrings(owners) {
-		var ps []string
-		for p := range owners[dir] {
-			ps = append(ps, projectOr(s, p))
-		}
-		sort.Strings(ps)
-		if len(ps) == 1 {
-			var only string
-			for p := range owners[dir] {
-				only = p
-			}
-			add(dir, "auto memory", only, true, "named by autoMemoryDirectory in "+named[dir])
-		} else {
-			add(dir, "auto memory", "", false, "several projects name this directory as their autoMemoryDirectory ("+strings.Join(ps, ", ")+"): map it by hand with --map-root "+displayPath(dir)+"=<project>")
 		}
 	}
 	// 3. A user-level or explicitly given settings file: the directory is
@@ -221,7 +214,7 @@ func ClaudeMemoryRoots(s *kb.Store, o ImportOptions) []MemoryRoot {
 			continue
 		}
 		dir = expandHome(dir)
-		add(dir, "auto memory", "", false, "autoMemoryDirectory in "+displayPath(f)+" is shared by every project that runs with it: map it by hand with --map-root "+displayPath(dir)+"=<project>")
+		add(dir, "auto memory", ownerShared, "", "autoMemoryDirectory in "+displayPath(f)+" is shared by every project that runs with it: map it by hand with --map-root "+displayPath(dir)+"=<project>")
 	}
 	// 4. Subagent memory. Project and local scope live in a checkout and
 	// belong to its project. User scope spans projects: it is not turned
@@ -231,20 +224,64 @@ func ClaudeMemoryRoots(s *kb.Store, o ImportOptions) []MemoryRoot {
 			subs, _ := filepath.Glob(filepath.Join(co, filepath.FromSlash(scope.dir), "*"))
 			sort.Strings(subs)
 			for _, d := range subs {
-				add(d, "subagent memory ("+scope.name+")", checkouts[co], true, "under a checkout of "+projectOr(s, checkouts[co]))
+				add(d, "subagent memory ("+scope.name+")", ownerOne, checkouts[co], "under a checkout of "+projectOr(s, checkouts[co]))
 			}
 		}
 	}
 	subs, _ := filepath.Glob(filepath.Join(claudeDir(), "agent-memory", "*"))
 	sort.Strings(subs)
 	for _, d := range subs {
-		add(d, "subagent memory (user)", "", false, "a user-level subagent's memory spans projects and is not imported as global knowledge on its own: map it by hand with --map-root "+displayPath(d)+"=<project or global>")
+		add(d, "subagent memory (user)", ownerShared, "", "a user-level subagent's memory spans projects and is not imported as global knowledge on its own: map it by hand with --map-root "+displayPath(d)+"=<project or global>")
 	}
 	// 5. Mappings made by hand for directories found nowhere else.
 	for _, dir := range sortedStrings(mapped.Roots) {
-		add(dir, "memory", mapped.Roots[dir], true, "mapped by hand (--map-root)")
+		add(dir, "memory", ownerOne, mapped.Roots[dir], "mapped by hand (--map-root)")
+	}
+
+	var out []MemoryRoot
+	for _, real := range order {
+		cs := claims[real]
+		r := MemoryRoot{Dir: found[real], Agent: agent, Kind: cs[0].kind}
+		if p, has := mapped.Roots[real]; has {
+			r.Project, r.Mapped, r.Why = p, true, "mapped by hand (--map-root)"
+		} else {
+			r.Project, r.Mapped, r.Why = weighOwners(s, found[real], cs)
+		}
+		out = append(out, r)
 	}
 	return out
+}
+
+// weighOwners decides a directory's project from everything said about it.
+func weighOwners(s *kb.Store, dir string, cs []ownerClaim) (project string, ok bool, why string) {
+	owners := map[string]string{} // project -> the first reason given for it
+	var names []string
+	unknown := ""
+	for _, c := range cs {
+		switch c.level {
+		case ownerShared:
+			return "", false, c.why
+		case ownerOne:
+			if _, has := owners[c.project]; !has {
+				owners[c.project] = c.why
+				names = append(names, projectOr(s, c.project))
+			}
+		default:
+			if unknown == "" {
+				unknown = c.why
+			}
+		}
+	}
+	switch len(owners) {
+	case 0:
+		return "", false, unknown
+	case 1:
+		for p, reason := range owners {
+			return p, true, reason
+		}
+	}
+	sort.Strings(names)
+	return "", false, "several projects are named as its owner (" + strings.Join(names, ", ") + "): map it by hand with --map-root " + displayPath(dir) + "=<project>"
 }
 
 func sortedStrings[V any](m map[string]V) []string {
@@ -260,15 +297,18 @@ func sortedStrings[V any](m map[string]V) []string {
 // (~/.claude/projects/<dir>): the project its transcripts ran in, when that
 // is one project; otherwise the project whose registered checkout encodes
 // to the directory's name, when that is one project.
-func claudeMemoryOwner(s *kb.Store, projectDir string) (project string, ok bool, why string) {
+func claudeMemoryOwner(s *kb.Store, projectDir string) (project string, level int, why string) {
 	const none = "no project could be established for this directory: run kb inside its repository once, or map it by hand with --map-root"
+	const repo, elsewhere = "\x00repo", "\x00elsewhere"
+	mapIt := ": map it by hand with --map-root " + displayPath(filepath.Join(projectDir, "memory")) + "=<project>"
 	projects := map[string]bool{}
 	byCWD := map[string]string{}
+	// Every transcript counts: the memory still there may come from any
+	// session, and a file's name says nothing about which. A session that
+	// ran somewhere this store does not know (another repository) counts
+	// too: it is evidence that the directory is not one project's alone.
 	ts, _ := filepath.Glob(filepath.Join(projectDir, "*.jsonl"))
 	sort.Strings(ts)
-	if len(ts) > 60 {
-		ts = ts[len(ts)-60:]
-	}
 	for _, t := range ts {
 		tr, err := ReadMeta(t)
 		if err != nil || tr.CWD == "" {
@@ -276,25 +316,29 @@ func claudeMemoryOwner(s *kb.Store, projectDir string) (project string, ok bool,
 		}
 		p, known := byCWD[tr.CWD]
 		if !known {
+			p = elsewhere
 			if s.Hub {
-				p = s.ForDir(tr.CWD).Project
+				if id := s.ForDir(tr.CWD).Project; id != "" {
+					p = id
+				}
 			} else {
 				root := s.GitTop()
 				if root == "" {
 					root = s.CodeRoot
 				}
 				if within(root, tr.CWD) {
-					p = "\x00repo"
+					p = repo
 				}
 			}
 			byCWD[tr.CWD] = p
 		}
-		if p != "" {
-			projects[p] = true
-		}
+		projects[p] = true
 	}
+	outside := projects[elsewhere]
+	delete(projects, elsewhere)
+	byTranscripts := len(projects) > 0
 	name := filepath.Base(projectDir)
-	if len(projects) == 0 {
+	if !byTranscripts {
 		if s.Hub {
 			for id := range s.ProjectFiles() {
 				for _, c := range s.Checkouts(id) {
@@ -304,25 +348,38 @@ func claudeMemoryOwner(s *kb.Store, projectDir string) (project string, ok bool,
 				}
 			}
 		} else if s.CodeRoot != "" && claudeProjectDirName(s.CodeRoot) == name {
-			projects["\x00repo"] = true
+			projects[repo] = true
 		}
-		if len(projects) == 1 {
-			for p := range projects {
-				return strings.TrimPrefix(p, "\x00repo"), true, "its name is the encoded path of a registered checkout"
-			}
-		}
-		if len(projects) > 1 {
-			return "", false, "its name matches checkouts of several projects (" + strings.Join(sortedStrings(projects), ", ") + "): map it by hand with --map-root"
-		}
-		return "", false, none
 	}
-	if len(projects) > 1 {
-		return "", false, "its transcripts ran in several projects (" + strings.Join(sortedStrings(projects), ", ") + "), so whose memory it holds is not known: map it by hand with --map-root " + displayPath(filepath.Join(projectDir, "memory")) + "=<project>"
+	var names []string
+	for p := range projects {
+		if p == repo {
+			p = "this repository"
+		}
+		names = append(names, p)
+	}
+	sort.Strings(names)
+	switch {
+	case len(projects) == 0:
+		return "", ownerUnknown, none
+	case len(projects) > 1 && byTranscripts:
+		return "", ownerShared, "its transcripts ran in several projects (" + strings.Join(names, ", ") + "), so whose memory it holds is not known" + mapIt
+	case len(projects) > 1:
+		return "", ownerShared, "its name matches checkouts of several projects (" + strings.Join(names, ", ") + ")" + mapIt
+	case outside:
+		where := "outside any project known here"
+		if !s.Hub {
+			where = "outside it"
+		}
+		return "", ownerShared, "sessions that wrote to it ran in " + names[0] + " and also " + where + ", so whose memory it holds is not known" + mapIt
 	}
 	for p := range projects {
-		return strings.TrimPrefix(p, "\x00repo"), true, "its transcripts ran in this project"
+		project = strings.TrimPrefix(p, repo)
 	}
-	return "", false, none
+	if byTranscripts {
+		return project, ownerOne, "its transcripts ran in this project"
+	}
+	return project, ownerOne, "its name is the encoded path of a registered checkout"
 }
 
 // SourcesReport describes what a scan would look at: memory directories and

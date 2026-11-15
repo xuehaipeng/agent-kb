@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/xuehaipeng/agent-kb/internal/extract"
@@ -41,10 +42,7 @@ const fileContextTimeout = 1500 * time.Millisecond
 // hookContext prints additionalContext for events that take context only
 // as JSON (SubagentStart, PreToolUse). It sets no decision.
 func (a *App) hookContext(event, text string) {
-	out, err := json.Marshal(map[string]any{"hookSpecificOutput": map[string]any{"hookEventName": event, "additionalContext": text}})
-	if err == nil {
-		fmt.Fprintln(a.Stdout, string(out))
-	}
+	fmt.Fprint(a.Stdout, kb.HookContext(event, text))
 }
 
 // cmdHook never fails the agent: errors go to the local log, exit code is 0.
@@ -121,10 +119,21 @@ func (a *App) cmdHook(args []string) int {
 		if last != nil && last.Digest == s.RuleDigest() {
 			return 0
 		}
-		if d, err := s.AgentDelivery(kb.SurfaceRuleRefresh); err == nil && d.Text != "" {
-			a.hookContext("PreToolUse", "kb: the rules that apply here changed since you last received them. They are now:\n"+d.Text)
-			s.RecordDelivery(in.SessionID, orMain(in.AgentID), in.AgentType, "PreToolUse:refresh", d, false, false)
+		d, err := s.AgentDelivery(kb.SurfaceRuleRefresh)
+		if err != nil {
+			return 0
 		}
+		switch {
+		case d.Text != "":
+			a.hookContext("PreToolUse", kb.RuleRefreshNotice+d.Text)
+		case last != nil && last.Rules > 0:
+			// The last rule it holds was retired or no longer applies here:
+			// say so, or it goes on following an instruction that is gone.
+			a.hookContext("PreToolUse", "kb: the rules you received from kb earlier no longer apply here, and no kb rules apply now. Stop following them unless the user says otherwise.")
+		}
+		// Recorded even when there is nothing to hand over, so the agent
+		// is not looked at again on every tool call.
+		s.RecordDelivery(in.SessionID, orMain(in.AgentID), in.AgentType, "PreToolUse:refresh", d, false, false)
 	case "PostCompact":
 		// Opt-in: the summary of a main session's compaction is extracted,
 		// and stands for the part of the transcript before it. A subagent's
@@ -260,16 +269,31 @@ func (a *App) hookFileContext(s *kb.Store, in hookInput) {
 	default:
 		return // not a file access this hook covers (a shell command, another tool)
 	}
+	// Only the lookup is timed, and it records nothing. What was given is
+	// recorded after it has been printed: a lookup that is dropped for
+	// taking too long leaves no trace, so the next touch of the file tries
+	// again instead of treating those entries as already delivered.
 	done := make(chan kb.FileContext, 1)
-	go func() { done <- s.FileContextFor(in.SessionID, in.AgentID, in.AgentType, in.ToolInput.FilePath, pre) }()
+	go func() { done <- s.PlanFileContext(in.SessionID, in.AgentID, in.ToolInput.FilePath, pre) }()
 	select {
 	case fc := <-done:
 		if fc.Text != "" {
 			a.hookContext(in.HookEventName, fc.Text)
+			s.RecordFileContext(in.SessionID, in.AgentID, in.AgentType, fc)
 		}
-	case <-time.After(fileContextTimeout):
+	case <-fileContextDeadline():
 		logLine(s, "hook: file context lookup took longer than "+fileContextTimeout.String()+" and was dropped")
 	}
+}
+
+// fileContextDeadline is when a lookup is given up. KB_FILE_CONTEXT_TIMEOUT_MS
+// overrides it (tests, slow disks).
+func fileContextDeadline() <-chan time.Time {
+	d := fileContextTimeout
+	if v, err := strconv.Atoi(os.Getenv("KB_FILE_CONTEXT_TIMEOUT_MS")); err == nil && v >= 0 {
+		d = time.Duration(v) * time.Millisecond
+	}
+	return time.After(d)
 }
 
 func orMain(agent string) string {
