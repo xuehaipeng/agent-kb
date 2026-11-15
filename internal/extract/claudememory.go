@@ -420,9 +420,24 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		}
 		return out
 	}
+	// An ambiguous group is withheld as a whole: every vanished source that
+	// shares the content or the name, not just the one being looked at.
+	// Otherwise the next one in the group would find its candidates already
+	// set aside and be reported deleted, though which one survived is unknown.
+	quarantine := func(match func(*ledgerEntry) bool, cands []string) {
+		for _, c := range cands {
+			ambiguous[c] = true
+		}
+		for p, g := range vanished {
+			if g.Entry != "" && match(g) {
+				ambiguous[p] = true
+			}
+		}
+		r.ambiguous++
+	}
 	for _, key := range sortedKeysOf(vanished) {
 		e := vanished[key]
-		if e.Entry == "" {
+		if e.Entry == "" || ambiguous[key] {
 			continue
 		}
 		sameHash, sameName := 0, 0
@@ -439,12 +454,8 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			move(key, cands[0])
 			continue
 		case len(cands) > 0:
-			for _, c := range cands {
-				ambiguous[c] = true
-			}
-			ambiguous[key] = true
-			r.ambiguous++
-			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) have the content of %d deleted source(s) of %s; nothing was imported or flagged for them (make the files differ, or deprecate the entry)", len(cands), sameHash, e.Entry))
+			quarantine(func(g *ledgerEntry) bool { return g.Hash == e.Hash }, cands)
+			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) have the content of %d deleted source(s) (%s among them); nothing was imported or flagged for them (make the files differ, or deprecate the entry)", len(cands), sameHash, e.Entry))
 			continue
 		}
 		if e.Name == "" {
@@ -458,12 +469,8 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			// and edited copy next to a backup), or several vanished
 			// sources share it. Which one continues the source is not
 			// knowable, so none is imported and nothing is reported deleted.
-			for _, c := range cands {
-				ambiguous[c] = true
-			}
-			ambiguous[key] = true
-			r.ambiguous++
-			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) carry the name %q of %d deleted source(s) of %s; nothing was imported or flagged for them (keep one file with that name, or deprecate the entry)", len(cands), e.Name, sameName, e.Entry))
+			quarantine(func(g *ledgerEntry) bool { return g.Name == e.Name }, cands)
+			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) carry the name %q of %d deleted source(s) (%s among them); nothing was imported or flagged for them (keep one file per source with that name, or deprecate the entries)", len(cands), e.Name, sameName, e.Entry))
 		}
 	}
 
@@ -609,7 +616,12 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 				continue
 			}
 		}
-		if e != nil && e.Hash == f.hash {
+		// --force reconsiders an unchanged source that owns no entry: one
+		// recorded as already known or documented may be importable now
+		// (the entry it duplicated was deprecated, say). A source that owns
+		// an entry stays as it is: forcing never rewrites or duplicates it.
+		forced := o.Force && e != nil && e.Entry == "" && e.Conflict == ""
+		if e != nil && e.Hash == f.hash && !forced {
 			r.unchanged++
 			continue
 		}
@@ -685,9 +697,16 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		// it has been on (whose prompt knows the existing entries).
 		if e == nil || e.Outcome == "imported-by-model" {
 			if st := loadState(s, f.path); st.Hash != "" {
-				if st.Hash == legacyHash(f.data) {
+				if st.Hash == legacyHash(f.data) && !forced {
 					r.legacy++
 					record("imported-by-model", "", 0, "")
+					continue
+				}
+				if forced {
+					// The model path honors --force itself.
+					r.fallback++
+					r.details = append(r.details, fmt.Sprintf("fallback: %s (forced re-import through the model, which imported it earlier)", base))
+					fallbacks = append(fallbacks, FileSource{Path: f.path, Kind: KindMemory, Agent: root.Agent, Project: root.Project})
 					continue
 				}
 				r.fallback++
