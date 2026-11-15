@@ -86,7 +86,10 @@ type ledgerEntry struct {
 	Revision int      `json:"revision,omitempty"` // entry revision this import last wrote
 	Conflict string   `json:"conflict,omitempty"` // why a changed source was not applied
 	Missing  string   `json:"missing_since,omitempty"`
-	Updated  string   `json:"updated"`
+	// MissingChecks is how many verification events the entry had when its
+	// source was first found deleted; a later confirmation settles it.
+	MissingChecks int    `json:"missing_checks,omitempty"`
+	Updated       string `json:"updated"`
 }
 
 func ledgerPath(s *kb.Store) string { return s.LocalPath("extract", "import-ledger.json") }
@@ -397,35 +400,54 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		}
 	}
 	ambiguous := map[string]bool{}
+	// A destination can stand for one vanished source only, whichever way it
+	// was matched; and the candidates are counted on the set as it was, so
+	// the outcome does not depend on the order sources are looked at.
+	taken := map[string]bool{}     // new paths already matched to a source
+	movedFrom := map[string]bool{} // vanished sources matched to a new path
+	vanished := map[string]*ledgerEntry{}
+	for p, g := range gone {
+		vanished[p] = g
+	}
 	move := func(from string, to string) {
+		taken[to], movedFrom[from] = true, true
+		r.renamed++
+		if o.DryRun {
+			return
+		}
 		e := gone[from]
 		delete(gone, from)
 		delete(l.Sources, from)
 		e.Aliases = append(e.Aliases, from)
-		e.Path, e.Missing = to, ""
+		e.Path, e.Missing, e.MissingChecks = to, "", 0
 		l.Sources[to] = e
-		r.renamed++
 	}
-	for _, key := range sortedKeysOf(gone) {
-		e, ok := gone[key]
-		if !ok || e.Entry == "" {
+	free := func(paths []string) []string {
+		var out []string
+		for _, p := range paths {
+			if !taken[p] && !ambiguous[p] {
+				out = append(out, p)
+			}
+		}
+		return out
+	}
+	for _, key := range sortedKeysOf(vanished) {
+		e := vanished[key]
+		if e.Entry == "" {
 			continue
 		}
-		var sameHash, sameName []string
-		for p, g := range gone {
+		sameHash, sameName := 0, 0
+		for _, g := range vanished {
 			if g.Entry != "" && g.Hash == e.Hash {
-				sameHash = append(sameHash, p)
+				sameHash++
 			}
 			if g.Entry != "" && e.Name != "" && g.Name == e.Name {
-				sameName = append(sameName, p)
+				sameName++
 			}
 		}
-		switch cands := newByHash[e.Hash]; {
-		case len(cands) == 1 && len(sameHash) == 1:
-			if !o.DryRun {
-				move(key, cands[0])
-			}
-			delete(newByHash, e.Hash)
+		switch cands := free(newByHash[e.Hash]); {
+		case len(cands) == 1 && sameHash == 1:
+			move(key, cands[0])
 			continue
 		case len(cands) > 0:
 			for _, c := range cands {
@@ -433,19 +455,17 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			}
 			ambiguous[key] = true
 			r.ambiguous++
-			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) have the content of %d deleted source(s) of %s; nothing was imported or flagged for them (make the files differ, or deprecate the entry)", len(cands), len(sameHash), e.Entry))
+			r.details = append(r.details, fmt.Sprintf("ambiguous: %d new file(s) have the content of %d deleted source(s) of %s; nothing was imported or flagged for them (make the files differ, or deprecate the entry)", len(cands), sameHash, e.Entry))
 			continue
 		}
-		if cands := newByName[e.Name]; e.Name != "" && len(cands) == 1 && len(sameName) == 1 && !ambiguous[cands[0]] {
-			if !o.DryRun {
-				move(key, cands[0])
-			}
+		if cands := free(newByName[e.Name]); e.Name != "" && len(cands) == 1 && sameName == 1 {
+			move(key, cands[0])
 		}
 	}
 
 	for _, f := range files {
 		base := filepath.Base(f.path)
-		if ambiguous[f.path] {
+		if ambiguous[f.path] || (o.DryRun && taken[f.path]) {
 			continue
 		}
 		if base == "MEMORY.md" {
@@ -463,23 +483,56 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		}
 		t, err := parseTopic(f.data)
 		kbType, known := memoryKBType(t.Type)
-		reason := ""
+		reason, skip := "", ""
 		switch {
 		case err != nil:
 			reason = "no usable frontmatter"
 		case t.Type == "user":
 			// Notes about the person stay in the agent's private memory.
-			r.user++
-			continue
+			skip = "is now a user memory"
 		case !known:
 			reason = fmt.Sprintf("unknown memory type %q", t.Type)
 		case t.Body == "":
-			r.empty++
-			continue
+			skip = "is now empty"
 		case len(t.Body) > maxTopicBytes:
 			reason = fmt.Sprintf("longer than one note (%d bytes)", len(t.Body))
 		case len(headingRe.FindAllString(t.Body, -1)) > 1:
 			reason = "several sections: not a single note"
+		}
+		// A source that already became an entry keeps that identity. If it
+		// can no longer be imported as one note, the model path must not
+		// take it: that path only adds entries, so the old one (a delivered
+		// rule, say) would stay as it was beside a new one. It is flagged
+		// for a merge by hand instead.
+		if tracked := l.Sources[f.path]; tracked != nil && tracked.Entry != "" && (reason != "" || skip != "") {
+			why := reason
+			if why == "" {
+				why = skip
+			}
+			switch {
+			case tracked.Conflict != "" && o.AcceptConflicts:
+				if !o.DryRun {
+					tracked.Hash, tracked.Conflict, tracked.Missing, tracked.Updated = f.hash, "", "", now.Format(time.RFC3339)
+				}
+				r.unchanged++
+			case tracked.Hash == f.hash && tracked.Conflict == "":
+				r.unchanged++ // settled earlier, and unchanged since
+			default:
+				r.conflicts++
+				r.details = append(r.details, fmt.Sprintf("conflict: %s can no longer be imported as one note (%s), so %s was left as it is. Update or deprecate it by hand, then run this scan with --accept-conflicts", base, why, tracked.Entry))
+				if !o.DryRun {
+					tracked.Hash, tracked.Conflict, tracked.Missing, tracked.Updated = f.hash, "the source is no longer a single typed note: "+why, "", now.Format(time.RFC3339)
+				}
+			}
+			continue
+		}
+		switch skip {
+		case "is now a user memory":
+			r.user++
+			continue
+		case "is now empty":
+			r.empty++
+			continue
 		}
 		if reason != "" {
 			r.fallback++
@@ -513,7 +566,7 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 
 		e := l.Sources[f.path]
 		if e != nil && e.Missing != "" && !o.DryRun {
-			e.Missing = "" // the file is back
+			e.Missing, e.MissingChecks = "", 0 // the file is back
 		}
 		// A conflict stands until someone settles it: it is reported on
 		// every scan, not once. --accept-conflicts records the entry as it
@@ -661,19 +714,52 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			}
 			continue
 		}
-		if n, err := s.Get(e.Entry); err != nil || s.Trust(n).State == kb.StateDeprecated {
+		if movedFrom[key] {
+			continue // matched to a new path in this (dry) run
+		}
+		n, err := s.Get(e.Entry)
+		if err != nil || s.Trust(n).State == kb.StateDeprecated {
 			if !o.DryRun {
 				delete(l.Sources, key) // the entry is retired: nothing left to review
 			}
 			continue
 		}
+		// Someone looked at the entry after the deletion was reported: it
+		// now stands on that check (or rewrite), not on the vanished file.
+		if e.Missing != "" && reviewedSince(n, e.MissingChecks, e.Revision) {
+			if !o.DryRun {
+				delete(l.Sources, key)
+			}
+			continue
+		}
 		r.missing++
 		if e.Missing == "" && !o.DryRun {
-			e.Missing = now.Format(time.RFC3339)
+			e.Missing, e.MissingChecks = now.Format(time.RFC3339), len(n.Meta().Verified)
 		}
 		r.details = append(r.details, fmt.Sprintf("source deleted: %s no longer backs %s; the entry is kept. If it still holds: kb verify %s --confirm -e \"...\"; if not: kb deprecate %s -m \"...\"", filepath.Base(key), e.Entry, e.Entry, e.Entry))
 	}
 	return r, fallbacks
+}
+
+// reviewedSince reports whether an entry was confirmed or rewritten after
+// its source was found deleted: a confirmation of its current revision
+// recorded since (beyond the checks it had then), or a revision newer than
+// the one the import last wrote. Events are counted, not compared by time:
+// an import and the scan that finds its source gone can share a timestamp.
+func reviewedSince(n *kb.Node, checksThen, importedRev int) bool {
+	m := n.Meta()
+	if importedRev > 0 && m.Rev() > importedRev {
+		return true
+	}
+	for i, e := range m.Verified {
+		if i < checksThen || okf.EventRev(e) != m.Rev() {
+			continue
+		}
+		if e.Result == "" || e.Result == kb.ResultConfirmed {
+			return true
+		}
+	}
+	return false
 }
 
 // legacyHash is the content hash ImportFile records for a file.

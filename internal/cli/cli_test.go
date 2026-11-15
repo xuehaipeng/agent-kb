@@ -1265,3 +1265,115 @@ func legacyImportState(dir, path string, content []byte) error {
 	}
 	return os.WriteFile(filepath.Join(dir, hex.EncodeToString(key[:8])+".json"), data, 0o644)
 }
+
+// Identity edge cases found in review: a tracked memory that stops being a
+// single note, a rename target matched twice, and a deleted source whose
+// entry was checked again.
+func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
+	base, home := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	pdir := filepath.Join(home, ".claude", "projects", "-x-aiproxy")
+	mem := filepath.Join(pdir, "memory")
+	os.MkdirAll(mem, 0o755)
+	os.WriteFile(filepath.Join(pdir, "t.jsonl"), []byte(`{"type":"user","cwd":"`+repo+`","sessionId":"s1","message":{"role":"user","content":"hi"}}`+"\n"), 0o644)
+	write := func(name, content string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(mem, name), []byte(content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	topic := func(name, desc, typ, body string) string {
+		return "---\nname: " + name + "\ndescription: " + desc + "\ntype: " + typ + "\n---\n\n" + body + "\n"
+	}
+	// An extractor that cannot run: any model call shows up as an error.
+	scan := func(extra ...string) string {
+		t.Helper()
+		os.Chdir(base)
+		return must(t, "", append([]string{"extract", "--scan", "claude-memory", "--cmd", "/nonexistent/model"}, extra...)...)
+	}
+	show := func(id string) string { t.Helper(); os.Chdir(repo); return must(t, "codex", "show", id) }
+
+	write("feedback_logging.md", topic("feedback-logging", "Log with structured fields only", "feedback", "Never build log lines with string formatting."))
+	write("project_alpha.md", topic("shared-name", "Alpha rollout is gated on the canary", "project", "The alpha rollout waits for the canary to pass for a day."))
+	write("project_beta.md", topic("shared-name", "Beta customers get weekly builds", "project", "Beta customers receive a build every Tuesday."))
+	write("reference_runbook.md", topic("reference-runbook", "Incident runbook location", "reference", "The incident runbook is the pinned page in the operations space."))
+	if out := scan(); !strings.Contains(out, "4 imported") {
+		t.Fatalf("first scan:\n%s", out)
+	}
+	const ruleID, alphaID, betaID, runbookID = "aiproxy/conventions/log-with-structured-fields-only", "aiproxy/facts/alpha-rollout-is-gated-on-the-canary", "aiproxy/facts/beta-customers-get-weekly-builds", "aiproxy/facts/incident-runbook-location"
+
+	// 1. A tracked memory grows into several sections. The model path only
+	// adds entries, so it must not take the file: the delivered rule would
+	// stay as it was next to a new one.
+	write("feedback_logging.md", topic("feedback-logging", "Log with structured fields only", "feedback", "# Logging\n\nUse structured fields.\n\n# Metrics\n\nAlso count every retry."))
+	out := scan()
+	if !strings.Contains(out, "1 conflicts") || !strings.Contains(out, "conflict: feedback_logging.md can no longer be imported as one note (several sections: not a single note), so "+ruleID+" was left as it is") ||
+		strings.Contains(out, "fallback") || strings.Contains(out, "error") {
+		t.Fatalf("a tracked source that became a mixed note:\n%s", out)
+	}
+	if out := scan(); !strings.Contains(out, "1 conflicts") {
+		t.Fatalf("the conflict must stand:\n%s", out)
+	}
+	if rule := show(ruleID); !strings.Contains(rule, "revision: 1") || !strings.Contains(rule, "string formatting") {
+		t.Fatalf("the tracked entry changed:\n%s", rule)
+	}
+	os.Chdir(base)
+	if out := must(t, "codex", "status", "--all"); !strings.Contains(out, "knowledge: 4 active") {
+		t.Fatalf("a second entry was created:\n%s", out)
+	}
+	if out := scan("--accept-conflicts"); strings.Contains(out, "conflict") {
+		t.Fatalf("accepting:\n%s", out)
+	}
+	if out := scan(); strings.Contains(out, "conflict") || strings.Contains(out, "fallback") {
+		t.Fatalf("after accepting, the unchanged mixed file is settled:\n%s", out)
+	}
+	// The same holds when a tracked memory turns private.
+	write("feedback_logging.md", topic("feedback-logging", "Log with structured fields only", "user", "The user prefers structured logs."))
+	if out := scan(); !strings.Contains(out, "can no longer be imported as one note (is now a user memory)") {
+		t.Fatalf("a tracked source that became a user memory:\n%s", out)
+	}
+
+	// 2. Two sources share a name. One is renamed (same content), the other
+	// deleted: the new path stands for the renamed one only.
+	os.Rename(filepath.Join(mem, "project_alpha.md"), filepath.Join(mem, "project_alpha_rollout.md"))
+	os.Remove(filepath.Join(mem, "project_beta.md"))
+	out = scan()
+	if !strings.Contains(out, "1 renamed") || !strings.Contains(out, "1 sources deleted") || !strings.Contains(out, "source deleted: project_beta.md no longer backs "+betaID) || strings.Contains(out, "no longer backs "+alphaID) {
+		t.Fatalf("rename next to a deletion:\n%s", out)
+	}
+	write("project_alpha_rollout.md", topic("shared-name", "Alpha rollout is gated on the canary", "project", "The alpha rollout waits for the canary to pass for two days."))
+	if out := scan(); !strings.Contains(out, "1 updated") {
+		t.Fatalf("edit after the rename:\n%s", out)
+	}
+	if a := show(alphaID); !strings.Contains(a, "two days") || !strings.Contains(a, "revision: 2") {
+		t.Fatalf("the renamed source lost its entry:\n%s", a)
+	}
+	if b := show(betaID); !strings.Contains(b, "every Tuesday") || !strings.Contains(b, "revision: 1") {
+		t.Fatalf("the deleted source's entry was overwritten:\n%s", b)
+	}
+
+	// 3. A deleted source keeps being reported until its entry is checked
+	// again; the check the report recommends settles it.
+	os.Remove(filepath.Join(mem, "reference_runbook.md"))
+	if out := scan(); !strings.Contains(out, "2 sources deleted") || !strings.Contains(out, "no longer backs "+runbookID) {
+		t.Fatalf("second deletion:\n%s", out)
+	}
+	os.Chdir(repo)
+	must(t, "codex", "verify", runbookID, "--confirm", "-e", "the pinned page is still there")
+	out = scan()
+	if strings.Contains(out, runbookID) || !strings.Contains(out, "1 sources deleted") || !strings.Contains(out, betaID) {
+		t.Fatalf("a confirmation must settle its deleted-source warning, and only its own:\n%s", out)
+	}
+	if out := scan(); strings.Contains(out, runbookID) {
+		t.Fatalf("settled warning came back:\n%s", out)
+	}
+	// A dry run reports the same rename without recording it.
+	os.Rename(filepath.Join(mem, "project_alpha_rollout.md"), filepath.Join(mem, "project_alpha_gate.md"))
+	if out := scan("--dry-run"); !strings.Contains(out, "1 renamed") || strings.Contains(out, "1 would be imported") || strings.Contains(out, "no longer backs "+alphaID) {
+		t.Fatalf("dry run of a rename:\n%s", out)
+	}
+	if out := scan(); !strings.Contains(out, "1 renamed") {
+		t.Fatalf("the dry run recorded the rename:\n%s", out)
+	}
+}

@@ -435,8 +435,12 @@ and the revision the import last wrote.
 - Renamed file: recognised when exactly one new file carries a vanished
   source's content (or name). Several identical candidates are reported as
   ambiguous; nothing is imported or flagged for them.
+- Tracked file that stops being a single typed note (several sections, too
+  long, now `user` or empty): also a conflict. The model path only adds
+  entries, so it must not take a file that already owns one.
 - Deleted file: the entry is kept and reported for review until it is
-  verified again or deprecated. Deletions are reported only when the whole
+  confirmed again (a check recorded after the deletion was found), rewritten
+  or deprecated. Deletions are reported only when the whole
   directory was read: an unreadable file or directory is not a deletion.
 - A directory with no project to attach to is reported and skipped.
 
