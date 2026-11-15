@@ -87,7 +87,16 @@ func ImportFile(s *kb.Store, src FileSource, o ImportOptions) (*Result, error) {
 		}
 		retired, err := retireFrom(s, src, o)
 		res.Retired = retired
-		return res, err
+		if err != nil {
+			return res, err
+		}
+		// What was last imported from this file no longer stands. Forget
+		// it, so that the file is imported again when it is supported
+		// again, even with exactly the content it had before.
+		if abs, aerr := filepath.Abs(src.Path); aerr == nil && loadState(s, abs).Hash != "" {
+			return res, saveHash(s, abs, "")
+		}
+		return res, nil
 	}
 	data, err := os.ReadFile(src.Path)
 	if err != nil {

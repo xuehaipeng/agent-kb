@@ -1951,6 +1951,15 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); strings.Contains(out, "were retired") {
 		t.Errorf("retiring happens once:\n%s", out)
 	}
+	// Putting the file back as it was imports its rule again: the earlier
+	// import is not remembered as still standing.
+	file(".cursor/rules/always.mdc", "---\nalwaysApply: true\n---\nReturn early instead of nesting conditions.\n")
+	if out := must(t, "", "rules", "import", "--repo", "--cmd", script); !strings.Contains(out, "rules/always.mdc: added 1") {
+		t.Errorf("a restored rule file must be imported again:\n%s", out)
+	}
+	if got := must(t, "codex", "rules", "-q"); !strings.Contains(got, "Rule from rules-always.mdc") {
+		t.Errorf("the rule of a restored file is not delivered:\n%s", got)
+	}
 	file(".claude/rules/api.md", "---\npaths:\n  - \"src/api/**/*.ts\"\n---\n\n# API rules\n\n- Validate every API handler input with the shared schema helpers.\n")
 
 	// A path-scoped file named on the command line has no known base.
