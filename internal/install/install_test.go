@@ -28,11 +28,12 @@ func TestUpsertBlockIdempotent(t *testing.T) {
 func TestMergeClaudeSettingsPreservesUserKeys(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "settings.json")
 	os.WriteFile(p, []byte(`{"model":"opus","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"my-cleanup"},{"type":"command","command":"kb hook claude","timeout":30}]}],"Stop":[{"hooks":[{"type":"command","command":"notify"}]}]},"permissions":{"allow":["Bash(ls:*)"]}}`), 0o644)
-	all := append(append([]string{}, claudeDeliveryEvents...), claudeCaptureEvents...)
-	if _, err := mergeClaudeSettings(p, all, []string{claudeRefreshEvent}); err != nil {
+	allEvents := append(append([]string{}, claudeDeliveryEvents...), claudeCaptureEvents...)
+	all := generic(allEvents...)
+	if _, err := mergeClaudeSettings(p, all, generic(claudeRefreshEvent)); err != nil {
 		t.Fatal(err)
 	}
-	if did, _ := mergeClaudeSettings(p, all, []string{claudeRefreshEvent}); did {
+	if did, _ := mergeClaudeSettings(p, all, generic(claudeRefreshEvent)); did {
 		t.Fatal("merge not idempotent")
 	}
 	read := func() map[string]any {
@@ -49,7 +50,7 @@ func TestMergeClaudeSettingsPreservesUserKeys(t *testing.T) {
 	if ss := hooks["SessionStart"].([]any); len(ss) != 2 {
 		t.Fatalf("SessionStart groups: %v", ss)
 	}
-	for _, ev := range all {
+	for _, ev := range allEvents {
 		if _, ok := hooks[ev]; !ok {
 			t.Fatalf("%s hook missing: %v", ev, hooks)
 		}
@@ -64,7 +65,7 @@ func TestMergeClaudeSettingsPreservesUserKeys(t *testing.T) {
 
 	// Manual capture: kb's own capture hooks go, and only those. Another
 	// tool's hook in the same event, and events kb does not own, stay.
-	if _, err := mergeClaudeSettings(p, claudeDeliveryEvents, append([]string{claudeRefreshEvent}, claudeCaptureEvents...)); err != nil {
+	if _, err := mergeClaudeSettings(p, generic(claudeDeliveryEvents...), generic(append([]string{claudeRefreshEvent}, claudeCaptureEvents...)...)); err != nil {
 		t.Fatal(err)
 	}
 	data, _ := os.ReadFile(p)
@@ -85,6 +86,36 @@ func TestMergeClaudeSettingsPreservesUserKeys(t *testing.T) {
 	}
 	if hooks = read()["hooks"].(map[string]any); hooks["PreCompact"] == nil || len(hooks["SessionEnd"].([]any)) != 2 {
 		t.Fatalf("full capture: %v", hooks)
+	}
+
+	// File context is a hook of its own, with a matcher, beside kb's other
+	// hook on the same event; removing it leaves that one alone.
+	refresh := generic(claudeRefreshEvent)
+	if _, err := mergeClaudeSettings(p, append(append([]hookSpec{}, refresh...), fileContextSpecs("pre")...), nil); err != nil {
+		t.Fatal(err)
+	}
+	hooks = read()["hooks"].(map[string]any)
+	pre := hooks["PreToolUse"].([]any)
+	post := hooks["PostToolUse"].([]any)
+	if len(pre) != 2 || len(post) != 1 || post[0].(map[string]any)["matcher"] != "Read|Edit|Write" {
+		t.Fatalf("file-context hooks: pre=%v post=%v", pre, post)
+	}
+	for _, g := range append(append([]any{}, pre...), post...) {
+		for _, h := range g.(map[string]any)["hooks"].([]any) {
+			if _, async := h.(map[string]any)["async"]; async {
+				t.Fatalf("kb's hooks are synchronous: async context can arrive a turn late or be lost: %v", h)
+			}
+		}
+	}
+	if did, _ := mergeClaudeSettings(p, append(append([]hookSpec{}, refresh...), fileContextSpecs("pre")...), nil); did {
+		t.Fatal("file-context merge not idempotent")
+	}
+	if _, err := mergeClaudeSettings(p, refresh, fileContextSpecs("pre")); err != nil {
+		t.Fatal(err)
+	}
+	hooks = read()["hooks"].(map[string]any)
+	if hooks["PostToolUse"] != nil || len(hooks["PreToolUse"].([]any)) != 1 {
+		t.Fatalf("removing file context must leave the refresh hook: %v", hooks)
 	}
 
 	if err := os.WriteFile(p, []byte("{broken"), 0o644); err != nil {

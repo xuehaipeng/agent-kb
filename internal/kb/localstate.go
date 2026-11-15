@@ -16,6 +16,12 @@ import (
 // and what its hooks delivered. None of it is knowledge: it lives in the
 // gitignored local directory and never syncs.
 
+// File-context modes: off by default.
+const (
+	FileContextPost = "post" // after a successful Read, Edit or Write
+	FileContextPre  = "pre"  // also before an Edit or Write
+)
+
 // Capture modes of an installation.
 const (
 	CaptureFull   = "full"   // capture hooks installed (transcript and memory extraction)
@@ -34,6 +40,7 @@ type ClaudeInstall struct {
 	Settings    string `json:"settings"`               // the settings.json that carries the hooks
 	NativeRules string `json:"native_rules,omitempty"` // managed rules file Claude Code loads itself ("" = not used)
 	RuleRefresh bool   `json:"rule_refresh,omitempty"` // PreToolUse hook that re-delivers changed rules
+	FileContext string `json:"file_context,omitempty"` // "", FileContextPost or FileContextPre
 	Updated     string `json:"updated"`
 }
 
@@ -71,6 +78,15 @@ func (s *Store) claudeInstallHere() *ClaudeInstall {
 		}
 	}
 	return r.Claude["user"]
+}
+
+// FileContextMode is the file-context mode of the installation that governs
+// this session: "" (off), FileContextPost or FileContextPre.
+func (s *Store) FileContextMode() string {
+	if in := s.claudeInstallHere(); in != nil {
+		return in.FileContext
+	}
+	return ""
 }
 
 // NativeRulesText is the content of the managed rules file Claude Code
@@ -183,7 +199,11 @@ type AgentDelivery struct {
 	Rules       int    `json:"rules"`            // rules the agent holds after it (in the payload or the managed file)
 	Compactions int    `json:"compactions"`      // compactions of this agent seen so far
 	Deliveries  int    `json:"deliveries"`       // times rules were delivered to it
-	At          string `json:"at"`
+	// FileContext is what the file-context hook already gave this agent
+	// since its last compaction: entry id -> revision. A compaction clears
+	// it, because the summary may not have kept the headers.
+	FileContext map[string]int `json:"file_context,omitempty"`
+	At          string         `json:"at"`
 }
 
 func (s *Store) deliveryPath(session string) string {
@@ -229,6 +249,7 @@ func (s *Store) RecordDelivery(session, agent, agentType, event string, d Delive
 	a.Deliveries++
 	if compacted {
 		a.Compactions++
+		a.FileContext = nil // only this agent's: another agent's context is intact
 	}
 	a.At = s.Now().UTC().Format(time.RFC3339)
 	if data, err := json.MarshalIndent(st, "", "  "); err == nil {
@@ -302,7 +323,11 @@ func (s *Store) RenderDeliveryDiagnostics() string {
 	case in == nil:
 		b.WriteString("claude installation: none recorded on this machine ('kb install claude'); a bare install uses full capture\n")
 	default:
-		fmt.Fprintf(&b, "claude installation: capture %s; rule refresh hook %s; hooks in %s\n", in.Capture, onOff(in.RuleRefresh), in.Settings)
+		fc := in.FileContext
+		if fc == "" {
+			fc = "off"
+		}
+		fmt.Fprintf(&b, "claude installation: capture %s; rule refresh hook %s; file context %s; hooks in %s\n", in.Capture, onOff(in.RuleRefresh), fc, in.Settings)
 	}
 	switch path, active := s.NativeRulesActive(); {
 	case path == "":

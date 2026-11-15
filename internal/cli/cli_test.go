@@ -2808,3 +2808,471 @@ func TestAccessStatisticsAreOnlyASignal(t *testing.T) {
 		t.Errorf("access statistics leaked into the shared hub:\n%s", st)
 	}
 }
+
+// TestFileContextHookRepoMode covers file context for a repository bundle
+// (<repo>/knowledge): a repo-local installation, unprefixed entry ids, the
+// delivery state under the bundle's local directory, and the benchmark.
+func TestFileContextHookRepoMode(t *testing.T) {
+	repo := setupRepo(t)
+	must(t, "", "init", "--install", "claude")
+	settings := filepath.Join(repo, ".claude", "settings.json")
+	hooksIn := func() map[string]any {
+		var m map[string]any
+		data, _ := os.ReadFile(settings)
+		json.Unmarshal(data, &m)
+		h, _ := m["hooks"].(map[string]any)
+		return h
+	}
+	file := filepath.Join(repo, "src", "app.go")
+	tool := func(cwd, event, toolName, path, session, agent string) string {
+		t.Helper()
+		os.Chdir(cwd)
+		in := `{"session_id":"` + session + `","hook_event_name":"` + event + `","tool_name":"` + toolName + `","tool_input":{"file_path":"` + path + `"},"cwd":"` + cwd + `"`
+		if agent != "" {
+			in += `,"agent_id":"` + agent + `","agent_type":"Explore"`
+		}
+		out, _, code := kbRun(t, "claude-code", in+"}", "hook", "claude", "file")
+		if code != 0 {
+			t.Fatalf("hook exit %d", code)
+		}
+		if strings.TrimSpace(out) == "" {
+			return ""
+		}
+		var m struct {
+			Out struct {
+				Event   string `json:"hookEventName"`
+				Context string `json:"additionalContext"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("not hook JSON: %v\n%s", err, out)
+		}
+		return m.Out.Event + "|" + m.Out.Context
+	}
+	read := func(session, agent string) string { return tool(repo, "PostToolUse", "Read", file, session, agent) }
+
+	must(t, "claude-code", "add", "learning", "The app package starts the metrics server", "-d", "It binds the port before the handlers are ready.", "-r", "src/app.go", "-e", "read src/app.go")
+	must(t, "claude-code", "add", "rule", "Keep src free of init functions", "-d", "start-up order must be explicit", "-e", "user said so", "--when", "src/**")
+	must(t, "claude-code", "add", "learning", "The docs are generated", "-d", "Do not edit them by hand.", "-r", "docs/**", "-e", "read the Makefile")
+	const learning, rule = "learnings/the-app-package-starts-the-metrics-server", "conventions/keep-src-free-of-init-functions"
+
+	// Off by default, in a bundle as in a hub.
+	if h := hooksIn(); h["PostToolUse"] != nil || h["PreToolUse"] != nil {
+		t.Fatalf("file context must be opt-in: %v", h)
+	}
+	if out := read("off", ""); out != "" {
+		t.Fatalf("off must inject nothing:\n%s", out)
+	}
+	// Turned on for this repository: the hooks go into the repository's own
+	// settings, and the choice is recorded locally, not in the bundle.
+	if out := must(t, "", "install", "claude", "--file-context", "post"); !strings.Contains(out, "File context is on (post)") {
+		t.Errorf("install notes:\n%s", out)
+	}
+	if h := hooksIn(); h["PostToolUse"] == nil || h["PreToolUse"] != nil {
+		t.Fatalf("post mode hooks in the repository's settings: %v", h)
+	}
+	// The rule for the file, then the anchored entry, by their unprefixed
+	// ids; nothing about other files.
+	out := read("s1", "")
+	for _, want := range []string{"PostToolUse|kb: recorded about src/app.go, for the work that follows", "- rule for this file: Keep src free of init functions - start-up order must be explicit [" + rule + "]", "- " + learning + " [verified,"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("repo-mode context lacks %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "The docs are generated") || strings.Index(out, rule) > strings.Index(out, learning) {
+		t.Errorf("only what is recorded about the file, rules first:\n%s", out)
+	}
+	// Once per agent; a subagent has its own context; a compaction of that
+	// agent starts it over. The state lives in the bundle's local directory.
+	if again := read("s1", "") + tool(repo, "PostToolUse", "Edit", file, "s1", ""); again != "" {
+		t.Errorf("the same agent got the same entries twice:\n%s", again)
+	}
+	if sub := read("s1", "agent-1"); !strings.Contains(sub, learning) {
+		t.Errorf("a subagent must get it regardless of its parent:\n%s", sub)
+	}
+	state, err := os.ReadFile(filepath.Join(repo, "knowledge", ".kb", "sessions", "s1.json"))
+	if err != nil || !strings.Contains(string(state), `"`+learning+`"`) || !strings.Contains(string(state), `"agent-1"`) {
+		t.Fatalf("delivery state under the bundle's local directory: %v\n%s", err, state)
+	}
+	os.Chdir(repo)
+	kbRun(t, "claude-code", `{"session_id":"s1","hook_event_name":"SessionStart","source":"compact","agent_id":"agent-1","agent_type":"Explore","cwd":"`+repo+`"}`, "hook", "claude")
+	if sub := read("s1", "agent-1"); !strings.Contains(sub, learning) {
+		t.Errorf("after its compaction the subagent should get the entry again:\n%s", sub)
+	}
+	// A rewritten entry is given again.
+	must(t, "codex", "update", learning, "-d", "It binds the port before the handlers are registered.", "-m", "clearer", "-e", "src/app.go")
+	if out := read("s1", ""); !strings.Contains(out, "before the handlers are registered") || strings.Contains(out, rule) {
+		t.Errorf("after an update, the new revision only:\n%s", out)
+	}
+	// From a subdirectory, and for files the hook does not cover.
+	if out := tool(filepath.Join(repo, "src"), "PostToolUse", "Read", file, "s2", ""); !strings.Contains(out, "kb: recorded about src/app.go") || !strings.Contains(out, learning) {
+		t.Errorf("from a subdirectory:\n%s", out)
+	}
+	if out := tool(repo, "PostToolUse", "Read", filepath.Join(filepath.Dir(repo), "elsewhere.go"), "s3", ""); out != "" {
+		t.Errorf("a file outside the repository:\n%s", out)
+	}
+	if out := tool(repo, "PreToolUse", "Edit", file, "s4", ""); out != "" {
+		t.Errorf("post mode must not inject before an edit:\n%s", out)
+	}
+	// Pre mode, then the benchmark with unprefixed ids.
+	must(t, "", "install", "claude", "--file-context", "pre")
+	if out := tool(repo, "PreToolUse", "Edit", file, "s5", ""); !strings.Contains(out, "PreToolUse|kb: recorded about src/app.go, before you change it") || !strings.Contains(out, learning) {
+		t.Errorf("pre-edit context:\n%s", out)
+	}
+	cases := filepath.Join(t.TempDir(), "cases.json")
+	os.WriteFile(cases, []byte(`[{"file":"src/app.go","relevant":["`+learning+`","`+rule+`"]},{"file":"docs/guide.md","relevant":["learnings/the-docs-are-generated"]},{"file":"README.md","relevant":[]}]`), 0o644)
+	os.Chdir(repo)
+	bench := must(t, "codex", "bench", "file-context", "--cases", cases)
+	for _, want := range []string{"src/app.go: injected 2, relevant 2 of 2", "docs/guide.md: injected 1, relevant 1 of 1", "README.md: injected 0", "cases 3, injections 2: precision 1.00 (3 of 3 injected were judged relevant), recall 1.00 (3 of 3 judged relevant were injected)"} {
+		if !strings.Contains(bench, want) {
+			t.Errorf("repo-mode benchmark lacks %q:\n%s", want, bench)
+		}
+	}
+	// A lookup slower than the hook waits is scored as the hook would
+	// behave: nothing injected, its judged entries still counted.
+	t.Setenv("KB_FILE_CONTEXT_TIMEOUT_MS", "0")
+	slow := must(t, "codex", "bench", "file-context", "--cases", cases)
+	t.Setenv("KB_FILE_CONTEXT_TIMEOUT_MS", "")
+	for _, want := range []string{"src/app.go: timed out (the lookup took ", "injected 0, relevant 0 of 2", "cases 3, injections 0: precision 0.00 (0 of 0 injected were judged relevant), recall 0.00 (0 of 3 judged relevant were injected)", "timed out: 3 of 3 cases took longer than the 0 ms the hook waits"} {
+		if !strings.Contains(slow, want) {
+			t.Errorf("benchmark past the hook's deadline lacks %q:\n%s", want, slow)
+		}
+	}
+	// The local state is not part of the bundle that gets committed.
+	if st := git(t, repo, "status", "--porcelain", "--", "knowledge"); strings.Contains(st, ".kb/") {
+		t.Errorf("local state shows up as a change to the bundle:\n%s", st)
+	}
+	// A group kb's hook shares with someone else's command keeps its
+	// matcher: kb's hook moves into a group of its own instead of narrowing
+	// what the other command runs for.
+	var cfg map[string]any
+	data, _ := os.ReadFile(settings)
+	json.Unmarshal(data, &cfg)
+	cfg["hooks"].(map[string]any)["PostToolUse"] = []any{map[string]any{
+		"matcher": "Read|Edit|Write|Bash",
+		"hooks": []any{
+			map[string]any{"type": "command", "command": "kb hook claude file", "timeout": 5},
+			map[string]any{"type": "command", "command": "my-audit-log"},
+		},
+	}}
+	data, _ = json.MarshalIndent(cfg, "", "  ")
+	os.WriteFile(settings, data, 0o644)
+	must(t, "", "install", "claude")
+	var theirs, ours string
+	for _, g := range hooksIn()["PostToolUse"].([]any) {
+		gm := g.(map[string]any)
+		for _, h := range gm["hooks"].([]any) {
+			switch h.(map[string]any)["command"] {
+			case "my-audit-log":
+				theirs = fmt.Sprint(gm["matcher"])
+				if len(gm["hooks"].([]any)) != 1 {
+					t.Errorf("kb's hook should have left the shared group: %v", gm)
+				}
+			case "kb hook claude file":
+				ours = fmt.Sprint(gm["matcher"])
+			}
+		}
+	}
+	if theirs != "Read|Edit|Write|Bash" || ours != "Read|Edit|Write" {
+		t.Errorf("matchers after reinstalling: theirs %q (must be unchanged), kb's %q", theirs, ours)
+	}
+	// Off again: the hooks go from the repository's settings.
+	must(t, "", "install", "claude", "--file-context", "off")
+	if h := hooksIn(); h["PreToolUse"] != nil || h["SessionStart"] == nil || strings.Contains(fmt.Sprint(h["PostToolUse"]), "kb hook claude file") || !strings.Contains(fmt.Sprint(h["PostToolUse"]), "my-audit-log") {
+		t.Fatalf("after turning file context off, kb's hooks go and the other command stays: %v", h)
+	}
+	if out := read("s6", ""); out != "" {
+		t.Errorf("off must inject nothing:\n%s", out)
+	}
+}
+
+// Item 4: file context is off by default; when turned on it hands an agent
+// what is recorded about a file it reads or edits, once per agent, entry
+// revision and compaction, within a budget and within the project.
+func TestFileContextHook(t *testing.T) {
+	base, home, aiproxy, kubedl := populatedHub(t)
+	const learning = "aiproxy/learnings/retries-need-idempotency-keys"
+	settings := filepath.Join(home, ".claude", "settings.json")
+	hooksIn := func() map[string]any {
+		var m map[string]any
+		data, _ := os.ReadFile(settings)
+		json.Unmarshal(data, &m)
+		h, _ := m["hooks"].(map[string]any)
+		return h
+	}
+	file := filepath.Join(aiproxy, "pkg", "x.go")
+	tool := func(cwd, event, toolName, path, session, agent string) string {
+		t.Helper()
+		os.Chdir(cwd)
+		in := `{"session_id":"` + session + `","hook_event_name":"` + event + `","tool_name":"` + toolName + `","tool_input":{"file_path":"` + path + `","command":"cat ` + path + `"},"cwd":"` + cwd + `"`
+		if agent != "" {
+			in += `,"agent_id":"` + agent + `","agent_type":"Explore"`
+		}
+		out, _, code := kbRun(t, "claude-code", in+"}", "hook", "claude", "file")
+		if code != 0 {
+			t.Fatalf("hook exit %d", code)
+		}
+		if strings.TrimSpace(out) == "" {
+			return ""
+		}
+		var m struct {
+			Out map[string]any `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("not hook JSON: %v\n%s", err, out)
+		}
+		if _, decides := m.Out["permissionDecision"]; decides {
+			t.Fatalf("the file-context hook must never decide a permission: %s", out)
+		}
+		return fmt.Sprint(m.Out["hookEventName"]) + "|" + fmt.Sprint(m.Out["additionalContext"])
+	}
+	read := func(session, agent string) string { return tool(aiproxy, "PostToolUse", "Read", file, session, agent) }
+
+	// Off by default: no hook entry, and the handler says nothing even if
+	// something still calls it.
+	if h := hooksIn(); h["PostToolUse"] != nil || h["PreToolUse"] != nil {
+		t.Fatalf("file context must be opt-in: %v", h)
+	}
+	if out := read("off", ""); out != "" {
+		t.Fatalf("off must inject nothing:\n%s", out)
+	}
+
+	out := must(t, "", "install", "claude", "--file-context", "post")
+	if !strings.Contains(out, "File context is on (post)") || !strings.Contains(out, "not the edit that triggered it") {
+		t.Errorf("install notes:\n%s", out)
+	}
+	post := hooksIn()["PostToolUse"].([]any)[0].(map[string]any)
+	if post["matcher"] != "Read|Edit|Write" || hooksIn()["PreToolUse"] != nil {
+		t.Fatalf("post mode hooks: %v", hooksIn())
+	}
+	// After a Read: the anchored entry's header, with its freshness label,
+	// worded as input for what follows.
+	out = read("s1", "")
+	for _, want := range []string{"PostToolUse|kb: recorded about pkg/x.go, for the work that follows", "- " + learning + " [verified,code-changed,stale] Retries need idempotency keys - Upstream jobs duplicate without keys."} {
+		if !strings.Contains(out, want) {
+			t.Errorf("post-read context lacks %q:\n%s", want, out)
+		}
+	}
+	// Once per agent: a second touch adds nothing, by Read or by Edit.
+	if again := read("s1", "") + tool(aiproxy, "PostToolUse", "Edit", file, "s1", ""); again != "" {
+		t.Errorf("the same agent got the same entry twice:\n%s", again)
+	}
+	// Another agent of the session has its own context.
+	if sub := read("s1", "agent-1"); !strings.Contains(sub, learning) {
+		t.Errorf("a subagent must get it regardless of its parent:\n%s", sub)
+	}
+	if sub := read("s1", "agent-1"); sub != "" {
+		t.Errorf("the subagent got it twice:\n%s", sub)
+	}
+	// After that agent compacts, it starts over; the main agent does not.
+	os.Chdir(aiproxy)
+	kbRun(t, "claude-code", `{"session_id":"s1","hook_event_name":"SessionStart","source":"compact","agent_id":"agent-1","agent_type":"Explore","cwd":"`+aiproxy+`"}`, "hook", "claude")
+	if sub := read("s1", "agent-1"); !strings.Contains(sub, learning) {
+		t.Errorf("after its compaction the subagent should get the entry again:\n%s", sub)
+	}
+	if again := read("s1", ""); again != "" {
+		t.Errorf("another agent's compaction reset the main agent:\n%s", again)
+	}
+	// A rewritten entry is given again; a rule that applies to the file comes first.
+	must(t, "codex", "update", learning, "-d", "Upstream jobs duplicate unless every retry carries a key.", "-m", "clearer", "-e", "pkg/x.go")
+	must(t, "claude-code", "add", "rule", "Keep pkg free of global state", "-d", "tests run in parallel", "-e", "user said so", "--when", "pkg/**")
+	out = read("s1", "")
+	if !strings.Contains(out, "unless every retry carries a key") || !strings.Contains(out, "- rule for this file: Keep pkg free of global state") || strings.Index(out, "rule for this file") > strings.Index(out, learning) {
+		t.Errorf("after an update and a new file rule:\n%s", out)
+	}
+	// Scope: another project's knowledge never leaks, even for the same
+	// relative path; files outside the repository and tools that are not
+	// Read, Edit or Write are not covered.
+	if out := tool(kubedl, "PostToolUse", "Read", filepath.Join(kubedl, "pkg", "x.go"), "s2", ""); out != "" {
+		t.Errorf("cross-project leak:\n%s", out)
+	}
+	if out := tool(aiproxy, "PostToolUse", "Read", filepath.Join(base, "elsewhere.go"), "s3", ""); out != "" {
+		t.Errorf("a file outside the repository:\n%s", out)
+	}
+	if out := tool(aiproxy, "PostToolUse", "Bash", file, "s3", ""); out != "" {
+		t.Errorf("a shell command is not a covered file access:\n%s", out)
+	}
+	// Post mode never speaks before an edit.
+	if out := tool(aiproxy, "PreToolUse", "Edit", file, "s4", ""); out != "" {
+		t.Errorf("post mode must not inject before an edit:\n%s", out)
+	}
+
+	// Pre mode: context before the edit, worded as such, then nothing new
+	// after it.
+	must(t, "", "install", "claude", "--file-context", "pre")
+	if h := hooksIn(); h["PreToolUse"].([]any)[0].(map[string]any)["matcher"] != "Edit|Write" || h["PostToolUse"] == nil {
+		t.Fatalf("pre mode hooks: %v", h)
+	}
+	out = tool(aiproxy, "PreToolUse", "Edit", file, "s5", "")
+	if !strings.Contains(out, "PreToolUse|kb: recorded about pkg/x.go, before you change it") || !strings.Contains(out, learning) {
+		t.Errorf("pre-edit context:\n%s", out)
+	}
+	if after := tool(aiproxy, "PostToolUse", "Edit", file, "s5", ""); after != "" {
+		t.Errorf("the edit that follows adds nothing new:\n%s", after)
+	}
+	if out := tool(aiproxy, "PreToolUse", "Read", file, "s6", ""); out != "" {
+		t.Errorf("pre mode covers Edit and Write, not Read:\n%s", out)
+	}
+
+	// The benchmark measures the same lookup against judged cases without
+	// injecting or recording anything.
+	cases := filepath.Join(base, "cases.json")
+	os.WriteFile(cases, []byte(`[{"file":"pkg/x.go","relevant":["`+learning+`","aiproxy/learnings/not-recorded"]},{"file":"docs/readme.md","relevant":[]}]`), 0o644)
+	bench := must(t, "codex", "bench", "file-context", "--cases", cases)
+	for _, want := range []string{"pkg/x.go: injected ", "relevant 1 of 2", "docs/readme.md: injected 0", "cases 2, injections 1: precision 0.50 (1 of 2 injected were judged relevant)", "recall 0.50 (1 of 2 judged relevant were injected)", "budget 2000", "File context stays off until they say it helps."} {
+		if !strings.Contains(bench, want) {
+			t.Errorf("benchmark lacks %q:\n%s", want, bench)
+		}
+	}
+	// Budget: many anchored entries fit one injection, whole lines only.
+	var items []string
+	for i := 0; i < 30; i++ {
+		items = append(items, fmt.Sprintf(`{"type":"learning","title":"Package pitfall number %02d about retries and timeouts","description":"A long enough description of pitfall %02d to take real space in a header line.","resources":["pkg/**"]}`, i, i))
+	}
+	os.Chdir(aiproxy)
+	if out, errs, code := kbRun(t, "claude-code", "["+strings.Join(items, ",")+"]", "add", "--from", "-", "-e", "read the code", "--force"); code != 0 || !strings.Contains(out, "seeded 30 of 30") {
+		t.Fatalf("seed: %d %s %s", code, out, errs)
+	}
+	out = read("s7", "")
+	ctx := out[strings.Index(out, "|")+1:]
+	units := 0
+	for _, r := range ctx {
+		if r >= 0x10000 {
+			units++
+		}
+		units++
+	}
+	if units > 2000 || units < 1200 || !strings.Contains(ctx, "more: kb search -f pkg/x.go)") {
+		t.Errorf("injection is %d units; it must stay within 2000 and say what it left out:\n%s", units, ctx)
+	}
+	for _, l := range strings.Split(strings.TrimSpace(ctx), "\n")[1:] {
+		if !strings.HasPrefix(l, "- ") && !strings.HasPrefix(l, "(+") {
+			t.Errorf("a line was split: %q", l)
+		}
+	}
+	// What was left out comes with the next touch, not never.
+	next := read("s7", "")
+	if !strings.Contains(next, "Package pitfall number") {
+		t.Errorf("the next touch should bring entries not yet given:\n%s", next)
+	}
+	for _, l := range strings.Split(next, "\n") {
+		if strings.HasPrefix(l, "- ") && strings.Contains(out, l) {
+			t.Errorf("the next touch repeated a line already given: %s", l)
+		}
+	}
+	// Repeated touches drain everything anchored to the file: the lookup
+	// is not cut to a first few that have all been given already.
+	got := map[string]bool{}
+	first := ""
+	for i := 0; i < 12; i++ {
+		out := read("s9", "")
+		if i == 0 {
+			first = out
+		}
+		if out == "" {
+			break
+		}
+		for _, l := range strings.Split(out, "\n") {
+			if j := strings.Index(l, "Package pitfall number "); j >= 0 {
+				n := l[j+len("Package pitfall number "):][:2]
+				if got[n] {
+					t.Errorf("pitfall %s was given twice", n)
+				}
+				got[n] = true
+			}
+		}
+	}
+	if len(got) != 30 {
+		t.Errorf("repeated touches gave %d of the 30 anchored entries", len(got))
+	}
+	if !strings.Contains(first, "(+") || read("s9", "") != "" {
+		t.Errorf("the first touch says how many are still to come, and a drained file adds nothing:\n%s", first)
+	}
+	// A lookup that is dropped for taking too long was not delivered: it
+	// leaves no record, and the next touch gives those entries.
+	t.Setenv("KB_FILE_CONTEXT_TIMEOUT_MS", "0")
+	if out := read("s10", ""); out != "" {
+		t.Fatalf("a lookup past its deadline must print nothing:\n%s", out)
+	}
+	t.Setenv("KB_FILE_CONTEXT_TIMEOUT_MS", "")
+	if out := read("s10", ""); !strings.Contains(out, "Package pitfall number") && !strings.Contains(out, learning) {
+		t.Errorf("entries of a dropped lookup were recorded as delivered and never arrived:\n%s", out)
+	}
+
+	// A rule limited to the file that is also anchored to it is one match,
+	// listed once as the rule it is; the benchmark counts it once too.
+	must(t, "claude-code", "add", "rule", "Wrap errors with context in pkg", "-d", "callers log them", "-e", "user said so", "--when", "pkg/**", "-r", "pkg/**")
+	const wrapRule = "aiproxy/conventions/wrap-errors-with-context-in-pkg"
+	if out := read("s11", ""); strings.Count(out, wrapRule) != 1 || !strings.Contains(out, "- rule for this file: Wrap errors with context in pkg") {
+		t.Errorf("a rule that is also anchored to the file must appear once, as a rule:\n%s", out)
+	}
+	os.WriteFile(cases, []byte(`[{"file":"pkg/x.go","relevant":["`+wrapRule+`"]}]`), 0o644)
+	if bench := must(t, "codex", "bench", "file-context", "--cases", cases); !strings.Contains(bench, "relevant 1 of 1") || !strings.Contains(bench, "recall 1.00 (1 of 1 judged relevant were injected)") {
+		t.Errorf("the benchmark counted one entry twice:\n%s", bench)
+	}
+	// A session started in a subdirectory: the touched file is looked up
+	// by its place in the repository, not taken again as relative to the
+	// working directory (where pkg/pkg/x.go happens to exist).
+	must(t, "claude-code", "add", "learning", "Exact anchor for the top-level x.go only", "-d", "It is about pkg/x.go and no other file.", "-r", "pkg/x.go", "-e", "read the code")
+	os.MkdirAll(filepath.Join(aiproxy, "pkg", "pkg"), 0o755)
+	os.WriteFile(filepath.Join(aiproxy, "pkg", "pkg", "x.go"), []byte("package pkg\n"), 0o644)
+	sub := ""
+	for i := 0; i < 15 && !strings.Contains(sub, "Exact anchor"); i++ {
+		out := tool(filepath.Join(aiproxy, "pkg"), "PostToolUse", "Read", file, "s13", "")
+		if out == "" {
+			break
+		}
+		sub += out
+	}
+	if !strings.Contains(sub, "kb: recorded about pkg/x.go") || !strings.Contains(sub, "Exact anchor for the top-level x.go only") {
+		t.Errorf("from a subdirectory, the touched file's own entries must be found:\n%s", sub)
+	}
+	if out := tool(filepath.Join(aiproxy, "pkg"), "PostToolUse", "Read", filepath.Join(aiproxy, "pkg", "pkg", "x.go"), "s14", ""); strings.Contains(out, "Exact anchor") {
+		t.Errorf("an entry anchored to pkg/x.go was given for pkg/pkg/x.go:\n%s", out)
+	}
+	// The benchmark keeps the hook's scope: a file the hook does not cover
+	// counts as nothing injected, not as a lookup the hook never does.
+	must(t, "claude-code", "add", "learning", "Go files are formatted on save", "-d", "Anchored to every Go file by name.", "-r", "*.go", "-e", "read the code")
+	os.WriteFile(cases, []byte(`[{"file":"`+filepath.Join(base, "elsewhere.go")+`","relevant":["aiproxy/learnings/go-files-are-formatted-on-save"]}]`), 0o644)
+	os.Chdir(aiproxy)
+	if bench := must(t, "codex", "bench", "file-context", "--cases", cases); !strings.Contains(bench, "not covered by the hook (outside the repository): injected 0, relevant 0 of 1") || !strings.Contains(bench, "cases 1, injections 0:") {
+		t.Errorf("the benchmark looked up a file the hook never would:\n%s", bench)
+	}
+	// A title of any length is cut in a header: it cannot use up the
+	// budget and hold back itself and everything ranked after it.
+	must(t, "claude-code", "add", "learning", "Oversized "+strings.Repeat("title about the retry queue ", 120), "-d", "An entry whose title alone is longer than one injection.", "-r", "pkg/**", "-e", "read the code", "--force")
+	seen, bigLine := map[string]bool{}, ""
+	for i := 0; i < 15; i++ {
+		out := read("s12", "")
+		if out == "" {
+			break
+		}
+		for _, l := range strings.Split(out, "\n") {
+			if j := strings.Index(l, "Package pitfall number "); j >= 0 {
+				seen[l[j+len("Package pitfall number "):][:2]] = true
+			}
+			if strings.Contains(l, "] Oversized title about") {
+				bigLine = l
+			}
+		}
+	}
+	if bigLine == "" || !strings.Contains(bigLine, "…") || len(bigLine) > 600 {
+		t.Errorf("an oversized title must be delivered, cut to a header (%d bytes):\n%.200s", len(bigLine), bigLine)
+	}
+	if len(seen) != 30 || read("s12", "") != "" {
+		t.Errorf("an oversized entry held back the rest: %d of 30 delivered", len(seen))
+	}
+
+	if d := must(t, "codex", "rules", "--delivery"); !strings.Contains(d, "file context pre") {
+		t.Errorf("diagnostics:\n%s", d)
+	}
+	// Off again: the hooks go, kb's other hooks stay, and it is remembered.
+	must(t, "", "install", "claude", "--file-context", "off")
+	must(t, "", "install", "claude")
+	if h := hooksIn(); h["PostToolUse"] != nil || h["PreToolUse"] != nil || h["SessionStart"] == nil || h["SubagentStart"] == nil {
+		t.Fatalf("after turning file context off: %v", h)
+	}
+	if out := read("s8", ""); out != "" {
+		t.Errorf("off must inject nothing:\n%s", out)
+	}
+}

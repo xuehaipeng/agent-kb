@@ -81,8 +81,10 @@ Cross-review:
 Set up and maintain:
   kb init [--dir knowledge] [--install claude,codex,git-hooks]   single-repo bundle (repo mode)
   kb install <claude|codex|cursor|antigravity|hermes|git-hooks|all>... [--global|--repo]
-           claude: [--capture full|manual] [--native-rules on|off] [--rule-refresh on|off]  (choices are remembered
-           on this machine: a later bare install keeps them)
+           claude: [--capture full|manual] [--native-rules on|off] [--rule-refresh on|off] [--file-context off|post|pre]
+           (choices are remembered on this machine: a later bare install keeps them)
+  kb bench file-context --cases <file.json>   measure what --file-context would inject for judged cases
+                              ([{"file":"path","relevant":["id",...]}]): precision, recall, context cost, latency
   kb index [--quiet]          regenerate index.md files (deterministic)
   kb lint [--staged] [--fix]  deterministic checks; exit 1 on errors
   kb maintain                 index + pointer refresh + lint (cron-safe)
@@ -181,6 +183,8 @@ done:
 		return a.cmdHook(rest)
 	case "mcp":
 		err = a.cmdMCP(rest)
+	case "bench":
+		err = a.cmdBench(rest)
 	default:
 		err = fmt.Errorf("unknown command %q (see 'kb help')", cmd)
 	}
@@ -284,6 +288,8 @@ func (a *App) cmdInstall(args []string) error {
 	f.str(&capture, "", "claude: full (capture hooks) or manual (rule delivery only); remembered on this machine", "capture")
 	f.str(&nativeRules, "", "claude: on|off, write global rules to a rules file Claude Code loads itself", "native-rules")
 	f.str(&ruleRefresh, "", "claude: on|off, re-deliver rules that changed during a session (runs kb before every tool call)", "rule-refresh")
+	var fileContext string
+	f.str(&fileContext, "", "claude: off|post|pre, hand an agent what is recorded about a file it reads or edits (off by default)", "file-context")
 	f.boolean(&global, "install user-wide (default with a hub)", "global")
 	f.boolean(&repo, "install into the current repository (default with a repo bundle)", "repo")
 	pos, err := f.parse(args)
@@ -298,6 +304,7 @@ func (a *App) cmdInstall(args []string) error {
 	}
 	opts["skills-dir"] = skills
 	opts["capture"], opts["native-rules"], opts["rule-refresh"] = capture, nativeRules, ruleRefresh
+	opts["file-context"] = fileContext
 	if global {
 		opts["scope"] = "global"
 	}
@@ -990,6 +997,53 @@ func (a *App) cmdExtract(args []string) error {
 			a.out("  %s [unverified]\n", id)
 		}
 	}
+	return nil
+}
+
+// cmdBench measures an opt-in feature against judged cases before anyone
+// turns it on.
+func (a *App) cmdBench(args []string) error {
+	f := newFlags("bench")
+	a.globals(f)
+	var casesFile string
+	var asJSON bool
+	f.str(&casesFile, "", "JSON file of judged cases", "cases")
+	f.boolean(&asJSON, "JSON output", "json")
+	pos, err := f.parse(args)
+	if err != nil {
+		return err
+	}
+	if len(pos) != 1 || pos[0] != "file-context" || casesFile == "" {
+		return errors.New(`usage: kb bench file-context --cases <file.json>   ([{"file":"src/a.go","relevant":["learnings/x"]}, ...])`)
+	}
+	data, err := os.ReadFile(casesFile)
+	if err != nil {
+		return err
+	}
+	var cases []kb.FileContextCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		return fmt.Errorf("%s: %w", casesFile, err)
+	}
+	s, err := a.store()
+	if err != nil {
+		return err
+	}
+	b, err := s.BenchFileContext(cases, fileContextWait())
+	if err != nil {
+		return err
+	}
+	if asJSON {
+		return a.json(b)
+	}
+	for _, l := range b.Lines {
+		a.out("%s\n", l)
+	}
+	a.out("cases %d, injections %d: precision %.2f (%d of %d injected were judged relevant), recall %.2f (%d of %d judged relevant were injected)\n", b.Cases, b.Injected, b.Precision, b.Hits, b.Returned, b.Recall, b.Hits, b.Relevant)
+	a.out("context per injection: mean %.0f, max %d units (budget %d); lookup: median %.1f ms, max %.1f ms\n", b.MeanUnits, b.MaxUnits, kb.FileContextBudget, b.MedianMillis, b.MaxMillis)
+	if b.TimedOut > 0 {
+		a.out("timed out: %d of %d cases took longer than the %.0f ms the hook waits; the hook would have injected nothing for them, and they are scored that way\n", b.TimedOut, b.Cases, b.DeadlineMS)
+	}
+	a.out("These numbers describe the judged cases only. File context stays off until they say it helps.\n")
 	return nil
 }
 

@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"time"
 
 	"github.com/xuehaipeng/agent-kb/internal/extract"
 	"github.com/xuehaipeng/agent-kb/internal/kb"
@@ -24,7 +26,17 @@ type hookInput struct {
 	// Set when the event belongs to a subagent rather than the main agent.
 	AgentID   string `json:"agent_id"`
 	AgentType string `json:"agent_type"`
+	// Tool events.
+	ToolName  string `json:"tool_name"`
+	ToolInput struct {
+		FilePath string `json:"file_path"`
+	} `json:"tool_input"`
 }
+
+// fileContextTimeout bounds the lookup the file-context hook does inside a
+// tool call. Past it the hook says nothing: late context is worth less than
+// a stalled tool.
+const fileContextTimeout = 1500 * time.Millisecond
 
 // hookContext prints additionalContext for events that take context only
 // as JSON (SubagentStart, PreToolUse). It sets no decision.
@@ -47,6 +59,10 @@ func (a *App) cmdHook(args []string) int {
 	s, err := a.store()
 	if err != nil {
 		return 0 // not a kb-enabled repository
+	}
+	if len(args) > 1 && args[1] == "file" {
+		a.hookFileContext(s, in)
+		return 0
 	}
 	switch in.HookEventName {
 	case "SessionStart":
@@ -183,6 +199,51 @@ func (a *App) spawn(s *kb.Store, in hookInput, args []string, label string) erro
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+// hookFileContext is the opt-in file-context hook: after a successful Read,
+// Edit or Write (and, in "pre" mode, before an Edit or Write) it hands the
+// agent what is recorded about that file. It adds context only: it never
+// decides whether the tool may run.
+func (a *App) hookFileContext(s *kb.Store, in hookInput) {
+	var pre bool
+	mode := s.FileContextMode()
+	switch {
+	case mode == "":
+		return // off: a hook entry left behind in some settings file changes nothing
+	case in.HookEventName == "PostToolUse" && (in.ToolName == "Read" || in.ToolName == "Edit" || in.ToolName == "Write"):
+	case in.HookEventName == "PreToolUse" && mode == kb.FileContextPre && (in.ToolName == "Edit" || in.ToolName == "Write"):
+		pre = true
+	default:
+		return // not a file access this hook covers (a shell command, another tool)
+	}
+	// Only the lookup is timed, and it records nothing. What was given is
+	// recorded after it has been printed: a lookup that is dropped for
+	// taking too long leaves no trace, so the next touch of the file tries
+	// again instead of treating those entries as already delivered.
+	done := make(chan kb.FileContext, 1)
+	go func() { done <- s.PlanFileContext(in.SessionID, in.AgentID, in.ToolInput.FilePath, pre) }()
+	select {
+	case fc := <-done:
+		if fc.Text != "" {
+			a.hookContext(in.HookEventName, fc.Text)
+			s.RecordFileContext(in.SessionID, in.AgentID, in.AgentType, fc)
+		}
+	case <-fileContextDeadline():
+		logLine(s, "hook: file context lookup took longer than "+fileContextTimeout.String()+" and was dropped")
+	}
+}
+
+// fileContextDeadline is when a lookup is given up. KB_FILE_CONTEXT_TIMEOUT_MS
+// overrides it (tests, slow disks).
+func fileContextDeadline() <-chan time.Time { return time.After(fileContextWait()) }
+
+// fileContextWait is how long the hook waits for a lookup.
+func fileContextWait() time.Duration {
+	if v, err := strconv.Atoi(os.Getenv("KB_FILE_CONTEXT_TIMEOUT_MS")); err == nil && v >= 0 {
+		return time.Duration(v) * time.Millisecond
+	}
+	return fileContextTimeout
 }
 
 func orMain(agent string) string {
