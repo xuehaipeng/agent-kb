@@ -21,6 +21,18 @@ type hookInput struct {
 	Source         string `json:"source"`
 	Reason         string `json:"reason"`
 	Trigger        string `json:"trigger"`
+	// Set when the event belongs to a subagent rather than the main agent.
+	AgentID   string `json:"agent_id"`
+	AgentType string `json:"agent_type"`
+}
+
+// hookContext prints additionalContext for events that take context only
+// as JSON (SubagentStart, PreToolUse). It sets no decision.
+func (a *App) hookContext(event, text string) {
+	out, err := json.Marshal(map[string]any{"hookSpecificOutput": map[string]any{"hookEventName": event, "additionalContext": text}})
+	if err == nil {
+		fmt.Fprintln(a.Stdout, string(out))
+	}
 }
 
 // cmdHook never fails the agent: errors go to the local log, exit code is 0.
@@ -48,17 +60,54 @@ func (a *App) cmdHook(args []string) int {
 		// Rules are pushed into the session; everything else is pulled. Both
 		// the rules and the brief follow the session's project: outside any
 		// project that is the global scope only, never every project.
+		// A subagent's own SessionStart (after it compacts): it gets the
+		// complete rule set, like at its start. Nothing is assumed about
+		// what it loads natively.
+		if in.AgentID != "" {
+			if d, err := s.AgentDelivery(kb.SurfaceSessionStart); err == nil {
+				fmt.Fprint(a.Stdout, d.Text)
+				s.RecordDelivery(in.SessionID, in.AgentID, in.AgentType, "SessionStart:"+in.Source, d, false, in.Source == "compact")
+			}
+			return 0
+		}
 		// The whole payload is fitted to one budget: Claude Code replaces a
 		// hook's stdout with a short preview once it passes 10,000
 		// characters, so an oversized rule list would mostly go missing.
+		// It is printed on every start, resume, clear, compaction and fork:
+		// a session seen before may still hold rules that have changed.
 		if d, err := s.SessionStartDelivery(me); err == nil {
 			fmt.Fprint(a.Stdout, d.Text)
+			s.RecordDelivery(in.SessionID, "", "", "SessionStart:"+in.Source, d, d.Native > 0, in.Source == "compact")
 		}
 		// Hub: pull what other machines (e.g. Hermes) recorded, in the background.
 		if s.Hub && hasOrigin(s) && os.Getenv(extract.GuardEnv) == "" {
 			if err := a.spawn(s, in, []string{"--root", s.Dir, "sync", "--quiet"}, "sync"); err != nil {
 				logLine(s, "hook: "+err.Error())
 			}
+		}
+	case "SubagentStart":
+		// A subagent starts with its own context: it does not see what
+		// SessionStart gave the main agent, and may not load CLAUDE.md or
+		// the rules files (Explore, Plan and agents that omit them do not).
+		// So it gets the complete applicable rule set here, whatever the
+		// main agent received.
+		if d, err := s.AgentDelivery(kb.SurfaceSubagentStart); err == nil && d.Text != "" {
+			a.hookContext("SubagentStart", d.Text)
+			s.RecordDelivery(in.SessionID, orMain(in.AgentID), in.AgentType, "SubagentStart", d, false, false)
+		}
+	case "PreToolUse":
+		// Opt-in rule refresh: when the rules changed since this agent last
+		// received them, hand it the current set before it goes on. A
+		// subagent keeps what SubagentStart gave it until then, and a
+		// running main session only gets rules again at its next start.
+		st := s.LoadDelivery(in.SessionID)
+		last := st.Agents[orMain(in.AgentID)]
+		if last != nil && last.Digest == s.RuleDigest() {
+			return 0
+		}
+		if d, err := s.AgentDelivery(kb.SurfaceRuleRefresh); err == nil && d.Text != "" {
+			a.hookContext("PreToolUse", "kb: the rules that apply here changed since you last received them. They are now:\n"+d.Text)
+			s.RecordDelivery(in.SessionID, orMain(in.AgentID), in.AgentType, "PreToolUse:refresh", d, false, false)
 		}
 	case "PreCompact", "SessionEnd", "Stop":
 		if os.Getenv(extract.GuardEnv) != "" || in.TranscriptPath == "" {
@@ -126,6 +175,13 @@ func (a *App) spawn(s *kb.Store, in hookInput, args []string, label string) erro
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+func orMain(agent string) string {
+	if agent == "" {
+		return "main"
+	}
+	return agent
 }
 
 func hasOrigin(s *kb.Store) bool {

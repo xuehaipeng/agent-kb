@@ -503,6 +503,64 @@ four hops, once each (cycles end), only to existing files, and never inside
 code spans or fences. Block-level HTML comments are dropped, except inside
 code blocks. Everything left out is listed as a `note:` line.
 
+### 2.15 Rule delivery to Claude Code: managed file, hooks, subagents *(issue #3 item 3)*
+
+SessionStart output reaches the main agent only, and compaction summarizes
+it away. Claude Code's own instruction files are reloaded after compaction
+and are read by most subagents. So delivery is split by what each mechanism
+can be trusted with.
+
+| Rules | Main agent | Subagent |
+|---|---|---|
+| Global, no `projects:` restriction | managed rules file `<claude config>/rules/kb.md`, loaded by Claude Code itself | `SubagentStart` context |
+| Project rules, global rules restricted to the project | `SessionStart` hook | `SubagentStart` context |
+| Conditional rules | one line saying they exist (§2.14) | the same |
+
+- **The managed file** holds only what applies in every repository, between
+  kb's markers (HTML comments, which Claude Code drops), with its own
+  declared budget. It is written by `kb install claude` in a hub and
+  rewritten on every rule change, `kb maintain` and `kb sync`. A file this
+  hub did not write is left alone. `kb rules import` never reads it back.
+- **Fallback.** The hook checks the file before relying on it: recorded by an
+  installation, present, and holding exactly what would be written now. If
+  not, SessionStart delivers the universal rules itself.
+- **Nothing is suppressed by session.** SessionStart delivers on every
+  startup, resume, clear, compaction and fork: a session seen before may
+  hold rules that have since changed.
+- **Subagents get the complete set** through `SubagentStart`, whatever the
+  main agent received and whatever the subagent's type. Explore, Plan and
+  agents with `omitClaudeMd` load no instruction files, and which other
+  agents do has not been verified on a live session, so nothing is assumed.
+  The cost is that an agent which does load the managed file sees the
+  universal rules twice. A subagent's own SessionStart after it compacts
+  (it carries `agent_id`, Claude Code 2.1.323 or later) is handled the same
+  way.
+- **Rule refresh (opt-in).** A subagent keeps what `SubagentStart` gave it,
+  and a running main session gets rules again only at its next start. With
+  `kb install claude --rule-refresh on`, a `PreToolUse` hook hands an agent
+  the current rules once when they changed since it last received them. It
+  is off by default because it runs kb before every tool call.
+- **Diagnostics.** Each delivery is recorded per session and per agent
+  (`.kb/sessions/`, local, pruned after 30 days): how it was delivered, the
+  rule digest, compactions seen. `kb rules --delivery` shows the managed
+  file's state, the fallback, the installation choices and, for recent
+  sessions, which agents still hold an older rule set. An agent stays listed
+  as stale until something actually delivers to it again.
+
+**Capture mode is a separate, recorded choice** (issue #1 item 5, the part
+this needs). `.kb/install.json` (local) records per installation: capture
+`full` or `manual`, whether the managed file and the refresh hook are used,
+and the settings file. An explicit flag overrides the record; the record
+overrides the default (full, as before). `--capture manual` installs pointer,
+skill and delivery hooks, and removes only kb's own `PreCompact` and
+`SessionEnd` hooks; other tools' hooks in the same events stay. A later bare
+`kb install claude` keeps the recorded mode.
+
+**Not established here.** Everything above is tested with synthetic hook
+input through the CLI. Whether Claude Code loads `rules/kb.md` into a given
+agent type, and how `SubagentStart` and `PreToolUse` context behave across a
+real resume or compaction, was not tested on a live session.
+
 ## 3. Doc C (ChatGPT plan) review
 
 **Adopted in rev 2** (also: §2.9, repo docs as the source of truth):
@@ -541,7 +599,7 @@ code blocks. Everything left out is listed as a `note:` line.
 | `kb hub init / clone / import` | create, copy, or migrate into the multi-project hub |
 | `kb project [list / link <id>]` | show/list projects; map a repo to a project |
 | `kb project checkout [list / set / clear]` | this machine's checkouts; choose the baseline code is compared with |
-| `kb install claude / codex / cursor / antigravity / hermes / git-hooks [--global / --repo]` | pointer, skill, hooks (user-wide with a hub) |
+| `kb install claude / codex / cursor / antigravity / hermes / git-hooks [--global / --repo]` | pointer, skill, hooks (user-wide with a hub); for claude also `--capture`, `--native-rules`, `--rule-refresh` (§2.15) |
 | `kb search [query] [-f path] [-p project] [--all]` | compact ranked headers with trust badges |
 | `kb show <id>` | entry with trust trail, revisions, resources, fenced body |
 | `kb add <type> <title> -d ... [-e evidence] [--global [--for ...]]` | record knowledge (`rule` = convention) |

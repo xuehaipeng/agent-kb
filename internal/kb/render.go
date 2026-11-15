@@ -336,6 +336,9 @@ func RenderStatus(r *StatusReport) string {
 		fmt.Fprintf(&b, "; session start delivers %d and leaves out %d (%d over the %d-rule cap, %d to fit the %d-unit budget; kb rules --all-rules lists them)",
 			d.Rendered, d.Omitted(), d.OmittedByCount, maxDeliveredRules, d.OmittedBySize, d.Budget)
 	}
+	if d := r.Delivery; d != nil && d.Native > 0 {
+		fmt.Fprintf(&b, "; %d reach Claude Code through its managed rules file", d.Native)
+	}
 	if d := r.Delivery; d != nil && d.BriefOmitted > 0 {
 		fmt.Fprintf(&b, "; %d health line(s) left out of session start to fit the budget", d.BriefOmitted)
 	}

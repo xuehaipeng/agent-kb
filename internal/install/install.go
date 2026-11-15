@@ -299,7 +299,7 @@ func Run(s *kb.Store, target string, opts map[string]string) (*Result, error) {
 	}
 	switch target {
 	case "claude", "claude-code":
-		return Claude(s, global)
+		return Claude(s, global, opts)
 	case "codex":
 		return Codex(s, global)
 	case "cursor":
@@ -407,6 +407,10 @@ func RefreshPointer(s *kb.Store) (*Result, error) {
 		}
 		res.changed(f, did)
 	}
+	// The rules file Claude Code loads itself, when an installation uses one.
+	if err := refreshNativeRules(s, res); err != nil {
+		return nil, err
+	}
 	return res, nil
 }
 
@@ -424,21 +428,90 @@ func importPath(s *kb.Store, global bool) string {
 	return "@" + p
 }
 
-// Claude wires Claude Code: CLAUDE.md import, skill, hooks, permissions.
-func Claude(s *kb.Store, global bool) (*Result, error) {
+// Hook events kb owns in Claude Code's settings. Rule delivery and capture
+// are separate choices: delivery hooks are always installed, capture hooks
+// only in full capture mode.
+var (
+	claudeDeliveryEvents = []string{"SessionStart", "SubagentStart"}
+	claudeCaptureEvents  = []string{"PreCompact", "SessionEnd"}
+	claudeRefreshEvent   = "PreToolUse"
+)
+
+const claudeHookCmd = "kb hook claude"
+
+var claudeAllow = []string{"Bash(kb search:*)", "Bash(kb show:*)", "Bash(kb status:*)", "Bash(kb add:*)", "Bash(kb update:*)", "Bash(kb verify:*)", "Bash(kb deprecate:*)", "Bash(kb review:*)", "Bash(kb project:*)", "Bash(kb rules:*)"}
+
+// Claude wires Claude Code: CLAUDE.md import, skill, hooks, permissions and,
+// with a hub, a managed rules file for the global rules.
+//
+// opts: "capture" (full|manual), "native-rules" (on|off), "rule-refresh"
+// (on|off). A choice given here is recorded for this machine; one not given
+// keeps what was recorded; with no record the defaults are full capture,
+// the managed rules file where it applies, and no rule-refresh hook. So a
+// later bare 'kb install claude' never turns capture back on for an
+// installation that was set to manual.
+func Claude(s *kb.Store, global bool, opts map[string]string) (*Result, error) {
 	res := &Result{}
-	if r, err := RefreshPointer(s); err == nil {
-		res.Changed = append(res.Changed, r.Changed...)
-	} else {
-		return nil, err
-	}
 	base := claudeDir()
 	claudeMD := filepath.Join(base, "CLAUDE.md")
 	settings := filepath.Join(base, "settings.json")
+	scope := "user"
 	if !global {
 		base = filepath.Join(repoRoot(s), ".claude")
 		claudeMD = filepath.Join(repoRoot(s), "CLAUDE.md")
 		settings = filepath.Join(base, "settings.json")
+		scope = repoRoot(s)
+	}
+	rec := s.LoadInstall()
+	cur := rec.Claude[scope]
+	in := &kb.ClaudeInstall{Capture: kb.CaptureFull, Settings: settings}
+	recorded := cur != nil
+	if recorded {
+		in.Capture, in.NativeRules, in.RuleRefresh = cur.Capture, cur.NativeRules, cur.RuleRefresh
+	} else if s.Hub && global {
+		in.NativeRules = filepath.Join(base, "rules", "kb.md")
+	}
+	switch opts["capture"] {
+	case "":
+	case kb.CaptureFull, kb.CaptureManual:
+		in.Capture = opts["capture"]
+	default:
+		return nil, fmt.Errorf("--capture must be %s or %s", kb.CaptureFull, kb.CaptureManual)
+	}
+	if in.Capture != kb.CaptureManual {
+		in.Capture = kb.CaptureFull
+	}
+	switch opts["native-rules"] {
+	case "on":
+		if !s.Hub || !global {
+			return nil, errors.New("the managed rules file holds global rules: it needs a hub and a user-wide install")
+		}
+		in.NativeRules = filepath.Join(base, "rules", "kb.md")
+	case "off":
+		if in.NativeRules != "" {
+			if did, err := removeNativeRules(s, in.NativeRules); err == nil && did {
+				res.Notes = append(res.Notes, "removed "+in.NativeRules)
+			}
+		}
+		in.NativeRules = ""
+	}
+	switch opts["rule-refresh"] {
+	case "on":
+		in.RuleRefresh = true
+	case "off":
+		in.RuleRefresh = false
+	}
+	// The record first: RefreshPointer writes the managed rules file from it.
+	in.Updated = s.Now().UTC().Format("2006-01-02T15:04:05Z07:00")
+	rec.Claude[scope] = in
+	if err := s.SaveInstall(rec); err != nil {
+		return nil, fmt.Errorf("could not record the installation choices: %w", err)
+	}
+	if r, err := RefreshPointer(s); err == nil {
+		res.Changed = append(res.Changed, r.Changed...)
+		res.Notes = append(res.Notes, r.Notes...)
+	} else {
+		return nil, err
 	}
 	did, err := upsertBlock(claudeMD, importPath(s, global), mdBegin, mdEnd)
 	if err != nil {
@@ -451,28 +524,96 @@ func Claude(s *kb.Store, global bool) (*Result, error) {
 		return nil, err
 	}
 	res.changed(skill, did)
-	did, err = mergeClaudeSettings(settings)
+	want := append([]string{}, claudeDeliveryEvents...)
+	var drop []string
+	if in.Capture == kb.CaptureFull {
+		want = append(want, claudeCaptureEvents...)
+	} else {
+		drop = append(drop, claudeCaptureEvents...)
+	}
+	if in.RuleRefresh {
+		want = append(want, claudeRefreshEvent)
+	} else {
+		drop = append(drop, claudeRefreshEvent)
+	}
+	did, err = mergeClaudeSettings(settings, want, drop)
 	if err != nil {
 		return nil, err
 	}
 	res.changed(settings, did)
-	scope := "every repository (user-wide)"
+	where := "every repository (user-wide)"
 	if !global {
-		scope = "this repository"
+		where = "this repository"
 	}
-	res.Notes = append(res.Notes,
-		"Claude Code now loads the kb pointer in "+scope+". Hooks: SessionStart delivers the rules for the session's project plus reviews/disputes/stale entries; PreCompact and SessionEnd run 'kb extract' in the background, and SessionEnd also imports Claude's own memory files (needs the 'claude' CLI; see extract.commands in kb.yaml).",
-		"Optional MCP instead of the CLI: claude mcp add kb -- kb mcp --as claude-code")
+	how := "recorded for this machine"
+	if !recorded && opts["capture"] == "" {
+		how = "the default; 'kb install claude --capture manual' installs rule delivery without capture"
+	}
+	res.Notes = append(res.Notes, "Claude Code now loads the kb pointer in "+where+". SessionStart delivers the rules for the session's project plus reviews/disputes/stale entries, and SubagentStart gives each subagent the rules too.")
+	if in.Capture == kb.CaptureFull {
+		res.Notes = append(res.Notes, "Capture mode: full ("+how+"). PreCompact and SessionEnd run 'kb extract' in the background, and SessionEnd also imports Claude's own memory files (needs the 'claude' CLI; see extract.commands in kb.yaml).")
+	} else {
+		res.Notes = append(res.Notes, "Capture mode: manual ("+how+"). Nothing is captured automatically: kb's PreCompact and SessionEnd hooks are not installed. 'kb install claude --capture full' turns capture on.")
+	}
+	if in.NativeRules != "" {
+		res.Notes = append(res.Notes, "Global rules that apply everywhere are written to "+in.NativeRules+", which Claude Code loads itself (also after compaction); the hooks deliver the rest.")
+	}
+	if in.RuleRefresh {
+		res.Notes = append(res.Notes, "Rule refresh is on: a PreToolUse hook re-delivers the rules to an agent when they changed since it received them. It runs kb before every tool call.")
+	}
+	res.Notes = append(res.Notes, "Optional MCP instead of the CLI: claude mcp add kb -- kb mcp --as claude-code")
 	return res, nil
 }
 
-var claudeHookEvents = []string{"SessionStart", "PreCompact", "SessionEnd"}
+// nativeRulesBlock is the managed rules file: the rules between kb's
+// markers (HTML comments, which Claude Code drops before loading the file).
+func nativeRulesBlock(s *kb.Store) string {
+	text := s.NativeRulesText()
+	if text == "" {
+		return ""
+	}
+	return mdBegin + "\n" + strings.TrimRight(text, "\n") + "\n" + hubMarker(s) + mdEnd + "\n"
+}
 
-const claudeHookCmd = "kb hook claude"
+// refreshNativeRules writes the managed rules file for the user-wide
+// installation, or removes it when no rule applies everywhere. A file this
+// hub did not write is left alone.
+func refreshNativeRules(s *kb.Store, res *Result) error {
+	in := s.LoadInstall().Claude["user"]
+	if in == nil || in.NativeRules == "" || !s.Hub {
+		return nil
+	}
+	if data, err := os.ReadFile(in.NativeRules); err == nil && !(strings.Contains(string(data), mdBegin) && ownsBlock(s, string(data))) {
+		res.Notes = append(res.Notes, in.NativeRules+" exists and was not written by this hub: left as it is (the hooks deliver the global rules instead)")
+		return nil
+	}
+	block := nativeRulesBlock(s)
+	if block == "" {
+		did, err := removeNativeRules(s, in.NativeRules)
+		res.changed(in.NativeRules, did)
+		return err
+	}
+	did, err := kb.WriteFileIfChanged(in.NativeRules, []byte(block))
+	res.changed(in.NativeRules, did)
+	return err
+}
 
-var claudeAllow = []string{"Bash(kb search:*)", "Bash(kb show:*)", "Bash(kb status:*)", "Bash(kb add:*)", "Bash(kb update:*)", "Bash(kb verify:*)", "Bash(kb deprecate:*)", "Bash(kb review:*)", "Bash(kb project:*)"}
+// removeNativeRules deletes the managed rules file if this hub wrote it.
+func removeNativeRules(s *kb.Store, path string) (bool, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false, nil
+	}
+	if !strings.Contains(string(data), mdBegin) || !ownsBlock(s, string(data)) {
+		return false, nil
+	}
+	return true, os.Remove(path)
+}
 
-func mergeClaudeSettings(path string) (bool, error) {
+// mergeClaudeSettings makes sure kb's hook is registered for the wanted
+// events and removes it from the dropped ones. Only entries that run kb's
+// own hook command are touched: other hooks and settings stay as they are.
+func mergeClaudeSettings(path string, want, drop []string) (bool, error) {
 	root := map[string]any{}
 	if data, err := os.ReadFile(path); err == nil && len(strings.TrimSpace(string(data))) > 0 {
 		if err := json.Unmarshal(data, &root); err != nil {
@@ -483,15 +624,19 @@ func mergeClaudeSettings(path string) (bool, error) {
 	if hooks == nil {
 		hooks = map[string]any{}
 	}
-	for _, ev := range claudeHookEvents {
+	ours := func(h any) bool {
+		hm, _ := h.(map[string]any)
+		c, _ := hm["command"].(string)
+		return strings.HasPrefix(c, claudeHookCmd)
+	}
+	for _, ev := range want {
 		groups, _ := hooks[ev].([]any)
 		present := false
 		for _, g := range groups {
 			gm, _ := g.(map[string]any)
 			hs, _ := gm["hooks"].([]any)
 			for _, h := range hs {
-				hm, _ := h.(map[string]any)
-				if c, _ := hm["command"].(string); strings.HasPrefix(c, claudeHookCmd) {
+				if ours(h) {
 					present = true
 				}
 			}
@@ -500,6 +645,42 @@ func mergeClaudeSettings(path string) (bool, error) {
 			groups = append(groups, map[string]any{"hooks": []any{map[string]any{"type": "command", "command": claudeHookCmd, "timeout": 30}}})
 		}
 		hooks[ev] = groups
+	}
+	for _, ev := range drop {
+		groups, ok := hooks[ev].([]any)
+		if !ok {
+			continue
+		}
+		var keptGroups []any
+		for _, g := range groups {
+			gm, isMap := g.(map[string]any)
+			hs, _ := gm["hooks"].([]any)
+			if !isMap {
+				keptGroups = append(keptGroups, g)
+				continue
+			}
+			var kept []any
+			removed := false
+			for _, h := range hs {
+				if ours(h) {
+					removed = true
+					continue
+				}
+				kept = append(kept, h)
+			}
+			if removed && len(kept) == 0 {
+				continue // the group held only kb's hook
+			}
+			if removed {
+				gm["hooks"] = kept
+			}
+			keptGroups = append(keptGroups, gm)
+		}
+		if len(keptGroups) == 0 {
+			delete(hooks, ev)
+		} else {
+			hooks[ev] = keptGroups
+		}
 	}
 	root["hooks"] = hooks
 	perms, _ := root["permissions"].(map[string]any)

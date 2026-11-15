@@ -168,7 +168,9 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 		if len(o.Projects) == 0 && !o.AllProjects && s.Hub && s.Project == "" {
 			brief = s.sessionBriefLines(me)
 		}
-		d := s.planDelivery(SurfaceSessionStart, SessionStartBudget, "", *planRules, brief)
+		_, native := s.NativeRulesActive()
+		native = native && len(o.Projects) == 0 && !o.AllProjects
+		d := s.planDelivery(SurfaceSessionStart, SessionStartBudget, "", *planRules, brief, native)
 		d.Text = ""
 		r.Delivery, r.RulesOmitted = &d, d.Omitted()
 	}

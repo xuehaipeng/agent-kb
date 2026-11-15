@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/xuehaipeng/agent-kb/internal/install"
 	"github.com/xuehaipeng/agent-kb/internal/kb"
 )
 
@@ -66,6 +67,9 @@ func (a *App) cmdSync(args []string) error {
 	if _, err := s.WriteIndex(); err != nil {
 		return err
 	}
+	// A pull can bring rules recorded elsewhere: bring the files that carry
+	// rules on this machine up to date with them.
+	_, _ = install.RefreshPointer(s)
 	if _, err := kb.Git(top, "add", "-A", "--", rel); err != nil {
 		return err
 	}

@@ -27,31 +27,70 @@ func TestUpsertBlockIdempotent(t *testing.T) {
 
 func TestMergeClaudeSettingsPreservesUserKeys(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "settings.json")
-	os.WriteFile(p, []byte(`{"model":"opus","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}]},"permissions":{"allow":["Bash(ls:*)"]}}`), 0o644)
-	if _, err := mergeClaudeSettings(p); err != nil {
+	os.WriteFile(p, []byte(`{"model":"opus","hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"echo hi"}]}],"SessionEnd":[{"hooks":[{"type":"command","command":"my-cleanup"},{"type":"command","command":"kb hook claude","timeout":30}]}],"Stop":[{"hooks":[{"type":"command","command":"notify"}]}]},"permissions":{"allow":["Bash(ls:*)"]}}`), 0o644)
+	all := append(append([]string{}, claudeDeliveryEvents...), claudeCaptureEvents...)
+	if _, err := mergeClaudeSettings(p, all, []string{claudeRefreshEvent}); err != nil {
 		t.Fatal(err)
 	}
-	if did, _ := mergeClaudeSettings(p); did {
+	if did, _ := mergeClaudeSettings(p, all, []string{claudeRefreshEvent}); did {
 		t.Fatal("merge not idempotent")
 	}
-	var m map[string]any
-	data, _ := os.ReadFile(p)
-	json.Unmarshal(data, &m)
+	read := func() map[string]any {
+		var m map[string]any
+		data, _ := os.ReadFile(p)
+		json.Unmarshal(data, &m)
+		return m
+	}
+	m := read()
 	if m["model"] != "opus" {
 		t.Fatal("lost user key")
 	}
-	ss := m["hooks"].(map[string]any)["SessionStart"].([]any)
-	if len(ss) != 2 {
+	hooks := m["hooks"].(map[string]any)
+	if ss := hooks["SessionStart"].([]any); len(ss) != 2 {
 		t.Fatalf("SessionStart groups: %v", ss)
+	}
+	for _, ev := range all {
+		if _, ok := hooks[ev]; !ok {
+			t.Fatalf("%s hook missing: %v", ev, hooks)
+		}
+	}
+	if _, ok := hooks[claudeRefreshEvent]; ok {
+		t.Fatalf("the rule refresh hook is opt-in: %v", hooks)
 	}
 	allow := m["permissions"].(map[string]any)["allow"].([]any)
 	if allow[0] != "Bash(ls:*)" || len(allow) != 1+len(claudeAllow) {
 		t.Fatalf("allow: %v", allow)
 	}
+
+	// Manual capture: kb's own capture hooks go, and only those. Another
+	// tool's hook in the same event, and events kb does not own, stay.
+	if _, err := mergeClaudeSettings(p, claudeDeliveryEvents, append([]string{claudeRefreshEvent}, claudeCaptureEvents...)); err != nil {
+		t.Fatal(err)
+	}
+	data, _ := os.ReadFile(p)
+	hooks = read()["hooks"].(map[string]any)
+	if _, ok := hooks["PreCompact"]; ok {
+		t.Fatalf("PreCompact held only kb's hook and should be gone:\n%s", data)
+	}
+	end := hooks["SessionEnd"].([]any)[0].(map[string]any)["hooks"].([]any)
+	if len(end) != 1 || end[0].(map[string]any)["command"] != "my-cleanup" {
+		t.Fatalf("another tool's SessionEnd hook must stay, kb's must go:\n%s", data)
+	}
+	if hooks["Stop"] == nil || len(hooks["SessionStart"].([]any)) != 2 || hooks["SubagentStart"] == nil {
+		t.Fatalf("unrelated or delivery hooks changed:\n%s", data)
+	}
+	// Back to full: the capture hooks return.
+	if _, err := mergeClaudeSettings(p, all, nil); err != nil {
+		t.Fatal(err)
+	}
+	if hooks = read()["hooks"].(map[string]any); hooks["PreCompact"] == nil || len(hooks["SessionEnd"].([]any)) != 2 {
+		t.Fatalf("full capture: %v", hooks)
+	}
+
 	if err := os.WriteFile(p, []byte("{broken"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mergeClaudeSettings(p); err == nil {
+	if _, err := mergeClaudeSettings(p, all, nil); err == nil {
 		t.Fatal("broken JSON must not be overwritten")
 	}
 }

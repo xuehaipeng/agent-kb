@@ -219,6 +219,9 @@ func prepareRuleFile(s *kb.Store, p rulePrep) (*FileSource, string) {
 	}
 	label := displayPath(p.path)
 	text := kbBlockRe.ReplaceAllString(strings.ReplaceAll(strings.TrimPrefix(string(data), "\xef\xbb\xbf"), "\r\n", "\n"), "")
+	if strings.TrimSpace(text) == "" && strings.Contains(string(data), "<!-- kb:begin") {
+		return nil, "" // a file kb generates (its rules file): never read back in
+	}
 	var applies *okf.Applicability
 	if p.rulesDir {
 		fm, body, has, perr := splitFrontmatter(text)
