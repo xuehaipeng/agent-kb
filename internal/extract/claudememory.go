@@ -188,7 +188,7 @@ var indexTargetRe = regexp.MustCompile(`\]\(([^)\s]+)[^)]*\)`)
 // everything else. A pointer is a link line whose target is a memory file in
 // the same directory: that file is imported itself. Any other line is
 // content of the index: a note, or a link to somewhere else (a runbook, a
-// dashboard), which no topic file preserves. An index with pointers only is
+// dashboard, a file in a subdirectory), which no topic file preserves. An index with pointers only is
 // a table of contents; one with other lines holds notes of its own.
 func splitIndex(content, dir string) (links int, rest string) {
 	var keep []string
@@ -211,7 +211,8 @@ func splitIndex(content, dir string) (links int, rest string) {
 }
 
 // pointsToTopic reports whether a link line's first target is a Markdown
-// file that exists in dir.
+// file directly in dir: the files the topic scan reads. A file in a
+// subdirectory is not scanned, so a link to it is content of the index.
 func pointsToTopic(line, dir string) bool {
 	m := indexTargetRe.FindStringSubmatch(line)
 	if m == nil {
@@ -225,7 +226,7 @@ func pointsToTopic(line, dir string) bool {
 		return false
 	}
 	p := filepath.Join(dir, filepath.FromSlash(target))
-	if !within(dir, p) {
+	if filepath.Dir(p) != filepath.Clean(dir) {
 		return false
 	}
 	st, err := os.Stat(p)
