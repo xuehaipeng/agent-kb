@@ -1,6 +1,10 @@
 package kb
 
-import "strings"
+import (
+	"bytes"
+	"encoding/json"
+	"strings"
+)
 
 // Rules and the health brief are pushed into an agent's context, and every
 // push surface has a size it must stay within. A count cap alone does not
@@ -73,6 +77,40 @@ type Delivery struct {
 	Text           string `json:"-"`                   // the payload itself
 }
 
+// RuleRefreshNotice opens a rule refresh: it tells the agent why it is
+// handed rules again.
+const RuleRefreshNotice = "kb: the rules that apply here changed since you last received them. They are now:\n"
+
+// HookContext is what a hook prints to hand text to an agent as
+// additionalContext, for events that take context only as JSON
+// (SubagentStart, PreToolUse). It sets no decision. HTML characters are left
+// as they are: escaping them only makes the output longer.
+func HookContext(event, text string) string {
+	type specific struct {
+		Event   string `json:"hookEventName"`
+		Context string `json:"additionalContext"`
+	}
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if enc.Encode(struct {
+		Out specific `json:"hookSpecificOutput"`
+	}{specific{event, text}}) != nil {
+		return ""
+	}
+	return b.String()
+}
+
+// planOpts adjusts a plan for how its surface delivers.
+type planOpts struct {
+	// native: rules the managed rules file already holds, by id. They are
+	// left out of the payload and counted as Native, not as omitted.
+	native map[string]bool
+	// measure gives the size of the complete output for a payload, when
+	// that is more than the payload itself (a JSON envelope around it).
+	measure func(text string) int
+}
+
 // Omitted is the number of applicable rules that are not in the payload.
 func (d Delivery) Omitted() int { return d.OmittedByCount + d.OmittedBySize }
 
@@ -86,21 +124,35 @@ const briefOmittedNotice = "kb: health notes were left out to fit the context bu
 // global rules before project rules, as the count cap does. The omission
 // notice is part of the payload and is counted.
 //
-// With native set, the universal global rules are left out: the managed
-// rules file delivers them. They stay in Applicable and are counted as
-// Native, not as omitted.
-func (s *Store) planDelivery(surface string, budget int, prefix string, rs RuleSet, brief []string, native bool) Delivery {
+// Rules the managed rules file holds (o.native) are left out: that file
+// delivers them. Only rules actually in the file count: one cut from it to
+// fit its own budget is still this payload's to deliver. They stay in
+// Applicable and are counted as Native, not as omitted.
+//
+// The budget is for the complete output. Where the payload travels inside
+// an envelope (o.measure), the envelope and its escaping count too.
+func (s *Store) planDelivery(surface string, budget int, prefix string, rs RuleSet, brief []string, o planOpts) Delivery {
+	d, _ := s.planDeliveryRules(surface, budget, prefix, rs, brief, o)
+	return d
+}
+
+// planDeliveryRules is planDelivery that also names the rules in the payload.
+func (s *Store) planDeliveryRules(surface string, budget int, prefix string, rs RuleSet, brief []string, o planOpts) (Delivery, []string) {
 	d := Delivery{Surface: surface, Scope: rs.Scope, Unit: ContextUnit, Budget: budget, Applicable: rs.Applicable(), OmittedByCount: rs.Omitted}
-	if native {
+	if len(o.native) > 0 {
 		var kept []*Node
 		for _, n := range rs.Global {
-			if len(n.Meta().Projects) == 0 {
+			if o.native[n.ID] {
 				d.Native++
 				continue
 			}
 			kept = append(kept, n)
 		}
 		rs.Global = kept
+	}
+	size := ContextLen
+	if o.measure != nil {
+		size = o.measure
 	}
 	nS, nG, nB := len(rs.Scoped), len(rs.Global), len(brief)
 	build := func() string {
@@ -124,7 +176,7 @@ func (s *Store) planDelivery(surface string, budget int, prefix string, rs RuleS
 		return b.String()
 	}
 	text := build()
-	fits := func() bool { return budget <= 0 || ContextLen(text) <= budget }
+	fits := func() bool { return budget <= 0 || size(text) <= budget }
 	for !fits() && nB > 0 {
 		nB--
 		text = build()
@@ -137,11 +189,15 @@ func (s *Store) planDelivery(surface string, budget int, prefix string, rs RuleS
 		}
 		text = build()
 	}
-	d.Text, d.Size = text, ContextLen(text)
+	d.Text, d.Size = text, size(text)
 	d.Rendered = nS + nG
+	var ids []string
+	for _, n := range append(append([]*Node{}, rs.Scoped[:nS]...), rs.Global[:nG]...) {
+		ids = append(ids, n.ID)
+	}
 	d.OmittedBySize = len(rs.Scoped) + len(rs.Global) - d.Rendered
 	d.BriefLines, d.BriefOmitted = nB, len(brief)-nB
-	return d
+	return d, ids
 }
 
 // SessionStartDelivery plans what the SessionStart hook prints for the
@@ -151,8 +207,25 @@ func (s *Store) SessionStartDelivery(me Actor) (Delivery, error) {
 	if err != nil {
 		return Delivery{}, err
 	}
-	_, native := s.NativeRulesActive()
-	return s.planDelivery(SurfaceSessionStart, SessionStartBudget, "", rs, s.sessionBriefLines(me), native), nil
+	return s.planDelivery(SurfaceSessionStart, SessionStartBudget, "", rs, s.sessionBriefLines(me), planOpts{native: s.nativeRuleIDs()}), nil
+}
+
+// nativeRuleIDs are the rules this session gets from the managed rules
+// file: those the file holds, when the session can count on it.
+func (s *Store) nativeRuleIDs() map[string]bool {
+	if _, active := s.NativeRulesActive(); !active {
+		return nil
+	}
+	rs, err := s.nativeRuleSet()
+	if err != nil {
+		return nil
+	}
+	_, rendered := s.planDeliveryRules(SurfaceNativeRules, NativeRulesBudget, "", rs, nil, planOpts{})
+	ids := map[string]bool{}
+	for _, id := range rendered {
+		ids[id] = true
+	}
+	return ids
 }
 
 // AgentDelivery plans a delivery of the complete applicable rule set to one
@@ -165,7 +238,17 @@ func (s *Store) AgentDelivery(surface string) (Delivery, error) {
 	if err != nil {
 		return Delivery{}, err
 	}
-	return s.planDelivery(surface, SubagentBudget, "", rs, nil, false), nil
+	// The hook limit applies to what the hook prints. Where that is JSON,
+	// the envelope and the escaping of the text count, and so does the
+	// notice a refresh opens with.
+	var o planOpts
+	switch surface {
+	case SurfaceSubagentStart:
+		o.measure = func(text string) int { return ContextLen(HookContext("SubagentStart", text)) }
+	case SurfaceRuleRefresh:
+		o.measure = func(text string) int { return ContextLen(HookContext("PreToolUse", RuleRefreshNotice+text)) }
+	}
+	return s.planDelivery(surface, SubagentBudget, "", rs, nil, o), nil
 }
 
 // MCPInstructionsDelivery plans the server's `instructions`: the fixed
@@ -175,5 +258,5 @@ func (s *Store) MCPInstructionsDelivery(base string) (Delivery, error) {
 	if err != nil {
 		return Delivery{Surface: SurfaceMCPInstructions, Unit: ContextUnit, Budget: MCPInstructionsBudget, Text: base, Size: ContextLen(base)}, err
 	}
-	return s.planDelivery(SurfaceMCPInstructions, MCPInstructionsBudget, base, rs, nil, false), nil
+	return s.planDelivery(SurfaceMCPInstructions, MCPInstructionsBudget, base, rs, nil, planOpts{}), nil
 }

@@ -88,12 +88,18 @@ func (s *Store) NativeRulesText() string {
 
 // NativeRulesDelivery plans the managed rules file.
 func (s *Store) NativeRulesDelivery() (Delivery, error) {
-	rs, err := s.universalRules()
+	rs, err := s.nativeRuleSet()
 	if err != nil {
 		return Delivery{}, err
 	}
+	return s.planDelivery(SurfaceNativeRules, NativeRulesBudget, "", rs, nil, planOpts{}), nil
+}
+
+// nativeRuleSet is what the managed rules file is planned from.
+func (s *Store) nativeRuleSet() (RuleSet, error) {
+	rs, err := s.universalRules()
 	rs.Conditional = nil // the hook names them; this file holds rules only
-	return s.planDelivery(SurfaceNativeRules, NativeRulesBudget, "", rs, nil, false), nil
+	return rs, err
 }
 
 // universalRules are the always-on global rules without a project

@@ -545,12 +545,19 @@ can be trusted with.
   installation, in the Claude configuration directory the session reads
   (`CLAUDE_CONFIG_DIR`), present, and holding exactly what would be written
   now. If not, SessionStart delivers the universal rules itself.
+- **Only what the file holds is left to it.** The file has its own budget.
+  A rule cut from it to fit stays SessionStart's to deliver, and the
+  diagnostics count as "from the managed file" only the rules that are in it.
 - **One place.** The record keeps the choice to use the file, not a path to
   reuse: an install under another configuration directory writes the file
   there and removes the one it wrote before.
 - **Nothing is suppressed by session.** SessionStart delivers on every
   startup, resume, clear, compaction and fork: a session seen before may
   hold rules that have since changed.
+- **The hook limit is on what a hook prints.** `SubagentStart` and the rule
+  refresh hand over context as JSON, so their budget covers the serialized
+  output: the envelope, the escaping of the text, and the refresh's opening
+  notice. HTML characters are not escaped.
 - **Subagents get the complete set** through `SubagentStart`, whatever the
   main agent received and whatever the subagent's type. Explore, Plan and
   agents with `omitClaudeMd` load no instruction files, and which other

@@ -2084,6 +2084,100 @@ func TestNativeRulesAndSubagentDelivery(t *testing.T) {
 	has("main under the old configuration directory", start(kubedl, "moved", "resume"), []string{volcano, english}, nil)
 }
 
+// TestManagedFileOverflowAndHookEnvelope: a rule cut from the managed rules
+// file to fit its budget is still delivered by SessionStart, and what a
+// context hook prints stays within the hook limit once it is JSON.
+func TestManagedFileOverflowAndHookEnvelope(t *testing.T) {
+	base, home := hubEnv(t)
+	must(t, "", "hub", "init")
+	var items, titles []string
+	for i := 0; i < 30; i++ {
+		// Markup, quotes and backslashes: characters JSON has to escape.
+		title := fmt.Sprintf("Rule %02d: wrap <T> & \"quoted\" paths like C:\\tmp in <code> tags, %s", i, strings.Repeat("never the raw <b>value</b> & nothing else, ", 7))
+		titles = append(titles, fmt.Sprintf("Rule %02d:", i))
+		items = append(items, fmt.Sprintf(`{"type":"rule","global":true,"title":%q,"description":"because the team agreed on it"}`, title))
+	}
+	out, errs, code := kbRun(t, "claude-code", "["+strings.Join(items, ",")+"]", "add", "--from", "-", "-e", "user said so", "--force")
+	if code != 0 || !strings.Contains(out, "seeded 30 of 30") {
+		t.Fatalf("seed: %d\n%s\n%s", code, out, errs)
+	}
+	must(t, "", "install", "claude")
+	data, _ := os.ReadFile(filepath.Join(home, ".claude", "rules", "kb.md"))
+	file := string(data)
+	os.Chdir(base)
+	hook, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SessionStart","source":"startup","cwd":"`+base+`"}`, "hook", "claude")
+	inFile, inHook := 0, 0
+	for _, title := range titles {
+		f, h := strings.Contains(file, title), strings.Contains(hook, title)
+		if f {
+			inFile++
+		}
+		if h {
+			inHook++
+		}
+		if f && h {
+			t.Errorf("%s is in the managed file and delivered again by the hook", title)
+		}
+		if !f && !h {
+			t.Errorf("%s was cut from the managed file and not delivered by the hook either", title)
+		}
+	}
+	if inFile == 0 || inHook == 0 {
+		t.Fatalf("the test needs rules on both sides: %d in the file, %d in the hook", inFile, inHook)
+	}
+	var st struct {
+		Delivery struct {
+			Rendered int `json:"rendered"`
+			Native   int `json:"native"`
+		} `json:"rules_delivery"`
+	}
+	json.Unmarshal([]byte(must(t, "claude-code", "status", "--json")), &st)
+	if st.Delivery.Native != inFile || st.Delivery.Rendered != inHook {
+		t.Errorf("status reports %d from the file and %d from the hook, want %d and %d", st.Delivery.Native, st.Delivery.Rendered, inFile, inHook)
+	}
+
+	// What a context hook prints is JSON. The limit is on the output, so
+	// the envelope and the escaping count, and so does a refresh's notice.
+	units := func(s string) int {
+		n := 0
+		for _, r := range s {
+			if r >= 0x10000 {
+				n++
+			}
+			n++
+		}
+		return n
+	}
+	check := func(name, out string) {
+		t.Helper()
+		var m struct {
+			Out struct {
+				Context string `json:"additionalContext"`
+			} `json:"hookSpecificOutput"`
+		}
+		if err := json.Unmarshal([]byte(out), &m); err != nil {
+			t.Fatalf("%s: not JSON: %v", name, err)
+		}
+		if n := units(out); n > 9000 || n < 6000 {
+			t.Errorf("%s prints %d units: it must stay under the hook limit and use its budget", name, n)
+		}
+		if !strings.Contains(m.Out.Context, "wrap <T> & \"quoted\" paths like C:\\tmp") || strings.Contains(out, `\u003c`) {
+			t.Errorf("%s: the rule text must arrive as written, without HTML escapes:\n%.300s", name, out)
+		}
+		if !strings.Contains(m.Out.Context, "more rule(s)") && !strings.Contains(m.Out.Context, "left out") && !strings.Contains(m.Out.Context, "omitted") {
+			t.Errorf("%s: rules were cut to fit, and the payload must say so:\n%.300s", name, m.Out.Context[len(m.Out.Context)-300:])
+		}
+	}
+	sub, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore","cwd":"`+base+`"}`, "hook", "claude")
+	check("SubagentStart", sub)
+	must(t, "claude-code", "add", "rule", "One more rule to change the digest", "-d", "so a refresh is due", "-e", "user said so", "--global")
+	refresh, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"PreToolUse","tool_name":"Read","agent_id":"a1","agent_type":"Explore","cwd":"`+base+`"}`, "hook", "claude")
+	check("rule refresh", refresh)
+	if !strings.Contains(refresh, "changed since you last received them") {
+		t.Errorf("the refresh notice is part of the payload:\n%.200s", refresh)
+	}
+}
+
 // TestRuleRefreshWhenNoRulesRemain: when the last rule an agent holds is
 // retired, the refresh hook says so once instead of staying silent with the
 // agent marked stale for ever.
