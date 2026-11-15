@@ -42,6 +42,17 @@ func TestAppliesToFile(t *testing.T) {
 		{"test[!s]*.go", "", "test/foo.go", false},
 		{"test[^s]*.go", "", "test/foo.go", false},
 		{"src/[!a]/x.go", "", "src/b/x.go", true},
+		{"test[0-9]*.go", "", "test1.go", true},
+		// An escaped character in brackets is that character.
+		{`file[a\-z].go`, "", "file-.go", true},
+		{`file[a\-z].go`, "", "filea.go", true},
+		{`file[a\-z].go`, "", "filem.go", false},
+		{`file[a-z].go`, "", "filem.go", true},
+		{`file[\]x].go`, "", "file].go", true},
+		{`file[!\-].go`, "", "file-.go", false},
+		{`file[!\-].go`, "", "filea.go", true},
+		{`file[a^].go`, "", "file^.go", true},
+		{"test[0-9]*.go", "", "test/1.go", false},
 		{`photos \[2024\]/**`, "", "photos [2024]/jan/a.jpg", true},
 		// A base directory: patterns are relative to it and stop at it.
 		{"**", "packages/web", "packages/web/src/a.ts", true},
@@ -62,7 +73,7 @@ func TestAppliesToFile(t *testing.T) {
 	}
 	// A pattern that cannot be matched exactly is an error and matches
 	// nothing: it is never widened.
-	for _, bad := range []string{"photos [2024/**", "src/{a,b", "src/a}", "", `src\`, "{" + strings.Repeat("{a,b,c,d,e,f,g,h,i,j}", 4) + "}"} {
+	for _, bad := range []string{"photos [2024/**", "src/{a,b", "src/a}", "", `src\`, "test[.-0]*.go", "src/[a/]x.go", "{" + strings.Repeat("{a,b,c,d,e,f,g,h,i,j}", 4) + "}"} {
 		a := &okf.Applicability{Paths: []string{bad}}
 		if err := ValidateApplies(a); err == nil {
 			t.Errorf("%q: expected an error", bad)
