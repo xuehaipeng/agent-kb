@@ -36,6 +36,12 @@ func TestAppliesToFile(t *testing.T) {
 		{"src/[ab]*.go", "", "src/alpha.go", true},
 		{"src/[ab]*.go", "", "src/gamma.go", false},
 		{"src/[!ab]*.go", "", "src/gamma.go", true},
+		// A negated class stays within one segment, like "*" and "?".
+		{"test[!s]*.go", "", "testa.go", true},
+		{"test[!s]*.go", "", "tests.go", false},
+		{"test[!s]*.go", "", "test/foo.go", false},
+		{"test[^s]*.go", "", "test/foo.go", false},
+		{"src/[!a]/x.go", "", "src/b/x.go", true},
 		{`photos \[2024\]/**`, "", "photos [2024]/jan/a.jpg", true},
 		// A base directory: patterns are relative to it and stop at it.
 		{"**", "packages/web", "packages/web/src/a.ts", true},
