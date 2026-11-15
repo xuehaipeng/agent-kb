@@ -139,6 +139,7 @@ kb deprecate stream-timeout -m "gateway replaced by envoy"
 kb rules                                        # rules for this project + global; proposed ones awaiting confirmation
 kb rules -p kubedl                              # a named project's rules (+ the global ones that apply to it)
 kb rules --all                                  # every project's rules, for inspection
+kb rules --all-rules                            # include rules a delivery cap left out
 kb add rule "Use pnpm, never npm" -d "lockfile is pnpm-lock.yaml" -e "user said so"
 kb add rule "Write commit messages in English" -d "team convention" -e "user said so" --global
 kb rules import                                 # ~/.claude/CLAUDE.md, ~/.codex/AGENTS.md, ~/.gemini/GEMINI.md (global)
@@ -185,6 +186,14 @@ surfaces select rules the same way:
 Search, status and review lists keep their wider default (every project when
 run outside one). `kb status` reports both: entry counts for its `scope`, and
 `rules that apply` for the narrower `rules_scope`.
+
+Pushed output has a size budget. Claude Code replaces a hook's output with a
+short preview once it passes 10,000 characters, so the session-start payload
+(rules, ids, headings and the health brief together) is fitted to 9,000, and
+the MCP `instructions` to the same figure. When it doesn't fit, health lines
+give way first, then global rules, then project rules; a notice says how many
+were left out, `kb rules --all-rules` lists them, and `kb status` shows what
+session start delivered (`rules_delivery` in `--json`).
 
 Only evidence-backed rules are delivered (`-e "user said so"`, an imported
 rule file, a memory the agent saved). A rule an agent inferred on its own waits

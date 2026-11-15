@@ -215,7 +215,8 @@ Rev 2 shares all three.
     change through a change hook. Project rules come from `kb rules`.
   - MCP clients: the server's `instructions`.
 
-  Output is capped at 40 rules, one line each. Every surface selects rules
+  Output is capped at 40 rules, one line each, and push surfaces also fit
+  their whole payload to a size budget (§2.12). Every surface selects rules
   through one function with the applicable-rule scope of §2.11.
 - **Only evidence-backed rules are delivered.** A rule recorded with evidence
   (the user said so, an imported rule file, a saved memory) is applied. One an
@@ -283,8 +284,8 @@ therefore have their own selection (`Store.Rules`), used by every surface:
   It used to leak into the user-level blocks.
 - `kb status` mixes the scopes on purpose and says so: entry counts follow
   `scope`, `rules_delivered` follows `rules_scope`. `rules_delivered` still
-  counts applicable rules before the 40-rule cap; `rules_omitted_by_cap` is
-  separate.
+  counts applicable rules before any cap; `rules_omitted_by_cap` is what
+  session start leaves out (§2.12).
 - The health brief injected at session start follows the session: project
   plus the global entries that apply to it, or outside a project only global
   entries with no `projects:` restriction (not the whole global bundle,
@@ -344,6 +345,36 @@ project records no commit.
 applicability (2B), source-only import anchors and deadlines (4A). Until 4A,
 an import into a single-repository project still records the checkout's HEAD.
 Global entries are `not_applicable`: nothing ties them to one repository.
+
+### 2.12 Delivery budgets *(issue #3 item 1)*
+
+A count cap does not bound size. Claude Code caps a hook's stdout at 10,000
+characters; past that, Claude gets a file path and a 2,000-character preview
+and is not asked to read the file. Forty rules of full length came to about
+12,000 characters, so most of them would have gone missing without an error.
+
+- Each push surface declares a budget for its **complete payload**: rule
+  lines, ids, headings, the omission notice and the health brief.
+  SessionStart: 9,000. MCP `instructions`: 9,000, a context-cost choice of
+  our own, since no host limit is documented for that field.
+- One pure planner (`planDelivery`) fits the payload. Whole lines only. When
+  it is too big, brief lines go first (replaced by a one-line notice), then
+  rules from the end: global before project, as the count cap does. The
+  40-rule cap stays as a second bound.
+- Sizes are counted in **UTF-16 code units**, which is how a JavaScript host
+  measures string length and is never less than the number of characters.
+  Issue #3 proposed 9,000 UTF-8 bytes; that is safe too, but it would cut
+  Chinese text to a third of what the documented limit allows.
+- `kb status` runs the same planner with the same inputs as the hook and
+  reports it under `rules_delivery` (surface, scope, unit, budget, size,
+  applicable, rendered, omitted by count and by size, brief lines kept and
+  left out). `rules_delivered` is unchanged: applicable rules before any
+  cap. `rules_omitted_by_cap` is now the rules session start leaves out for
+  either reason.
+- `kb rules --all-rules` lists what a cap left out. Plain `kb rules` keeps
+  the 40-rule cap and no size budget: it is pulled on request.
+- Not budgeted here: the user-level Codex/Antigravity blocks, which are
+  files, not hook output, and keep the count cap only.
 
 ## 3. Doc C (ChatGPT plan) review
 

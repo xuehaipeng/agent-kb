@@ -22,10 +22,11 @@ func (a *App) cmdRules(args []string) error {
 	f := newFlags("rules")
 	a.globals(f)
 	var projects []string
-	var all, quiet bool
+	var all, quiet, uncapped bool
 	f.list(&projects, true, "project(s) (hub)", "p", "project")
 	f.boolean(&all, "every project (hub)", "all")
 	f.boolean(&quiet, "rules only, no pending list or hints", "quiet", "q")
+	f.boolean(&uncapped, "list every rule that applies, including those a delivery cap leaves out", "all-rules")
 	if _, err := f.parse(args); err != nil {
 		return err
 	}
@@ -33,7 +34,11 @@ func (a *App) cmdRules(args []string) error {
 	if err != nil {
 		return err
 	}
-	rs, err := s.Rules(projects, all)
+	get := s.Rules
+	if uncapped {
+		get = s.AllRules
+	}
+	rs, err := get(projects, all)
 	if err != nil {
 		return err
 	}

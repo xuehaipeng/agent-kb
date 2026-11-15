@@ -43,6 +43,8 @@ Retrieve (in a hub: current repo's project + global by default):
 Rules (always-on conventions, delivered at session start):
   kb rules [-p project] [--all]      the rules that apply here (outside a project: only global rules that apply
                                      everywhere; --all lists every project's for inspection), plus proposed ones
+           [--all-rules]             include rules a delivery cap leaves out (session start and MCP instructions
+                                     are fitted to a size budget; kb status shows what was delivered)
   kb add rule "<instruction>" -d <why> -e "user said so" [--global]
   kb rules import [--user|--repo] [files...]   share rules written for one agent (CLAUDE.md, .cursor/rules, ~/.codex/AGENTS.md, ...)
 

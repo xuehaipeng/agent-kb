@@ -109,3 +109,35 @@ func TestMCPInstructionsCarryRules(t *testing.T) {
 		t.Fatalf("instructions: %s", instr)
 	}
 }
+
+// The rules in `instructions` are fitted to the declared budget for that
+// field; the fixed guidance always stays.
+func TestMCPInstructionsAreBudgeted(t *testing.T) {
+	dir := t.TempDir()
+	bundle := filepath.Join(dir, "knowledge")
+	os.MkdirAll(bundle, 0o755)
+	os.WriteFile(filepath.Join(bundle, kb.ConfigFile), []byte(kb.DefaultConfigYAML), 0o644)
+	s, _ := kb.Open(bundle)
+	for i := 0; i < 45; i++ {
+		title := "规则" + string(rune('A'+i%26)) + string(rune('a'+i/26)) + "：" + strings.Repeat("始终优先使用文档中记录的方法而不是临时方案，", 12)
+		if _, err := s.Add(kb.AddInput{Type: "rule", Title: title, Description: "because", Evidence: "user said so", Actor: kb.Actor{Producer: "claude-code"}, Force: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pr, pw, _ := os.Pipe()
+	go func() {
+		(&Server{Store: s}).Serve(strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","clientInfo":{"name":"cursor"}}}`+"\n"), pw)
+		pw.Close()
+	}()
+	var m map[string]any
+	if err := json.NewDecoder(pr).Decode(&m); err != nil {
+		t.Fatal(err)
+	}
+	instr := m["result"].(map[string]any)["instructions"].(string)
+	if n := kb.ContextLen(instr); n > kb.MCPInstructionsBudget {
+		t.Fatalf("instructions are %d units, budget %d", n, kb.MCPInstructionsBudget)
+	}
+	if !strings.HasPrefix(instr, baseInstructions) || !strings.Contains(instr, "Rules from kb") || !strings.Contains(instr, "more rule(s) apply here but were left out") {
+		t.Fatalf("instructions:\n%s", instr[:300])
+	}
+}

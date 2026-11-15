@@ -36,7 +36,8 @@ type StatusReport struct {
 	ParseErrors      int            `json:"parse_errors"`
 	Rules            int            `json:"rules_delivered"` // applicable trusted rules, before the delivery cap
 	RulesScope       string         `json:"rules_scope"`
-	RulesOmitted     int            `json:"rules_omitted_by_cap"`
+	RulesOmitted     int            `json:"rules_omitted_by_cap"` // applicable rules the session-start delivery leaves out (count cap or size budget)
+	Delivery         *Delivery      `json:"rules_delivery,omitempty"`
 	PendingRules     []string       `json:"rules_pending"`
 	Uncommitted      int            `json:"uncommitted_files"`
 	Unpushed         int            `json:"unpushed_commits"`
@@ -54,6 +55,9 @@ type StatusOptions struct {
 	// global entry restricted to one project when the global bundle is
 	// selected; automatic session output must not.
 	everywhere bool
+	// noDelivery skips the delivery plan (set when a report is computed only
+	// for its brief, which the plan itself needs).
+	noDelivery bool
 }
 
 // Status computes the report for the current scope; me may be zero.
@@ -88,6 +92,7 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 		r.Scope = s.Project + " + global"
 	}
 	r.Uncommitted, r.Unpushed, r.Upstream = s.SyncState()
+	var planRules *RuleSet
 	inScope := s.scopeFilter(o.Projects, o.AllProjects)
 	if o.everywhere && s.Hub {
 		inScope = func(n *Node) bool { return n.Project == GlobalProject && len(n.Meta().Projects) == 0 }
@@ -137,6 +142,7 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 		for _, n := range rs.Pending {
 			r.PendingRules = append(r.PendingRules, n.ID)
 		}
+		planRules = &rs
 	}
 	open, _ := s.Reviews(ReviewFilter{Projects: o.Projects, AllProjects: o.AllProjects})
 	r.ReviewsOpen = len(open)
@@ -152,6 +158,18 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 			}
 		}
 	}
+	// What the SessionStart hook delivers for this rule scope, planned with
+	// the same helper and budget the hook uses. In the default scope the
+	// brief is the session's own, so the numbers are exactly the hook's.
+	if planRules != nil && !o.noDelivery {
+		brief := r.briefLines()
+		if len(o.Projects) == 0 && !o.AllProjects && s.Hub && s.Project == "" {
+			brief = s.sessionBriefLines(me)
+		}
+		d := s.planDelivery(SurfaceSessionStart, SessionStartBudget, "", *planRules, brief)
+		d.Text = ""
+		r.Delivery, r.RulesOmitted = &d, d.Omitted()
+	}
 	return r, nil
 }
 
@@ -163,7 +181,9 @@ const briefLines = 3
 // disputes, proposed rules, entries needing a look, then one aggregate line
 // for code that could not be compared); what does not fit is left to
 // 'kb status'.
-func (r *StatusReport) Brief() string {
+func (r *StatusReport) Brief() string { return strings.Join(r.briefLines(), "\n") }
+
+func (r *StatusReport) briefLines() []string {
 	var lines []string
 	if n := len(r.ReviewsForMe); n > 0 {
 		lines = append(lines, fmt.Sprintf("kb: %d review(s) waiting for you: %s (kb review show <id>)", n, list3(r.ReviewsForMe)))
@@ -187,7 +207,7 @@ func (r *StatusReport) Brief() string {
 		lines = lines[:briefLines]
 		lines[briefLines-1] += fmt.Sprintf(" (+%d more: kb status)", over)
 	}
-	return strings.Join(lines, "\n")
+	return lines
 }
 
 // SessionBrief is the health brief injected into a session automatically
@@ -197,16 +217,20 @@ func (r *StatusReport) Brief() string {
 // unrelated projects, including through a global entry restricted to one of
 // them. Interactive 'kb status' keeps its discovery defaults.
 func (s *Store) SessionBrief(me Actor) string {
-	o := StatusOptions{Me: me}
+	return strings.Join(s.sessionBriefLines(me), "\n")
+}
+
+func (s *Store) sessionBriefLines(me Actor) []string {
+	o := StatusOptions{Me: me, noDelivery: true}
 	if s.Hub && s.Project == "" {
 		o.Projects = []string{GlobalProject}
 		o.everywhere = true
 	}
 	r, err := s.StatusFor(o)
 	if err != nil {
-		return ""
+		return nil
 	}
-	return r.Brief()
+	return r.briefLines()
 }
 
 func list3(ids []string) string {

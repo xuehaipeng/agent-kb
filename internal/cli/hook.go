@@ -48,13 +48,11 @@ func (a *App) cmdHook(args []string) int {
 		// Rules are pushed into the session; everything else is pulled. Both
 		// the rules and the brief follow the session's project: outside any
 		// project that is the global scope only, never every project.
-		if rs, err := s.Rules(nil, false); err == nil {
-			if out := s.RenderRules(rs, false); out != "" {
-				fmt.Fprint(a.Stdout, out)
-			}
-		}
-		if b := s.SessionBrief(me); b != "" {
-			fmt.Fprintln(a.Stdout, b)
+		// The whole payload is fitted to one budget: Claude Code replaces a
+		// hook's stdout with a short preview once it passes 10,000
+		// characters, so an oversized rule list would mostly go missing.
+		if d, err := s.SessionStartDelivery(me); err == nil {
+			fmt.Fprint(a.Stdout, d.Text)
 		}
 		// Hub: pull what other machines (e.g. Hermes) recorded, in the background.
 		if s.Hub && hasOrigin(s) && os.Getenv(extract.GuardEnv) == "" {
