@@ -1473,6 +1473,29 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 		t.Fatalf("the surviving file should continue the entry:\n%s", r)
 	}
 
+	// The way out an ambiguous rename advertises: deprecate the old entry,
+	// and the files carrying its name are imported as new sources.
+	write("feedback_naming.md", topic("feedback-naming", "Branch names start with the ticket id", "feedback", "Name branches after their ticket."))
+	if out := scan(); !strings.Contains(out, "1 imported") {
+		t.Fatalf("naming rule:\n%s", out)
+	}
+	const namingID = "aiproxy/conventions/branch-names-start-with-the-ticket-id"
+	os.Remove(filepath.Join(mem, "feedback_naming.md"))
+	write("feedback_naming_git.md", topic("feedback-naming", "Branches are named ticket-slug", "feedback", "Use the ticket id and a short slug for branch names."))
+	write("feedback_naming_files.md", topic("feedback-naming", "Test files sit next to their source", "feedback", "Keep a test file beside the file it tests."))
+	if out := scan(); !strings.Contains(out, `ambiguous: 2 new file(s) carry the name "feedback-naming"`) || strings.Contains(out, "imported,") && !strings.Contains(out, "0 imported") {
+		t.Fatalf("ambiguous replacements:\n%s", out)
+	}
+	os.Chdir(repo)
+	must(t, "codex", "deprecate", namingID, "-m", "split into two rules")
+	out = scan()
+	if strings.Contains(out, "ambiguous") || !strings.Contains(out, "2 imported") || strings.Contains(out, "no longer backs "+namingID) {
+		t.Fatalf("after deprecating the old entry the replacements must import:\n%s", out)
+	}
+	if out := scan(); strings.Contains(out, "ambiguous") || !strings.Contains(out, "0 imported") {
+		t.Fatalf("rescan after the split:\n%s", out)
+	}
+
 	// Two tracked sources share a name, both vanish, and one edited file
 	// with that name appears: which source it continues is unknown, so
 	// neither is reported deleted and nothing is imported.
