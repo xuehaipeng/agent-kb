@@ -105,10 +105,21 @@ func (a *App) cmdHook(args []string) int {
 		if last != nil && last.Digest == s.RuleDigest() {
 			return 0
 		}
-		if d, err := s.AgentDelivery(kb.SurfaceRuleRefresh); err == nil && d.Text != "" {
-			a.hookContext("PreToolUse", "kb: the rules that apply here changed since you last received them. They are now:\n"+d.Text)
-			s.RecordDelivery(in.SessionID, orMain(in.AgentID), in.AgentType, "PreToolUse:refresh", d, false, false)
+		d, err := s.AgentDelivery(kb.SurfaceRuleRefresh)
+		if err != nil {
+			return 0
 		}
+		switch {
+		case d.Text != "":
+			a.hookContext("PreToolUse", "kb: the rules that apply here changed since you last received them. They are now:\n"+d.Text)
+		case last != nil && last.Rules > 0:
+			// The last rule it holds was retired or no longer applies here:
+			// say so, or it goes on following an instruction that is gone.
+			a.hookContext("PreToolUse", "kb: the rules you received from kb earlier no longer apply here, and no kb rules apply now. Stop following them unless the user says otherwise.")
+		}
+		// Recorded even when there is nothing to hand over, so the agent
+		// is not looked at again on every tool call.
+		s.RecordDelivery(in.SessionID, orMain(in.AgentID), in.AgentType, "PreToolUse:refresh", d, false, false)
 	case "PreCompact", "SessionEnd", "Stop":
 		if os.Getenv(extract.GuardEnv) != "" || in.TranscriptPath == "" {
 			return 0

@@ -2033,4 +2033,77 @@ func TestNativeRulesAndSubagentDelivery(t *testing.T) {
 	if h := hooksIn(); h["PreToolUse"] != nil {
 		t.Fatalf("refresh hook not removed: %v", h)
 	}
+
+	// The same hub installed for another Claude configuration directory:
+	// the choice to use the managed file is kept, the file goes where that
+	// configuration is read from, and a session under the old directory no
+	// longer counts on a file that is not there.
+	has("main in kubedl before the move", start(kubedl, "moved", "startup"), []string{volcano}, []string{english})
+	other := filepath.Join(home, "claude-work")
+	t.Setenv("CLAUDE_CONFIG_DIR", other)
+	out = must(t, "", "install", "claude")
+	moved, _ := os.ReadFile(filepath.Join(other, "rules", "kb.md"))
+	has("managed rules file in the new configuration directory", string(moved), []string{english, "<!-- kb:source " + hub}, []string{volcano})
+	if _, err := os.Stat(filepath.Join(other, "settings.json")); err != nil {
+		t.Errorf("settings were not written to the new configuration directory: %v", err)
+	}
+	if _, err := os.Stat(native); err == nil || !strings.Contains(out, "removed "+native) {
+		t.Errorf("the file of the earlier configuration directory must go, and be reported:\n%s", out)
+	}
+	has("main under the new configuration directory", start(kubedl, "moved", "resume"), []string{volcano}, []string{english})
+	os.Unsetenv("CLAUDE_CONFIG_DIR")
+	has("main under the old configuration directory", start(kubedl, "moved", "resume"), []string{volcano, english}, nil)
+}
+
+// TestRuleRefreshWhenNoRulesRemain: when the last rule an agent holds is
+// retired, the refresh hook says so once instead of staying silent with the
+// agent marked stale for ever.
+func TestRuleRefreshWhenNoRulesRemain(t *testing.T) {
+	base, _ := hubEnv(t)
+	repo := mkRemoteRepo(t, base, "aiproxy")
+	must(t, "", "hub", "init")
+	os.Chdir(repo)
+	must(t, "claude-code", "add", "rule", "Squash commits before merging", "-d", "history stays readable", "-e", "user said so")
+	hook := func(input string) string {
+		t.Helper()
+		out, _, code := kbRun(t, "claude-code", input, "hook", "claude")
+		if code != 0 {
+			t.Fatalf("hook exit %d", code)
+		}
+		return out
+	}
+	tool := func(agent string) string {
+		in := `{"session_id":"s1","hook_event_name":"PreToolUse","tool_name":"Read","cwd":"` + repo + `"`
+		if agent != "" {
+			in += `,"agent_id":"` + agent + `","agent_type":"Explore"`
+		}
+		return hook(in + "}")
+	}
+	if out := hook(`{"session_id":"s1","hook_event_name":"SessionStart","source":"startup","cwd":"` + repo + `"}`); !strings.Contains(out, "Squash commits before merging") {
+		t.Fatalf("session start:\n%s", out)
+	}
+	hook(`{"session_id":"s1","hook_event_name":"SubagentStart","agent_id":"a1","agent_type":"Explore","cwd":"` + repo + `"}`)
+	if out := tool("") + tool("a1"); out != "" {
+		t.Fatalf("nothing changed yet:\n%s", out)
+	}
+	must(t, "claude-code", "deprecate", "aiproxy/conventions/squash-commits-before-merging", "-m", "the team merges with merge commits now")
+	for _, agent := range []string{"", "a1"} {
+		out := tool(agent)
+		if !strings.Contains(out, "no longer apply here, and no kb rules apply now") || strings.Contains(out, "Squash commits") {
+			t.Errorf("agent %q was not told its rules are gone:\n%s", agent, out)
+		}
+		if again := tool(agent); again != "" {
+			t.Errorf("agent %q is told once:\n%s", agent, again)
+		}
+	}
+	if diag := must(t, "claude-code", "rules", "--delivery"); strings.Contains(diag, "STALE") {
+		t.Errorf("no agent is stale after the refresh:\n%s", diag)
+	}
+	// An agent that never held a rule is not told that its rules are gone.
+	if out := tool("a2"); out != "" {
+		t.Errorf("an agent without rules has nothing to retract:\n%s", out)
+	}
+	if out := tool("a2"); out != "" {
+		t.Errorf("and is not looked at again:\n%s", out)
+	}
 }
