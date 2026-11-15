@@ -436,6 +436,11 @@ and the revision the import last wrote.
 - Renamed file: recognised when exactly one new file carries a vanished
   source's content (or name). Several identical candidates are reported as
   ambiguous; nothing is imported or flagged for them.
+- Memory whose type changes to one that maps to another knowledge type: a
+  conflict on every scan, decided on the entry's actual type. An update
+  cannot change an entry's type, so the source is never applied to it, and
+  accepting the conflict does not lift that. Deprecating the entry frees the
+  memory to import as a new entry.
 - Tracked file that stops being a single typed note (several sections, too
   long, now `user` or empty): also a conflict. The model path only adds
   entries, so it must not take a file that already owns one.

@@ -579,11 +579,14 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		// is now (after a merge by hand) as the new baseline.
 		if e != nil && e.Conflict != "" {
 			if o.AcceptConflicts {
+				// The entry as it is now is the baseline. Its imported type
+				// is kept: accepting never makes a later edit of a source
+				// of another type apply to it.
 				if !o.DryRun {
 					if n, err := s.Get(e.Entry); err == nil {
 						e.Revision = n.Meta().Rev()
 					}
-					e.Hash, e.Type, e.Conflict, e.Updated = f.hash, t.Type, "", now.Format(time.RFC3339)
+					e.Hash, e.Conflict, e.Updated = f.hash, "", now.Format(time.RFC3339)
 				}
 				r.unchanged++
 				continue
@@ -598,11 +601,14 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			r.unchanged++
 			continue
 		}
+		// The memory type recorded with the source: the one its entry was
+		// imported as. A conflict must not replace it.
+		recType := t.Type
 		record := func(outcome, entry string, rev int, conflict string) {
 			if o.DryRun {
 				return
 			}
-			ne := &ledgerEntry{Adapter: AdapterClaudeMemory, Root: root.Dir, Path: f.path, Project: root.Project, Name: t.Name, Type: t.Type,
+			ne := &ledgerEntry{Adapter: AdapterClaudeMemory, Root: root.Dir, Path: f.path, Project: root.Project, Name: t.Name, Type: recType,
 				Hash: f.hash, Outcome: outcome, Entry: entry, Revision: rev, Conflict: conflict, Updated: now.Format(time.RFC3339)}
 			if e != nil {
 				ne.Aliases = e.Aliases
@@ -610,17 +616,30 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			l.Sources[f.path] = ne
 		}
 
+		// A source whose entry was retired is free to become a new one: that
+		// is how a memory whose type changed is taken over (deprecate the
+		// old entry; the memory then imports as its new type).
+		if e != nil && e.Entry != "" {
+			if n, err := s.Get(e.Entry); err != nil || s.Trust(n).State == kb.StateDeprecated {
+				e = nil
+			} else if n.TypeKey != kbType {
+				// Decided on the entry's actual type, on every scan: an
+				// update cannot change an entry's type, so applying the
+				// source would put, say, a project fact into a delivered
+				// rule. Accepting the conflict does not lift this.
+				r.conflicts++
+				msg := fmt.Sprintf("the memory is now a %s, but its entry is a %s", t.Type, n.TypeKey)
+				r.details = append(r.details, fmt.Sprintf("conflict: %s: %s; %s was left as it is. Deprecate it and the memory imports as a new entry, or keep both as they are", base, msg, e.Entry))
+				if e.Type != "" {
+					recType = e.Type
+				}
+				record(e.Outcome, e.Entry, e.Revision, msg)
+				continue
+			}
+		}
+
 		// A source that already became an entry: apply the edit to it.
 		if e != nil && e.Entry != "" {
-			if e.Type != "" && e.Type != t.Type {
-				if oldType, _ := memoryKBType(e.Type); oldType != kbType {
-					r.conflicts++
-					msg := fmt.Sprintf("memory type changed from %s to %s", e.Type, t.Type)
-					r.details = append(r.details, fmt.Sprintf("conflict: %s: %s; %s was left as it is (update or deprecate it by hand)", base, msg, e.Entry))
-					record(e.Outcome, e.Entry, e.Revision, msg)
-					continue
-				}
-			}
 			if o.DryRun {
 				r.updated++
 				continue

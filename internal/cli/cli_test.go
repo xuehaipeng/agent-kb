@@ -1346,6 +1346,29 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 		t.Fatalf("a tracked source that became a user memory:\n%s", out)
 	}
 
+	// A tracked memory changes type: its entry cannot change type, so no
+	// later edit may be applied to it, with or without an accepted conflict.
+	write("reference_runbook.md", topic("reference-runbook", "Incident runbook location", "feedback", "Always open the runbook before paging anyone."))
+	if out := scan(); !strings.Contains(out, "conflict: reference_runbook.md: the memory is now a feedback, but its entry is a fact; "+runbookID+" was left as it is") {
+		t.Fatalf("type change:\n%s", out)
+	}
+	write("reference_runbook.md", topic("reference-runbook", "Incident runbook location", "feedback", "Always open the runbook before paging anyone, even at night."))
+	if out := scan(); !strings.Contains(out, "the memory is now a feedback, but its entry is a fact") || strings.Contains(out, "1 updated") {
+		t.Fatalf("a second edit must not slip past the type conflict:\n%s", out)
+	}
+	scan("--accept-conflicts")
+	write("reference_runbook.md", topic("reference-runbook", "Incident runbook location", "feedback", "Always open the runbook first."))
+	if out := scan(); !strings.Contains(out, "the memory is now a feedback, but its entry is a fact") || strings.Contains(out, "1 updated") {
+		t.Fatalf("accepting must not let a later edit change a fact into a rule's text:\n%s", out)
+	}
+	if rb := show(runbookID); !strings.Contains(rb, "pinned page in the operations space") || !strings.Contains(rb, "revision: 1") || !strings.Contains(rb, "type: fact") {
+		t.Fatalf("the fact was overwritten by a feedback memory:\n%s", rb)
+	}
+	write("reference_runbook.md", topic("reference-runbook", "Incident runbook location", "reference", "The incident runbook is the pinned page in the operations space."))
+	if out := scan(); strings.Contains(out, "conflict: reference_runbook.md") {
+		t.Fatalf("back to its own type:\n%s", out)
+	}
+
 	// 2. Two sources share a name. One is renamed (same content), the other
 	// deleted: the new path stands for the renamed one only.
 	os.Rename(filepath.Join(mem, "project_alpha.md"), filepath.Join(mem, "project_alpha_rollout.md"))
