@@ -388,6 +388,19 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 			gone[p] = e
 		}
 	}
+	// A vanished source whose entry was retired has nothing left to
+	// continue: it takes no part in rename matching, so it can neither
+	// claim a new file nor make one ambiguous. That is what makes
+	// "deprecate the entry" a way out of an ambiguous rename: the new files
+	// are then plain new sources.
+	for p, e := range gone {
+		if e.Entry != "" && !entryAlive(s, e.Entry) {
+			delete(gone, p)
+			if !o.DryRun {
+				delete(l.Sources, p)
+			}
+		}
+	}
 	// A new file that carries a vanished source's content (or its name) is
 	// that source renamed, when the match is unique both ways.
 	newByHash, newByName := map[string][]string{}, map[string][]string{}
