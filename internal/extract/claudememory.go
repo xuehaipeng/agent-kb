@@ -421,6 +421,15 @@ func importMemoryRoot(s *kb.Store, l *ledger, root MemoryRoot, o ImportOptions) 
 		e := gone[from]
 		delete(gone, from)
 		delete(l.Sources, from)
+		// The entry names its source: point it at the new file. A rename
+		// whose content also changed is rewritten by the update that
+		// follows; one whose content did not change would otherwise keep
+		// naming a file that no longer exists.
+		if e.Entry != "" {
+			if err := s.RelocateSource(e.Entry, KindMemory+"-"+kb.Slugify(root.Agent.Producer), displayPath(to), root.Agent); err != nil {
+				r.details = append(r.details, fmt.Sprintf("renamed: %s still names %s as its source (%v)", e.Entry, filepath.Base(from), err))
+			}
+		}
 		e.Aliases = append(e.Aliases, from)
 		e.Path, e.Missing, e.MissingChecks, e.MissingRevision = to, "", 0, 0
 		l.Sources[to] = e
