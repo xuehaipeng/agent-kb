@@ -589,12 +589,18 @@ project is established, never guessed from a name alone:
 
 | Directory | Owner |
 |---|---|
-| default `<config>/projects/<dir>/memory` | the one project its transcripts ran in; failing transcripts, the one project with a registered checkout whose encoded path is `<dir>` |
+| default `<config>/projects/<dir>/memory` | the one project its transcripts ran in (every transcript is read, not a sample); failing transcripts, the one project with a registered checkout whose encoded path is `<dir>` |
 | the same, with transcripts from several projects | none: needs a mapping |
 | `autoMemoryDirectory` in a repository's `.claude/settings*.json` | that repository's project |
 | `autoMemoryDirectory` in user settings, or in a file given with `--settings` | none: shared by every project that runs with it |
 | subagent memory under a checkout (`.claude/agent-memory[-local]/<agent>/`) | that checkout's project |
 | user-level subagent memory (`<config>/agent-memory/<agent>/`) | none: it spans projects and is not turned into global knowledge on its own |
+
+A directory can be reached several of these ways. Everything said about it
+is collected first and weighed together: a mapping made by hand settles it;
+otherwise anything that makes it shared keeps it out, however firmly
+something else names one project (a repository's directory that user
+settings also name is shared); otherwise the projects named must agree.
 
 `kb extract --map-root <dir>=<project>` records an owner for a shared
 directory in local state (`.kb/extract/roots.json`); `<dir>=` removes it.

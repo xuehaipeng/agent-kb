@@ -2245,6 +2245,47 @@ func TestMemoryDiscoveryAndOwnership(t *testing.T) {
 	if rep := must(t, "", "extract", "--sources"); !strings.Contains(rep, "transcript retention: 30 day(s) (the default)") {
 		t.Errorf("default retention:\n%s", rep)
 	}
+
+	// Everything said about a directory is weighed before it gets an
+	// owner. Named by one repository's settings and by a settings file any
+	// project may run with: shared, so not imported.
+	sharedSettings := filepath.Join(base, "shared-settings.json")
+	os.WriteFile(sharedSettings, []byte(`{"autoMemoryDirectory":"`+repoMem+`"}`), 0o644)
+	put(repoMem, "project_seven.md", topic("seven", "Late note in a directory that turned out shared", "project", "Written after the directory was named by a shared settings file."))
+	if out := scan("--settings", sharedSettings); !strings.Contains(out, "mem-kubedl: skipped (autoMemoryDirectory in ") || strings.Contains(out, "mem-kubedl [kubedl]") {
+		t.Errorf("a repository's directory that a shared settings file also names:\n%s", out)
+	}
+	if got := search("late note directory turned out shared"); strings.Contains(got, "late-note") {
+		t.Errorf("a note from a directory a shared settings file names was imported:\n%s", got)
+	}
+	// A default directory with one owner that user settings point every
+	// project at: shared as well.
+	put(filepath.Join(alt, "projects", "-x-kubedl", "memory"), "project_eight.md", topic("eight", "Late note in a default directory", "project", "Written after user settings named the directory."))
+	put(alt, "settings.json", `{"autoMemoryDirectory":"`+filepath.Join(alt, "projects", "-x-kubedl", "memory")+`"}`)
+	if out := scan(); !strings.Contains(out, "-x-kubedl/memory: skipped (autoMemoryDirectory in ") || strings.Contains(out, "-x-kubedl/memory [kubedl]") {
+		t.Errorf("a default directory that user settings name for every project:\n%s", out)
+	}
+	if got := search("late note default directory"); strings.Contains(got, "late-note-in-a-default-directory") {
+		t.Errorf("a note from a default directory user settings share was imported:\n%s", got)
+	}
+	os.Remove(filepath.Join(alt, "settings.json"))
+	// Named by two repositories: neither owns it.
+	put(filepath.Join(aiproxy, ".claude"), "settings.local.json", `{"autoMemoryDirectory":"`+repoMem+`"}`)
+	if out := scan(); !strings.Contains(out, "mem-kubedl: skipped (several projects are named as its owner (aiproxy, kubedl)") {
+		t.Errorf("a directory two repositories name:\n%s", out)
+	}
+	os.Remove(filepath.Join(aiproxy, ".claude", "settings.local.json"))
+	// Ownership looks at every transcript, not the last few by name: one
+	// early session in another project makes the directory shared.
+	many := filepath.Join(alt, "projects", "-x-many")
+	transcript(many, "000.jsonl", aiproxy)
+	for i := 1; i <= 70; i++ {
+		transcript(many, fmt.Sprintf("%03d.jsonl", i), kubedl)
+	}
+	put(filepath.Join(many, "memory"), "project_nine.md", topic("nine", "Note in a directory with many sessions", "project", "Seventy sessions in one project and one in another."))
+	if out := scan(); !strings.Contains(out, "-x-many/memory: skipped (its transcripts ran in several projects (aiproxy, kubedl)") {
+		t.Errorf("a directory with more transcripts than a sample would read:\n%s", out)
+	}
 	if st := strings.TrimSpace(git(t, os.Getenv("KB_HOME"), "status", "--porcelain")); st != "" {
 		t.Errorf("mappings leaked into the shared hub:\n%s", st)
 	}
