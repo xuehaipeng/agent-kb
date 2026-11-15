@@ -62,7 +62,16 @@ func (s *Store) fileMatches(rel string) ([]fileMatch, error) {
 	// before is taken out afterwards, so a cut here would hide the rest for
 	// good once the first few have been delivered. The budget, applied to
 	// what is still to give, bounds the injection.
-	hits, err := s.Search(SearchQuery{Files: []string{rel}, NoDocs: true, Limit: 1 << 20})
+	// The search makes paths repository-relative itself, and takes a
+	// relative one as relative to the working directory when such a file
+	// exists. rel is already relative to the repository, so it is handed
+	// over as an absolute path: in a session started in a subdirectory,
+	// pkg/x.go must not turn into <subdirectory>/pkg/x.go.
+	root := s.GitTop()
+	if root == "" {
+		root = s.CodeRoot
+	}
+	hits, err := s.Search(SearchQuery{Files: []string{filepath.Join(root, filepath.FromSlash(rel))}, NoDocs: true, Limit: 1 << 20})
 	if err != nil {
 		return nil, err
 	}
@@ -249,9 +258,13 @@ func (s *Store) BenchFileContext(cases []FileContextCase) (FileContextBench, err
 	var millis []float64
 	units := 0
 	for _, c := range cases {
+		// A file the hook does not cover gets nothing from it: the case
+		// counts with zero injected, not with a lookup the hook never does.
 		rel, skip := s.relForContext(c.File)
 		if skip != "" {
-			rel = c.File
+			b.Relevant += len(c.Relevant)
+			b.Lines = append(b.Lines, fmt.Sprintf("%s: not covered by the hook (%s): injected 0, relevant 0 of %d", c.File, skip, len(c.Relevant)))
+			continue
 		}
 		start := time.Now()
 		ms, err := s.fileMatches(rel)
