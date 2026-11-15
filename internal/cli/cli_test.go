@@ -1460,7 +1460,7 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 	write("feedback_reviews_v2.md", topic("feedback-reviews", "Review requests name one owner and one backup", "feedback", "Every review request names one owner and one backup."))
 	write("feedback_reviews_backup.md", topic("feedback-reviews", "Reviews are requested in the team channel", "feedback", "Ask for reviews in the team channel, not in private messages."))
 	out = scan()
-	if !strings.Contains(out, `ambiguous: 2 new file(s) carry the name "feedback-reviews" of 1 deleted source(s) of `+reviewsID) || strings.Contains(out, "1 imported") || strings.Contains(out, "2 imported") || strings.Contains(out, "no longer backs "+reviewsID) {
+	if !strings.Contains(out, `ambiguous: 2 new file(s) carry the name "feedback-reviews" of 1 deleted source(s) (`+reviewsID+` among them)`) || strings.Contains(out, "1 imported") || strings.Contains(out, "2 imported") || strings.Contains(out, "no longer backs "+reviewsID) {
 		t.Fatalf("ambiguous name match must be withheld:\n%s", out)
 	}
 	os.Chdir(base)
@@ -1474,6 +1474,53 @@ func TestClaudeMemoryIdentityEdgeCases(t *testing.T) {
 	}
 	if r := show(reviewsID); !strings.Contains(r, "one owner and one backup") || !strings.Contains(r, "revision: 2") {
 		t.Fatalf("the surviving file should continue the entry:\n%s", r)
+	}
+
+	// Two tracked sources share a name, both vanish, and one edited file
+	// with that name appears: which source it continues is unknown, so
+	// neither is reported deleted and nothing is imported.
+	write("project_gamma.md", topic("twin", "Gamma cluster runs the batch jobs", "project", "Batch jobs run on the gamma cluster."))
+	write("project_delta.md", topic("twin", "Delta cluster runs the web tier", "project", "The web tier runs on the delta cluster."))
+	if out := scan(); !strings.Contains(out, "2 imported") {
+		t.Fatalf("twins:\n%s", out)
+	}
+	const gammaID, deltaID = "aiproxy/facts/gamma-cluster-runs-the-batch-jobs", "aiproxy/facts/delta-cluster-runs-the-web-tier"
+	os.Remove(filepath.Join(mem, "project_gamma.md"))
+	os.Remove(filepath.Join(mem, "project_delta.md"))
+	write("project_clusters.md", topic("twin", "Clusters and what runs on them", "project", "Gamma runs batch, delta runs web, epsilon runs nothing yet."))
+	out = scan()
+	if !strings.Contains(out, `ambiguous: 1 new file(s) carry the name "twin" of 2 deleted source(s)`) || strings.Contains(out, "no longer backs "+gammaID) || strings.Contains(out, "no longer backs "+deltaID) || strings.Contains(out, "1 imported") || strings.Count(out, "ambiguous:") != 1 {
+		t.Fatalf("a whole ambiguous name group must be withheld:\n%s", out)
+	}
+	os.Remove(filepath.Join(mem, "project_clusters.md")) // now both are simply gone
+	if out := scan(); !strings.Contains(out, "no longer backs "+gammaID) || !strings.Contains(out, "no longer backs "+deltaID) {
+		t.Fatalf("once the candidate is gone, both deletions are reported:\n%s", out)
+	}
+
+	// --force reconsiders an unchanged source that owns no entry. Here the
+	// memory duplicated an entry that has since been deprecated.
+	os.Chdir(repo)
+	must(t, "codex", "add", "fact", "Staging database is refreshed nightly", "-d", "Copied from production every night at two.", "-e", "read the cron config")
+	write("project_staging.md", topic("staging", "Staging database is refreshed nightly", "project", "Copied from production every night at two."))
+	if out := scan(); !strings.Contains(out, "1 already known") {
+		t.Fatalf("duplicate memory:\n%s", out)
+	}
+	os.Chdir(repo)
+	must(t, "codex", "deprecate", "aiproxy/facts/staging-database-is-refreshed-nightly", "-m", "superseded by the memory import")
+	if out := scan(); strings.Contains(out, "1 imported") {
+		t.Fatalf("an unforced scan leaves an unchanged source alone:\n%s", out)
+	}
+	if out := scan("--force"); !strings.Contains(out, "1 imported") {
+		t.Fatalf("--force must reconsider a source that owns no entry:\n%s", out)
+	}
+	// Forcing never rewrites or duplicates a source that owns an entry.
+	os.Chdir(base)
+	active := must(t, "codex", "status", "--all")
+	if out := scan("--force"); strings.Contains(out, "1 imported") || strings.Contains(out, "1 updated") {
+		t.Fatalf("--force touched sources that own entries:\n%s", out)
+	}
+	if again := must(t, "codex", "status", "--all"); strings.SplitN(again, "\n", 3)[1] != strings.SplitN(active, "\n", 3)[1] {
+		t.Fatalf("--force changed the entries:\n%s\n%s", active, again)
 	}
 
 	// A dry run reports the same rename without recording it.
