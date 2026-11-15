@@ -1660,6 +1660,10 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	// A four-backtick block showing Markdown with its own fences: the inner
 	// fences do not end it, so nothing inside is an import or a comment.
 	file("docs/example.md", "Example content that is only an illustration.\n")
+	// Inline code delimited by two backticks may hold single ones; a
+	// reference inside it is an example, not an import.
+	file("docs/inline.md", "Inline example content that is only an illustration.\n")
+	file(".claude/rules/spans.md", "Write imports as ``@docs/inline.md`` or `` `@docs/inline.md` `` in examples.\nAn unmatched ` backtick changes nothing here.\n")
 	file(".claude/rules/fences.md", "Document commands in fenced blocks.\n\n````markdown\n```sh\nmake test\n```\nSee @docs/example.md\n<!-- kept: a comment inside the outer block -->\n~~~\nstill inside\n````\n\n<!-- dropped: a comment after the block -->\nKeep examples short.\n")
 	file("CLAUDE.local.md", "My sandbox URL is private.\n")
 	file("packages/web/CLAUDE.md", "Web components use CSS modules.\n")
@@ -1730,6 +1734,9 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	}
 	if strings.Count(p, "Always write a changelog entry.") != 1 {
 		t.Errorf("an import cycle included the file twice:\n%s", p)
+	}
+	if spans := read("rules-spans.md"); strings.Contains(spans, "Inline example content") || !strings.Contains(spans, "``@docs/inline.md``") {
+		t.Errorf("a reference inside a multi-backtick code span was followed:\n%s", spans)
 	}
 	fences := read("rules-fences.md")
 	for _, want := range []string{"See @docs/example.md", "<!-- kept: a comment inside the outer block -->", "still inside", "Keep examples short."} {
@@ -1835,7 +1842,7 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 		Conditional int `json:"rules_conditional"`
 	}
 	json.Unmarshal([]byte(must(t, "codex", "status", "--json")), &st)
-	if st.Rules != 4 || st.Conditional != 4 {
+	if st.Rules != 5 || st.Conditional != 4 {
 		t.Errorf("status: %+v", st)
 	}
 	// A rule can be recorded as conditional by hand too.

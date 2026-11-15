@@ -435,10 +435,51 @@ func stripBlockComments(text string) string {
 	return strings.Join(out, "\n")
 }
 
-var (
-	importRe   = regexp.MustCompile("(?:^|[\\s(])@((?:\\\\ |[^\\s`'\"()<>])+)")
-	codeSpanRe = regexp.MustCompile("`[^`]*`")
-)
+var importRe = regexp.MustCompile("(?:^|[\\s(])@((?:\\\\ |[^\\s`'\"()<>])+)")
+
+// stripCodeSpans removes inline code from a line, as Markdown delimits it:
+// a run of backticks opens a span that ends at the next run of the same
+// length, so a span opened by two backticks may hold single ones. A run
+// with no matching run after it is ordinary text.
+func stripCodeSpans(l string) string {
+	var out strings.Builder
+	for i := 0; i < len(l); {
+		if l[i] != '`' {
+			out.WriteByte(l[i])
+			i++
+			continue
+		}
+		n := 0
+		for i+n < len(l) && l[i+n] == '`' {
+			n++
+		}
+		// Look for a closing run of exactly n backticks.
+		end := -1
+		for j := i + n; j < len(l); {
+			if l[j] != '`' {
+				j++
+				continue
+			}
+			m := 0
+			for j+m < len(l) && l[j+m] == '`' {
+				m++
+			}
+			if m == n {
+				end = j + m
+				break
+			}
+			j += m
+		}
+		if end < 0 {
+			out.WriteString(l[i : i+n])
+			i += n
+			continue
+		}
+		out.WriteByte(' ')
+		i = end
+	}
+	return out.String()
+}
 
 // expandImports appends the files a text imports with @path, the way Claude
 // Code loads them next to the importing file. Only existing files inside the
@@ -450,7 +491,7 @@ func expandImports(s *kb.Store, text, dir, boundary string, seen map[string]bool
 		if fence.line(l) || fence.open() {
 			continue
 		}
-		for _, m := range importRe.FindAllStringSubmatch(codeSpanRe.ReplaceAllString(l, ""), -1) {
+		for _, m := range importRe.FindAllStringSubmatch(stripCodeSpans(l), -1) {
 			ref := strings.ReplaceAll(m[1], `\ `, " ")
 			target := resolveImport(ref, dir)
 			if target == "" {
