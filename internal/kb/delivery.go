@@ -76,6 +76,7 @@ type Delivery struct {
 	BriefOmitted   int      `json:"brief_lines_omitted"` // health lines left out to fit the budget
 	Text           string   `json:"-"`                   // the payload itself
 	IDs            []string `json:"-"`                   // the rules in the payload
+	NativeIDs      []string `json:"-"`                   // the rules left to the managed rules file
 }
 
 // RuleRefreshNotice opens a rule refresh: it tells the agent why it is
@@ -145,6 +146,7 @@ func (s *Store) planDeliveryRules(surface string, budget int, prefix string, rs 
 		for _, n := range rs.Global {
 			if o.native[n.ID] {
 				d.Native++
+				d.NativeIDs = append(d.NativeIDs, n.ID)
 				continue
 			}
 			kept = append(kept, n)

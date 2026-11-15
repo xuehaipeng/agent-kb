@@ -2582,6 +2582,17 @@ func TestAccessStatisticsAreOnlyASignal(t *testing.T) {
 	if n := delivered(pnpmRule); n != 3 {
 		t.Errorf("listing every project's rules is not a delivery: delivered %d, want 3", n)
 	}
+	// With the managed rules file in use, SessionStart leaves the universal
+	// rules to it. The agent still receives them, and they are counted.
+	const englishRule = "global/conventions/write-commit-messages-in-english"
+	englishBefore := delivered(englishRule)
+	hook, _, _ := kbRun(t, "claude-code", `{"session_id":"acc2","hook_event_name":"SessionStart","cwd":"`+aiproxy+`"}`, "hook", "claude")
+	if strings.Contains(hook, "Write commit messages in English") {
+		t.Fatalf("the test needs the universal rule to come from the managed file, not the hook:\n%s", hook)
+	}
+	if n := delivered(englishRule); n != englishBefore+1 {
+		t.Errorf("a rule the managed rules file delivers is delivered: %d, want %d", n, englishBefore+1)
+	}
 	out := must(t, "codex", "status", "--access")
 	for _, want := range []string{"a maintenance signal for this machine only", "never retrieved on this machine", learning + ": last ", "listed 2, shown 1, delivered 0"} {
 		if !strings.Contains(out, want) {
