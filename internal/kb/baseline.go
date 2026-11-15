@@ -157,7 +157,9 @@ func (s *Store) Checkouts(project string) []Checkout {
 		out = append(out, c)
 	}
 	if len(learned) > 0 {
-		s.updateRegistry(func(r *registry) bool {
+		// Best effort: the identities are a cache, re-read next time if the
+		// local state cannot be written.
+		_ = s.updateRegistry(func(r *registry) bool {
 			for p, info := range learned {
 				r.Checkouts[p] = info
 			}
@@ -302,10 +304,13 @@ func (s *Store) repoHasCommit(project, repo, commit string) (has, checked bool) 
 // ownerRepo establishes which repository of a project an entry's resources
 // refer to. Entries do not record it (structured anchors are a later stage),
 // so in a multi-repository project it is inferred from the anchor commit:
-// the one repository that contains it. Containment is only a hint (forks and
-// mirrors share commits, a missing object proves nothing), so several
-// matches are settled only by an explicit --checkout or the repository kb is
-// running in, and an anchor stamped by an import is not used at all.
+// the one repository that contains it, provided every repository of the
+// project could be looked in. Containment is only a hint (forks and mirrors
+// share commits, a missing object proves nothing, and a repository that is
+// not on this machine may contain the commit too), so several matches, or a
+// match with candidates that could not be checked, are settled only by an
+// explicit --checkout or the repository kb is running in. An anchor stamped
+// by an import is not used at all.
 func (s *Store) ownerRepo(project, anchor string, imported bool) (repo, basis, code, reason string) {
 	repos := s.ProjectRepos(project)
 	switch len(repos) {
@@ -328,17 +333,25 @@ func (s *Store) ownerRepo(project, anchor string, imported bool) (repo, basis, c
 		}
 	}
 	switch {
-	case len(matches) == 1:
+	case len(matches) == 1 && len(absent) == 0:
 		return matches[0], "anchor commit found only in " + matches[0], "", ""
-	case len(matches) > 1:
-		shared := "anchor commit is in " + strings.Join(matches, " and ")
+	case len(matches) > 0:
+		// Not unique, or not known to be: a repository that could not be
+		// looked in is not evidence that it lacks the commit.
+		found := "anchor commit is in " + strings.Join(matches, " and ")
+		if len(absent) > 0 {
+			found += "; not checked out here: " + strings.Join(absent, ", ")
+		}
 		if s.baselinePath != "" && containsStr(matches, s.baselineRepo) {
-			return s.baselineRepo, shared, "", ""
+			return s.baselineRepo, found, "", ""
 		}
 		if s.Project == project && containsStr(matches, s.repoID) {
-			return s.repoID, shared, "", ""
+			return s.repoID, found, "", ""
 		}
-		return "", "", UnknownAmbiguousRep, fmt.Sprintf("anchor commit %s is in several repositories of project %s (%s): run kb inside one of them or pass --checkout", short(anchor), project, strings.Join(matches, ", "))
+		if len(matches) > 1 {
+			return "", "", UnknownAmbiguousRep, fmt.Sprintf("anchor commit %s is in several repositories of project %s (%s): run kb inside one of them or pass --checkout", short(anchor), project, strings.Join(matches, ", "))
+		}
+		return "", "", UnknownAmbiguousRep, fmt.Sprintf("anchor commit %s is in %s, but %s of project %s could not be looked in (not checked out here) and may contain it too: run kb inside the owning repository or pass --checkout", short(anchor), matches[0], strings.Join(absent, ", "), project)
 	case len(absent) > 0:
 		return "", "", UnknownNoCheckout, fmt.Sprintf("anchor commit %s is not in the repositories of project %s checked out here; not checked out: %s", short(anchor), project, strings.Join(absent, ", "))
 	}
@@ -513,14 +526,16 @@ func (s *Store) SetPreferredCheckout(project, repo, path string) (string, string
 	if !containsStr(repos, repo) {
 		return "", "", fmt.Errorf("%s is not a repository of project %s (%s); 'kb project link %s' inside it adds it", repo, project, strings.Join(repos, ", "), project)
 	}
-	s.updateRegistry(func(r *registry) bool {
+	if err := s.updateRegistry(func(r *registry) bool {
 		r.adopt(project, top, info)
 		if r.Preferred[project] == nil {
 			r.Preferred[project] = map[string]string{}
 		}
 		r.Preferred[project][repo] = top
 		return true
-	})
+	}); err != nil {
+		return "", "", fmt.Errorf("the checkout preference was not saved: %w", err)
+	}
 	return repo, top, nil
 }
 
@@ -540,13 +555,15 @@ func (s *Store) ClearPreferredCheckout(project, repo string) (string, error) {
 	if prefs[repo] == "" {
 		return "", fmt.Errorf("no checkout preference for %s in project %s", repo, project)
 	}
-	s.updateRegistry(func(r *registry) bool {
+	if err := s.updateRegistry(func(r *registry) bool {
 		delete(r.Preferred[project], repo)
 		if len(r.Preferred[project]) == 0 {
 			delete(r.Preferred, project)
 		}
 		return true
-	})
+	}); err != nil {
+		return "", fmt.Errorf("the checkout preference was not cleared: %w", err)
+	}
 	return repo, nil
 }
 

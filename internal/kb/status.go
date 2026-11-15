@@ -48,6 +48,12 @@ type StatusOptions struct {
 	Me          Actor
 	Projects    []string
 	AllProjects bool
+
+	// everywhere limits entries to those that apply in any session: global
+	// entries with no `projects:` restriction. Discovery scope would count a
+	// global entry restricted to one project when the global bundle is
+	// selected; automatic session output must not.
+	everywhere bool
 }
 
 // Status computes the report for the current scope; me may be zero.
@@ -83,6 +89,10 @@ func (s *Store) StatusFor(o StatusOptions) (*StatusReport, error) {
 	}
 	r.Uncommitted, r.Unpushed, r.Upstream = s.SyncState()
 	inScope := s.scopeFilter(o.Projects, o.AllProjects)
+	if o.everywhere && s.Hub {
+		inScope = func(n *Node) bool { return n.Project == GlobalProject && len(n.Meta().Projects) == 0 }
+		r.Scope = "global"
+	}
 	sup := s.supersededIndex()
 	week := s.Now().Add(-7 * 24 * time.Hour)
 	for _, n := range nodes {
@@ -182,13 +192,15 @@ func (r *StatusReport) Brief() string {
 
 // SessionBrief is the health brief injected into a session automatically
 // (the SessionStart hook). It follows the session: the current project plus
-// global, and outside any project only the global scope, so a session never
-// receives the health of unrelated projects. Interactive 'kb status' keeps
-// its all-project default.
+// the global entries that apply to it, and outside any project only global
+// entries that apply everywhere, so a session never receives the health of
+// unrelated projects, including through a global entry restricted to one of
+// them. Interactive 'kb status' keeps its discovery defaults.
 func (s *Store) SessionBrief(me Actor) string {
 	o := StatusOptions{Me: me}
 	if s.Hub && s.Project == "" {
 		o.Projects = []string{GlobalProject}
+		o.everywhere = true
 	}
 	r, err := s.StatusFor(o)
 	if err != nil {

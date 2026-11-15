@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRulesDelivery(t *testing.T) {
@@ -171,5 +172,55 @@ func TestRuleScopeIsNotDiscoveryScope(t *testing.T) {
 	st, _ = home.StatusFor(StatusOptions{})
 	if len(rs.Global) != maxDeliveredRules || rs.Omitted != 3 || st.Rules != maxDeliveredRules+3 || st.RulesOmitted != 3 {
 		t.Fatalf("cap: delivered %d omitted %d status %d/%d", len(rs.Global), rs.Omitted, st.Rules, st.RulesOmitted)
+	}
+}
+
+// The automatic brief outside a project carries only what applies in every
+// session. A global entry restricted to one project (--for) is that
+// project's business, even though selecting the global bundle for discovery
+// includes it.
+func TestSessionBriefSkipsRestrictedGlobals(t *testing.T) {
+	newHub(t)
+	shop := newCodeRepo(t, "git@github.com:Acme/shop.git")
+	s := openAt(t, shop)
+	add := func(typ, title string, projects ...string) *Node {
+		t.Helper()
+		r, err := s.Add(AddInput{Type: typ, Title: title, Description: "because", Project: "global", Projects: projects, Evidence: "user said so", Actor: claude, Force: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return r.Node
+	}
+	restrictedRule := add("rule", "Tag shop images with the git sha", "shop")
+	restrictedFact := add("fact", "Shop checkout calls the tax service", "shop")
+	universalFact := add("fact", "All services log in JSON")
+	if _, _, err := s.Verify(VerifyInput{Ref: restrictedRule.ID, Result: ResultDisputed, Evidence: "tags are semver now", Actor: codex}); err != nil {
+		t.Fatal(err)
+	}
+	later := func(st *Store) *Store {
+		st.Now = func() time.Time { return time.Date(2027, 6, 1, 0, 0, 0, 0, time.UTC) } // facts are past stale_after
+		return st
+	}
+	home := later(openAt(t, t.TempDir()))
+	b := home.SessionBrief(claude)
+	if strings.Contains(b, restrictedRule.ID) || strings.Contains(b, restrictedFact.ID) || strings.Contains(b, "disputed") || strings.Contains(b, "proposed rule") {
+		t.Fatalf("brief outside a project carries a shop-only global entry:\n%s", b)
+	}
+	if !strings.Contains(b, "1 stale entr(ies) in global: "+universalFact.ID) {
+		t.Fatalf("brief outside a project should still report universal global entries:\n%s", b)
+	}
+	// Where the restriction applies, they are reported.
+	in := later(openAt(t, shop)).SessionBrief(claude)
+	if !strings.Contains(in, "1 disputed entr(ies): "+restrictedRule.ID) || !strings.Contains(in, restrictedFact.ID) {
+		t.Fatalf("brief in shop:\n%s", in)
+	}
+	// Interactive status keeps discovery semantics: selecting the global
+	// bundle lists everything in it.
+	st, _ := home.StatusFor(StatusOptions{Projects: []string{"global"}})
+	if st.Scope != "global" || len(st.Disputed) != 1 || st.Stale != 2 || st.Total != 3 {
+		t.Fatalf("kb status -p global: %+v", st)
+	}
+	if st, _ := home.StatusFor(StatusOptions{}); st.Scope != "all projects" || len(st.Disputed) != 1 {
+		t.Fatalf("kb status: %+v", st)
 	}
 }

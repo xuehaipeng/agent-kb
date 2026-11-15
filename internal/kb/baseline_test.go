@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -430,5 +431,200 @@ func TestExplicitRefBaseline(t *testing.T) {
 	}
 	if err := s.SetBaseline(t.TempDir(), ""); err == nil {
 		t.Fatal("--checkout outside git accepted")
+	}
+}
+
+// A repository that cannot be looked in is not evidence that it lacks the
+// anchor commit: with a parent and a shared-history fork, losing the fork's
+// checkout must not hand the fork's entry to the parent as "unchanged".
+func TestOwnershipWithUnavailableCandidate(t *testing.T) {
+	newHub(t)
+	base := t.TempDir()
+	const parentID, forkID = "github.com/acme/api", "github.com/fork/api"
+	parent := repoAt(t, filepath.Join(base, "api"), "git@github.com:Acme/api.git")
+	fork := filepath.Join(base, "fork")
+	runGit(t, base, "clone", "-q", parent, fork)
+	runGit(t, fork, "remote", "set-url", "origin", "git@github.com:Fork/api.git")
+	fork = realPath(fork)
+	if err := openAt(t, parent).LinkProject("api"); err != nil {
+		t.Fatal(err)
+	}
+	if err := openAt(t, fork).LinkProject("api"); err != nil {
+		t.Fatal(err)
+	}
+	// Checked in the fork at a commit both repositories have; then the fork
+	// changes the code the entry depends on.
+	entry := anchored(t, openAt(t, fork), "Fork patches the tenant check", "pkg/**")
+	commitFile(t, fork, "pkg/main.go", "package main\n// fork-only change\n")
+	if tr := trustOf(t, openAt(t, fork), entry.ID); tr.CodeFreshness != FreshChanged || tr.Baseline.Repo != forkID {
+		t.Fatalf("inside the fork: %+v baseline %+v", tr, tr.Baseline)
+	}
+	if tr := trustOf(t, openAt(t, t.TempDir()), entry.ID); tr.CodeFreshness != FreshUnknown || tr.FreshnessCode != UnknownAmbiguousRep {
+		t.Fatalf("both present, outside: %+v", tr)
+	}
+
+	// The fork's checkout goes away. The parent still contains the commit,
+	// but that no longer says the parent is the only repository that does.
+	if err := os.RemoveAll(fork); err != nil {
+		t.Fatal(err)
+	}
+	tr := trustOf(t, openAt(t, t.TempDir()), entry.ID)
+	if tr.CodeFreshness != FreshUnknown || tr.FreshnessCode != UnknownAmbiguousRep || tr.Stale {
+		t.Fatalf("a missing candidate must leave ownership unknown, not %s: %+v baseline %+v", tr.CodeFreshness, tr, tr.Baseline)
+	}
+	if !strings.Contains(tr.FreshnessReason, parentID) || !strings.Contains(tr.FreshnessReason, forkID) || !strings.Contains(tr.FreshnessReason, "not checked out here") {
+		t.Fatalf("reason should name what was found and what could not be checked: %q", tr.FreshnessReason)
+	}
+	if tr.Badge() != "verified,unknown-freshness" {
+		t.Fatalf("badge: %s", tr.Badge())
+	}
+	// An explicit or contextual choice still resolves it, and says what it
+	// could not rule out.
+	in := trustOf(t, openAt(t, parent), entry.ID)
+	if in.CodeFreshness != FreshUnchanged || in.Baseline.Repo != parentID || !strings.Contains(in.Baseline.Selection, "current checkout") || !strings.Contains(in.Baseline.Selection, "not checked out here: "+forkID) {
+		t.Fatalf("inside the parent: %+v baseline %+v", in, in.Baseline)
+	}
+	out := openAt(t, t.TempDir())
+	if err := out.SetBaseline(parent, ""); err != nil {
+		t.Fatal(err)
+	}
+	if ex := trustOf(t, out, entry.ID); ex.CodeFreshness != FreshUnchanged || !strings.Contains(ex.Baseline.Selection, "explicit --checkout") {
+		t.Fatalf("explicit checkout: %+v baseline %+v", ex, ex.Baseline)
+	}
+}
+
+// Registry updates from separate kb processes must not overwrite each
+// other: each store here stands for one process (its own registry copy and
+// its own lock handle).
+func TestRegistryUpdatesAreSerialized(t *testing.T) {
+	hub := newHub(t)
+	base := t.TempDir()
+	const n = 8
+	type proj struct{ id, repo, path string }
+	var projects []proj
+	for i := 0; i < n; i++ {
+		id := "svc" + string(rune('a'+i))
+		path := repoAt(t, filepath.Join(base, id), "git@github.com:Acme/"+id+".git")
+		openAt(t, path) // registers it
+		projects = append(projects, proj{id, "github.com/acme/" + id, path})
+	}
+	// A checkout nobody has registered yet, for a concurrent registration.
+	late := repoAt(t, filepath.Join(base, "late"), "git@github.com:Acme/late.git")
+	for round := 0; round < 5; round++ {
+		stores := make([]*Store, n)
+		for i := range stores {
+			stores[i] = openAt(t, t.TempDir())
+		}
+		errs := make([]error, n+1)
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range stores {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-start
+				_, _, errs[i] = stores[i].SetPreferredCheckout(projects[i].id, projects[i].repo, projects[i].path)
+			}(i)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, errs[n] = DiscoverAt("", late)
+		}()
+		close(start)
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d, writer %d: %v", round, i, err)
+			}
+		}
+		fresh := openAt(t, t.TempDir())
+		for _, p := range projects {
+			if sel := fresh.SelectCheckout(p.id, p.repo); sel.Path != p.path || sel.Why != "preferred checkout" {
+				t.Fatalf("round %d: preference for %s was lost to a concurrent update: %+v", round, p.id, sel)
+			}
+		}
+		if cos := fresh.Checkouts("late"); len(cos) != 1 || cos[0].Path != late {
+			t.Fatalf("round %d: concurrent registration lost: %+v", round, cos)
+		}
+		// Reset for the next round, concurrently as well.
+		for i := range stores {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				_, errs[i] = stores[i].ClearPreferredCheckout(projects[i].id, projects[i].repo)
+			}(i)
+		}
+		wg.Wait()
+		for i, err := range errs[:n] {
+			if err != nil {
+				t.Fatalf("round %d, clear %d: %v", round, i, err)
+			}
+		}
+		if prefs := openAt(t, t.TempDir()).loadRegistry().Preferred; len(prefs) != 0 {
+			t.Fatalf("round %d: concurrent clears left %v", round, prefs)
+		}
+		if err := os.Remove(filepath.Join(hub, LocalDir, registryFile)); err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range projects {
+			openAt(t, p.path)
+		}
+	}
+}
+
+// An explicit preference command must not report success when nothing was
+// saved.
+func TestPreferenceWriteFailureIsReported(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions")
+	}
+	hub := newHub(t)
+	base := t.TempDir()
+	const repo = "github.com/acme/api"
+	main := repoAt(t, filepath.Join(base, "api"), "git@github.com:Acme/api.git")
+	clone := filepath.Join(base, "clone")
+	runGit(t, base, "clone", "-q", main, clone)
+	runGit(t, clone, "remote", "set-url", "origin", "git@github.com:Acme/api.git")
+	clone = realPath(clone)
+	openAt(t, main)
+	openAt(t, clone)
+	local := filepath.Join(hub, LocalDir)
+	lock := func(on bool) {
+		mode := os.FileMode(0o755)
+		if on {
+			mode = 0o555
+		}
+		if err := os.Chmod(local, mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() { os.Chmod(local, 0o755) })
+
+	s := openAt(t, t.TempDir())
+	lock(true)
+	if _, _, err := s.SetPreferredCheckout("api", repo, clone); err == nil || !strings.Contains(err.Error(), "was not saved") {
+		t.Fatalf("set on read-only local state: %v", err)
+	}
+	if sel := openAt(t, t.TempDir()).SelectCheckout("api", repo); sel.Code != UnknownAmbiguousCo {
+		t.Fatalf("nothing should have been saved: %+v", sel)
+	}
+	// Opening a store in a checkout still works there: registration is best
+	// effort and selection falls back to what can be read.
+	if in := openAt(t, clone); in.Project != "api" || in.SelectCheckout("api", repo).Why != "current checkout" {
+		t.Fatalf("read-only hub must stay usable: %+v", in.SelectCheckout("api", repo))
+	}
+	lock(false)
+	if _, _, err := s.SetPreferredCheckout("api", repo, clone); err != nil {
+		t.Fatal(err)
+	}
+	lock(true)
+	if _, err := openAt(t, t.TempDir()).ClearPreferredCheckout("api", repo); err == nil || !strings.Contains(err.Error(), "was not cleared") {
+		t.Fatalf("clear on read-only local state: %v", err)
+	}
+	lock(false)
+	if sel := openAt(t, t.TempDir()).SelectCheckout("api", repo); sel.Path != clone || sel.Why != "preferred checkout" {
+		t.Fatalf("a failed clear must leave the preference: %+v", sel)
 	}
 }

@@ -925,3 +925,46 @@ func TestCheckoutBaselineCLI(t *testing.T) {
 		t.Fatalf("checkout preferences must stay out of the shared hub:\n%s", st)
 	}
 }
+
+// Startup regression: a disputed global rule restricted to kubedl must not
+// reach a session outside any project through the health brief, and a
+// preference command must fail when it cannot save.
+func TestStartupBriefAndPreferenceErrors(t *testing.T) {
+	base, _, aiproxy, kubedl := populatedHub(t)
+	const sha = "global/conventions/tag-images-with-the-git-sha"
+	must(t, "codex", "verify", sha, "--dispute", "-e", "images are tagged with semver now")
+	hook := func(cwd string) string {
+		os.Chdir(cwd)
+		out, _, _ := kbRun(t, "claude-code", `{"session_id":"s","hook_event_name":"SessionStart","cwd":"`+cwd+`"}`, "hook", "claude")
+		return out
+	}
+	if out := hook(base); strings.Contains(out, sha) || strings.Contains(out, "disputed") || strings.Contains(out, "git sha") {
+		t.Fatalf("hook outside a project carries a kubedl-only global rule:\n%s", out)
+	}
+	if out := hook(aiproxy); strings.Contains(out, sha) || strings.Contains(out, "disputed") {
+		t.Fatalf("hook in aiproxy carries a kubedl-only global rule:\n%s", out)
+	}
+	if out := hook(kubedl); !strings.Contains(out, "1 disputed entr(ies): "+sha) {
+		t.Fatalf("hook in kubedl should report its disputed rule:\n%s", out)
+	}
+	// Interactive status still finds it.
+	os.Chdir(base)
+	if out := must(t, "codex", "status"); !strings.Contains(out, sha) {
+		t.Fatalf("kb status lost the disputed entry:\n%s", out)
+	}
+
+	if os.Geteuid() == 0 {
+		return // root ignores directory permissions
+	}
+	local := filepath.Join(os.Getenv("KB_HOME"), ".kb")
+	os.Chmod(local, 0o555)
+	t.Cleanup(func() { os.Chmod(local, 0o755) })
+	out, errs, code := kbRun(t, "codex", "", "project", "checkout", "set", "aiproxy", "--path", aiproxy)
+	if code == 0 || strings.Contains(out, "baseline for") || !strings.Contains(errs, "was not saved") {
+		t.Fatalf("set on read-only local state: exit %d\nstdout: %s\nstderr: %s", code, out, errs)
+	}
+	os.Chmod(local, 0o755)
+	if out := must(t, "codex", "project", "checkout", "list", "aiproxy"); strings.Contains(out, "(preferred)") {
+		t.Fatalf("nothing should have been saved:\n%s", out)
+	}
+}

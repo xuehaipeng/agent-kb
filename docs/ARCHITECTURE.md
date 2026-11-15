@@ -286,7 +286,9 @@ therefore have their own selection (`Store.Rules`), used by every surface:
   counts applicable rules before the 40-rule cap; `rules_omitted_by_cap` is
   separate.
 - The health brief injected at session start follows the session: project
-  plus global, or global only outside a project. It is at most three lines,
+  plus the global entries that apply to it, or outside a project only global
+  entries with no `projects:` restriction (not the whole global bundle,
+  which discovery would select). It is at most three lines,
   in priority order (reviews, disputes, proposed rules, stale entries, one
   aggregate unknown-freshness line). Interactive `kb status` keeps its
   default.
@@ -310,7 +312,10 @@ identity (normalized remote) and git common directory. These and the
 preferences live in `.kb/checkouts.json`; `.kb/registry.json` keeps its
 original project-to-paths format, so an older binary on the same machine
 keeps working and cannot drop a preference when it rewrites the file. Paths
-recorded by older versions are inspected once. For the repository an entry belongs to, the baseline is,
+recorded by older versions are inspected once. Updates reread, change and
+write both files under a dedicated cross-process lock (`.kb/registry.lock`);
+`checkout set`/`clear` fail when the change cannot be saved, while automatic
+registration stays best effort. For the repository an entry belongs to, the baseline is,
 in order:
 
 1. an explicit `--checkout` (and `--ref` instead of HEAD);
@@ -325,12 +330,14 @@ The selected repository, path, commit and rule are exposed in `kb show` and
 
 **Owning repository (legacy entries).** Entries don't record their repository
 yet (structured anchors are stage 2B). In a multi-repository project it is
-inferred from the anchor commit when exactly one repository contains it.
-Containment is a hint, not proof: forks share commits, a missing object
-proves nothing, and a commit stamped by a memory or rule import (a source id
-`memory-*`/`rules-*` whose anchor is the import event) is not used. Several
-matches are settled only by `--checkout` or the repository kb runs in;
-otherwise the entry is unknown. A write from outside a multi-repository
+inferred from the anchor commit when exactly one repository contains it and
+every repository of the project could be looked in. Containment is a hint,
+not proof: forks share commits, a missing object proves nothing, a
+repository that is not checked out here may contain the commit too, and a
+commit stamped by a memory or rule import (a source id `memory-*`/`rules-*`
+whose anchor is the import event) is not used. Several matches, or a match
+with candidates that could not be checked, are settled only by `--checkout`
+or the repository kb runs in; otherwise the entry is unknown. A write from outside a multi-repository
 project records no commit.
 
 **Not done here:** structured multi-repository anchors and branch

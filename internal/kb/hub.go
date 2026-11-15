@@ -345,27 +345,48 @@ func (s *Store) readRegistry() *registry {
 	return r
 }
 
-// updateRegistry applies fn to the registry as it is on disk now (another kb
-// process may have written since this one loaded it) and saves it when fn
-// reports a change.
-func (s *Store) updateRegistry(fn func(*registry) bool) {
+// registryLock serializes registry updates across kb processes. It is a
+// lock of its own, not the bundle's write lock: registration happens while
+// a store is being opened, including under that write lock.
+const registryLock = "registry.lock"
+
+// updateRegistry applies fn to the registry as it is on disk now and saves
+// it when fn reports a change. The reread, the change and both file writes
+// happen under one cross-process lock, so concurrent kb processes (a
+// session-start hook registering a worktree while the user sets a
+// preference) cannot overwrite each other's update. A failure to lock or
+// write is returned; the change still applies to this process's copy, so
+// callers for whom saving is best effort can ignore the error.
+func (s *Store) updateRegistry(fn func(*registry) bool) error {
+	s.coCache, s.selCache, s.repoCache = nil, nil, nil
+	unlock, err := s.lockFile(registryLock)
+	if err != nil {
+		fn(s.loadRegistry())
+		return err
+	}
+	defer unlock()
 	r := s.readRegistry()
 	changed := fn(r)
 	s.registry = r
-	s.coCache, s.selCache, s.repoCache = nil, nil, nil
 	if !changed {
-		return
+		return nil
 	}
-	if err := os.MkdirAll(s.LocalPath(), 0o755); err != nil {
-		return
+	data, err := json.MarshalIndent(registry{Projects: r.Projects}, "", "  ")
+	if err != nil {
+		return err
 	}
-	data, _ := json.MarshalIndent(registry{Projects: r.Projects}, "", "  ")
-	_, _ = WriteFileIfChanged(s.LocalPath(registryFile), data)
-	data, _ = json.MarshalIndent(struct {
+	if _, err := WriteFileIfChanged(s.LocalPath(registryFile), data); err != nil {
+		return err
+	}
+	data, err = json.MarshalIndent(struct {
 		Checkouts map[string]checkoutInfo      `json:"checkouts"`
 		Preferred map[string]map[string]string `json:"preferred,omitempty"`
 	}{r.Checkouts, r.Preferred}, "", "  ")
-	_, _ = WriteFileIfChanged(s.LocalPath(checkoutsFile), data)
+	if err != nil {
+		return err
+	}
+	_, err = WriteFileIfChanged(s.LocalPath(checkoutsFile), data)
+	return err
 }
 
 func (s *Store) registerCheckout(project, path string, info checkoutInfo) {
@@ -384,7 +405,9 @@ func (s *Store) registerCheckout(project, path string, info checkoutInfo) {
 			return
 		}
 	}
-	s.updateRegistry(func(r *registry) bool { return r.adopt(project, path, info) })
+	// Best effort: a hub that cannot be written (read-only mount) still works
+	// for this run, and the checkout is registered again next time.
+	_ = s.updateRegistry(func(r *registry) bool { return r.adopt(project, path, info) })
 }
 
 func (s *Store) autocommit() bool {

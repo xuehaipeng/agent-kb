@@ -247,8 +247,10 @@ meaning; `unknown-freshness` alone does not set `stale`, so read
 
 In a project with several repositories, an entry doesn't record which one it
 belongs to yet. kb infers it from the entry's recorded commit when exactly
-one repository contains it. A fork that shares history is settled by the
-checkout you are in or by `--checkout`; anything else is `unknown-freshness`.
+one repository contains it and every repository of the project is checked
+out here. A fork that shares history, or a repository that is not on this
+machine and so can't be ruled out, is settled by the checkout you are in or
+by `--checkout`; anything else is `unknown-freshness`.
 
 States are **derived** from the append-only `verified` list on every read and
 never stored. Every check records the content revision it looked at, so after

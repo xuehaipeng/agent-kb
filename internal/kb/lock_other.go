@@ -9,11 +9,15 @@ import (
 )
 
 // Lock takes an exclusive lock using an O_EXCL lock file (non-unix fallback).
-func (s *Store) Lock() (func(), error) {
+func (s *Store) Lock() (func(), error) { return s.lockFile("lock") }
+
+// lockFile takes an exclusive lock on a named file in the local state
+// directory, waiting until it is free.
+func (s *Store) lockFile(name string) (func(), error) {
 	if err := os.MkdirAll(s.LocalPath(), 0o755); err != nil {
 		return nil, err
 	}
-	p := s.LocalPath("lock.excl")
+	p := s.LocalPath(name + ".excl")
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o644)
