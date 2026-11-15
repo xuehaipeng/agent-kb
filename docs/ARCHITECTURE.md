@@ -477,7 +477,10 @@ applies_to:
   <path>` (which the pointer already tells agents to run before touching
   unfamiliar code). `kb rules --all-rules` lists them with their condition.
   Nothing pushes them yet; a file-access hook is issue #3 item 4.
-- Only rules can be conditional (`kb add rule ... --when <glob>`).
+- Only rules can be conditional (`kb add rule ... --when <glob>`). `--when`
+  repeats or takes a comma-separated list; a comma inside `{a,b}` belongs to
+  its pattern. With `--from` it limits every seeded rule, and an item that
+  is not a rule is refused instead of being added without the condition.
 - Patterns follow Claude Code's documented rule syntax: `**` crosses
   directories; a bare name matches at any depth; a leading `/` anchors to the
   base; `{a,b}` expands (bounded at 1,000); `[...]` and `\` escapes work. A
@@ -495,6 +498,7 @@ applies_to:
 | Cursor rule that is not `alwaysApply: true`, other agents' `globs`/`trigger` | not imported: kb cannot reproduce that condition |
 | `CLAUDE.local.md` | not imported: personal, uncommitted instructions stay private |
 | a link or `@path` import leaving the repository (or `~/.claude` for user files) | not followed |
+| a repository instruction file that is itself a link to somewhere outside it (a nested `CLAUDE.md` included) | not imported |
 | `@AGENTS.md` | not followed: other agents read it natively |
 | kb's own blocks and pointer | never re-imported |
 

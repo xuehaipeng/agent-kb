@@ -1657,6 +1657,10 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	os.WriteFile(filepath.Join(home, "outside.md"), []byte("Content outside the repository that must not be imported.\n"), 0o644)
 	os.WriteFile(filepath.Join(home, "shared-rule.md"), []byte("A rule that lives outside the repository.\n"), 0o644)
 	os.Symlink(filepath.Join(home, "shared-rule.md"), filepath.Join(repo, ".claude", "rules", "linked.md"))
+	// A nested instruction file that is a link to somewhere outside the
+	// repository is not the repository's content.
+	os.MkdirAll(filepath.Join(repo, "packages", "api"), 0o755)
+	os.Symlink(filepath.Join(home, "outside.md"), filepath.Join(repo, "packages", "api", "CLAUDE.md"))
 	// A link back to the rules directory itself: read once, not for ever.
 	os.Symlink(".", filepath.Join(repo, ".claude", "rules", "shared"))
 	git(t, repo, "add", "-A")
@@ -1679,13 +1683,14 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 		".cursor/rules/attached.mdc: not imported (a Cursor rule that is not `alwaysApply: true`",
 		"note: CLAUDE.local.md: not imported (personal instructions",
 		".claude/rules/linked.md: not imported (a link to a location outside",
+		"packages/api/CLAUDE.md: not imported (a link to a location outside",
 		"CLAUDE.md: @AGENTS.md was not followed (other agents read AGENTS.md natively); @~/outside.md was not followed (it is outside",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("import report lacks %q:\n%s", want, out)
 		}
 	}
-	for _, not := range []string{"Rule from rules-broken.md", "Rule from rules-badglob.md", "Rule from rules-attached.mdc", "Rule from rules-linked.md", "CLAUDE.local.md: added"} {
+	for _, not := range []string{"Rule from rules-broken.md", "Rule from rules-badglob.md", "Rule from rules-attached.mdc", "Rule from rules-linked.md", "Rule from api-CLAUDE.md", "CLAUDE.local.md: added"} {
 		if strings.Contains(out, not) {
 			t.Errorf("import report must not contain %q:\n%s", not, out)
 		}
@@ -1777,6 +1782,30 @@ func TestImportConditionalRuleFiles(t *testing.T) {
 	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Migrations are forward-only") {
 		t.Errorf("--when rule delivered as always-on:\n%s", got)
 	}
+	// A comma inside {a,b} belongs to its pattern; outside, it separates.
+	must(t, "claude-code", "add", "rule", "Components export a single default", "-d", "one component per file", "-e", "user said so", "--when", "src/ui/**/*.{ts,tsx}, stories/**")
+	for _, path := range []string{"src/ui/forms/Field.tsx", "src/ui/a.ts", "stories/button.mdx"} {
+		if got := forFile(path); !strings.Contains(got, "Components export a single default") {
+			t.Errorf("--when with brace alternatives, %s:\n%s", path, got)
+		}
+	}
+	if got := forFile("src/ui/a.css"); strings.Contains(got, "Components export a single default") {
+		t.Errorf("--when with brace alternatives matched too much:\n%s", got)
+	}
+	// --when limits rules added in bulk too; it is never dropped.
+	seedFile := filepath.Join(base, "seed.json")
+	os.WriteFile(seedFile, []byte(`[{"title":"Handlers return typed errors","description":"callers switch on them"},{"type":"fact","title":"The API gateway terminates TLS","description":"services speak plain HTTP behind it"}]`), 0o644)
+	out = must(t, "claude-code", "add", "rule", "--from", seedFile, "--when", "src/api/**", "-e", "user said so")
+	if !strings.Contains(out, "only rules can be limited to matching files") {
+		t.Errorf("a seeded entry that is not a rule must be refused with --when:\n%s", out)
+	}
+	if got := forFile("src/api/users/list.ts"); !strings.Contains(got, "Handlers return typed errors") {
+		t.Errorf("a seeded rule with --when:\n%s", got)
+	}
+	if got := must(t, "codex", "rules", "-q"); strings.Contains(got, "Handlers return typed errors") {
+		t.Errorf("a seeded rule lost its condition and became always-on:\n%s", got)
+	}
+
 	// The same instruction for other files is a rule of its own; it repeats
 	// an existing one only where that one is already delivered.
 	must(t, "claude-code", "add", "rule", "Migrations are forward-only", "-d", "no down migrations", "-e", "user said so", "--when", "services/billing/migrations/**")

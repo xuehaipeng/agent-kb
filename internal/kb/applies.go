@@ -62,6 +62,29 @@ func AppliesCovers(existing, incoming *okf.Applicability) bool {
 // AppliesNote says in words which files a conditional rule is for.
 func AppliesNote(a *okf.Applicability) string { return appliesNote(a) }
 
+// SplitPatterns splits a comma-separated list of patterns. A comma inside
+// {a,b} belongs to its pattern, and "\" escapes the next character.
+func SplitPatterns(v string) []string {
+	var out []string
+	depth, last := 0, 0
+	for i := 0; i <= len(v); i++ {
+		switch {
+		case i < len(v) && v[i] == '\\':
+			i++
+		case i < len(v) && v[i] == '{':
+			depth++
+		case i < len(v) && v[i] == '}' && depth > 0:
+			depth--
+		case i == len(v) || (v[i] == ',' && depth == 0):
+			if p := strings.TrimSpace(v[last:i]); p != "" {
+				out = append(out, p)
+			}
+			last = i + 1
+		}
+	}
+	return out
+}
+
 // ValidateApplies checks that every pattern can be matched exactly. A
 // pattern that cannot is an error, never a wider or an empty match in
 // disguise: the caller reports it instead of importing the rule.
