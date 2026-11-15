@@ -1231,6 +1231,18 @@ func TestClaudeMemoryDeterministicImport(t *testing.T) {
 	if p, _ := os.ReadFile(prompt); !strings.Contains(string(p), "Production runbook") || !strings.Contains(string(p), "notes_that_do_not_exist.md") || strings.Contains(string(p), "feedback_testing.md") {
 		t.Fatalf("external references must reach the fallback, topic pointers must not:\n%s", p)
 	}
+	// A link into a subdirectory names a file the topic scan never reads:
+	// an index of such links is not a table of contents to skip.
+	os.MkdirAll(filepath.Join(mem, "topics"), 0o755)
+	os.WriteFile(filepath.Join(mem, "topics", "runbook.md"), []byte("Restart the queue workers before the API during a rollback.\n"), 0o644)
+	write("MEMORY.md", "# Memory index\n\n- [Rollback runbook](topics/runbook.md) — read it before any rollback\n")
+	if out := scan(cmd); !strings.Contains(out, "fallback: MEMORY.md holds notes besides its 0 link(s)") || strings.Contains(out, "1 index skipped") {
+		t.Fatalf("an index linking to a nested file:\n%s", out)
+	}
+	if p, _ := os.ReadFile(prompt); !strings.Contains(string(p), "topics/runbook.md") {
+		t.Fatalf("a nested link must reach the fallback:\n%s", p)
+	}
+	os.RemoveAll(filepath.Join(mem, "topics"))
 
 	// A typed file the earlier model-based import already took is not
 	// imported a second time: unchanged it is done, changed it stays on the
